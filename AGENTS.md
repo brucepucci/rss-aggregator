@@ -7,6 +7,8 @@ Update `README.md` in the same change whenever setup, commands, configuration, o
 
 Verify documented commands and settings against the implementation before considering a change complete. Clearly distinguish planned or unverified behavior from working features; use placeholders rather than real credentials or private feed URLs.
 
+Reviewers must assess whether each change requires updates to the README or affected domain/architecture documentation, including when the diff contains no documentation files. Report missing or stale required documentation as standards violations and identify the sections needing updates.
+
 ## Agent skills
 
 ### Issue tracker
