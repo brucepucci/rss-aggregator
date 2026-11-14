@@ -6,7 +6,11 @@ and SQLite in a named volume on the VM's native filesystem. No host PHP or
 database server, Podman Desktop, privileged socket helper, login item, launch
 agent, or automatic application startup is installed by this project.
 
-This implements [issue #1](https://github.com/brucepucci/rss-aggregator/issues/1).
+This branch contains the unmerged implementation of [issue #1](https://github.com/brucepucci/rss-aggregator/issues/1).
+Main at `d991e39` contains documentation and the canonical Python standard, not this
+runtime. The runtime commands below are working branch-specific behavior; Python
+tooling adoption is separately tracked in #9. See [Python development and adoption](#python-development-and-adoption).
+
 Backups, guarded removal, Tailscale, ReadKit and Linux deployment are **not yet
 implemented**. See [architecture decisions](docs/adr/).
 
@@ -305,3 +309,41 @@ See [sanitized verification evidence](docs/verification/issue-1.md) for actual
 results and remaining limitations; an available command is not itself a passed
 check. There is no existing application typechecker/build system in this
 repository; Python compilation is a syntax check, not a static typecheck.
+
+## Python development and adoption
+
+The canonical, copy/paste-friendly policy is [docs/python-standards.md](docs/python-standards.md); [AGENTS.md](AGENTS.md) points agents to it. Repository-specific setup and exceptions belong here, not in the reusable policy.
+
+### Approved rollout
+
+1. **Done:** the documentation-only [#8](https://github.com/brucepucci/rss-aggregator/issues/8) change reached main through PR #10 at `d991e39`, without waiting for #1's closure or merge.
+2. **Done on this branch:** incorporate those standards into #1's existing implementation branch, preserving its runtime and history.
+3. Implement [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) from that updated implementation branch and integrate it back into #1's branch, not independently into main.
+4. Verify the combined #1/#9 implementation against both issues, then squash-merge it into main as **one implementation commit**, separately from this documentation change.
+
+This is the approved integration plan, not authorization to publish or merge automatically.
+
+### Enforcement status and exceptions
+
+No Python policy exceptions are granted here. Tooling adoption is **pending #9**, not an exemption. This branch currently retains #1's unittest-style command tests, argparse CLI and text output as prior art; #9 must inventory the latest state and migrate it under the canonical policy. The existing runtime verification is recorded separately above.
+
+There are **no working uv setup, pytest, Ruff, formatting/safe-fix, or hook-installation commands to publish for main yet**. #9 must document and verify them when implemented, including check-only gates, setup with/without a remote, rerunning setup after a remote is added, and preservation or explicit resolution of existing hooks. Hooks must cover pushes to any Git remote; they can be absent or bypassed and do not replace CI.
+
+Host-side Python development tooling does not authorize installing FreshRSS's PHP/database runtime on the host, unexpected host-package upgrades, or changes to unrelated resources. All accepted ADRs remain in force; this change neither changes them nor certifies unmerged runtime behavior.
+
+### Verification responsibilities
+
+- **#8 (merged specification):** delivered the canonical policy and discovery/documentation guidance only; it installed no tools and changed no production Python, tests, hooks or CI workflows.
+- **#9 (baseline adoption):** supply uv-managed tooling, pytest, callable APIs with useful Click boundaries, production typing/docstrings, Ruff, pre-push gates, and matching GitHub Actions checks. The complete default suite must be deterministic and isolated, with no credentials, network, or production services. Preserve meaningful command-boundary success/failure coverage and prove checks reject controlled failures without rewriting files. Actual passing/failing local-hook and CI evidence belongs to adoption, not this specification.
+- **[#7 (shared integration infrastructure)](https://github.com/brucepucci/rss-aggregator/issues/7):** owns broader real rootless-Podman/runtime/HTTP coverage and platform responsibilities, with separately selected integration suites, safe fixtures, and explicit Mac VM-provider/manual-device limits. Feature issues retain their own acceptance tests. Coordinate shared entrypoints/workflows with #9 rather than creating competing systems or making either a new blocker for the other.
+
+A baseline pass is not proof of effective PHP security, real feed fetching, durable reading state, actual backup recovery, tailnet access, paid-feed authorization, or physical ReadKit client behavior. Record actual checks, unavailable prerequisites, unperformed checks, and platform limitations rather than claiming full coverage.
+
+## Architecture
+
+- [Isolate local development with Podman](docs/adr/0001-isolate-local-development-with-podman.md)
+- [Portable state and consistent external backups](docs/adr/0002-portable-state-with-consistent-external-backups.md)
+- [Private Tailscale access and shared reading state](docs/adr/0003-private-tailscale-access-and-shared-reading-state.md)
+
+These decisions describe accepted architecture. The local runtime above implements
+only #1's initial slice; subsequent features remain explicitly deferred.
