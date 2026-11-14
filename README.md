@@ -241,7 +241,7 @@ Development configuration is non-secret and required for the commands below:
 | `.python-version` | uv-managed Python 3.13.18. | Update intentionally with compatible project/Ruff targets and verify a fresh sync; do not silently upgrade host packages. |
 | `uv.lock` | Committed application dependency versions/hashes, including compatibility markers. | Regenerate only for intended dependency changes; normal setup/checks use `--locked`, not an implicit lock update. |
 | `.pre-commit-config.yaml` | One complete check-only baseline at pre-push, local/system environment, all files regardless of changed filenames. | Keep it aligned with `rss-dev check`; explicitly run guarded `rss-dev setup` when activating hooks. |
-| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; see the dated, revision-specific [CI checkpoint](#github-actions-and-7) and PR/evidence record for subsequent results. Controlled-failing CI evidence remains outstanding at that checkpoint. |
+| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; see the dated, revision-specific passing and controlled-failure [CI checkpoints](#github-actions-and-7), with subsequent results in the PR/evidence record. |
 
 For example, to move an **already installed** instance to loopback port 8081:
 
@@ -534,6 +534,20 @@ complete acceptance. Local push rejection is not evidence of CI execution.
 Integration/merge still requires separate authorization, and no branch protection
 changes are made.
 
+**Controlled-failure checkpoint: 2026-11-14.** With explicit authorization,
+disposable [PR #12](https://github.com/brucepucci/rss-aggregator/pull/12) exercised
+the unchanged baseline workflow with separate pytest, lint and formatting
+failures. Each Actions run rejected exactly the intended check after successful
+dependency setup, while the other checks passed. After removing the probe,
+[run 43644411740](https://github.com/brucepucci/rss-aggregator/actions/runs/43644411740)
+passed on the restored tree, identical to PR #11 revision `67cf72b`.
+The experiment was closed **without merging**, and its remote branch was deleted.
+The [revision/run-specific evidence](docs/verification/issue-9.md#controlled-failure-ci-checkpoint-2026-11-14)
+supplies #9's controlled-failing CI requirement; the earlier outstanding-status
+statements describe their historical checkpoints. It does not establish branch
+protection, live/platform coverage, review acceptance or permission to integrate
+or merge.
+
 [#7](https://github.com/brucepucci/rss-aggregator/issues/7) extends this entrypoint
 and workflow with native Linux rootless-Podman coverage, controlled publication
 fixtures/failure cases, a coverage matrix and Mac provider/manual-device limits.
@@ -602,7 +616,9 @@ particular checkout. At the **2026-11-14 checkpoint**, published revision `4a611
 passed the GitHub baseline; controlled-failing CI evidence and integration were
 still outstanding. That checkpoint does not establish results for subsequent
 commits. See the [CI checkpoint](#github-actions-and-7) and linked PR/evidence
-record for revision-specific results and remaining acceptance work.
+record for revision-specific results and remaining acceptance work. The later
+controlled-failure checkpoint above supplies the negative-CI evidence; it does
+not establish integration or full issue acceptance.
 
 Host-side Python development tooling does not authorize installing FreshRSS's PHP/database runtime on the host, unexpected host-package upgrades, or changes to unrelated resources. All accepted ADRs remain in force; this change neither changes them nor certifies unmerged runtime behavior.
 

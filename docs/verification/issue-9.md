@@ -10,7 +10,9 @@ The original sections below preserve the prepublication local evidence and its
 then-pending work. See [PR #11 review follow-up](#pr-11-review-follow-up) for the
 local regression verification and the
 [publication/CI checkpoint](#publication-and-ci-checkpoint-2026-11-14) for
-subsequent revision-specific evidence.
+subsequent revision-specific evidence. The later
+[controlled-failure CI checkpoint](#controlled-failure-ci-checkpoint-2026-11-14)
+supplies the negative-CI evidence that earlier checkpoints identify as outstanding.
 
 ## Proven locally
 
@@ -175,3 +177,58 @@ acceptance, integration, readiness change or merge is implied. Broader live,
 platform and device limitations above remain unchanged. Subsequent publication
 and verification results belong in the PR/evidence record with their exact
 revision, rather than updating moving phrases such as “current local fixes.”
+
+## Controlled-failure CI checkpoint (2026-11-14)
+
+The maintainer explicitly authorized disposable GitHub CI failure experiments,
+restoration, cleanup and publication of the evidence on PR #11. The experiments
+used [draft PR #12](https://github.com/brucepucci/rss-aggregator/pull/12), targeting
+`feat/issue-9-python-adoption`, from temporary branch
+`chore/issue-9-ci-failure-evidence`. Its starting head was PR #11 revision
+`67cf72beffc73b7f44aea0374463e26034da1692`, tree
+`ce54f4345d958cbc6c7cc60db66882993e5615a6`.
+
+Each intentionally failing candidate was an explicitly authorized draft exception,
+not accepted implementation. Only `tests/test_ci_failure_probe.py` differed from
+the starting tree: a failing assertion, then a passing test with an unused import,
+then a passing test with noncanonical formatting. Blob identities confirmed the
+workflow, gate implementation, project configuration and lockfile stayed unchanged.
+The same `uv sync --locked` and `uv run --locked rss-dev check` workflow ran for
+each PR update; no alternate workflow or failure-suppression setting was added.
+
+| Case | Exact branch head | Actions run | Workflow result | Gate exit codes: pytest / lint / format |
+| --- | --- | --- | --- | --- |
+| Pytest assertion | [`1977d38d3371cfd8f0f49d81a3e890a605a13727`](https://github.com/brucepucci/rss-aggregator/commit/1977d38d3371cfd8f0f49d81a3e890a605a13727) | [43644086364](https://github.com/brucepucci/rss-aggregator/actions/runs/43644086364) | Failure | `1 / 0 / 0` |
+| Ruff unused import (`F401`) | [`9d4f425c19de20e145ca7cedccfa61b4b1369c1b`](https://github.com/brucepucci/rss-aggregator/commit/9d4f425c19de20e145ca7cedccfa61b4b1369c1b) | [43644229824](https://github.com/brucepucci/rss-aggregator/actions/runs/43644229824) | Failure | `0 / 1 / 0` |
+| Ruff format check | [`810419960db510ce0b0fb94918a2f4f447aea4bc`](https://github.com/brucepucci/rss-aggregator/commit/810419960db510ce0b0fb94918a2f4f447aea4bc) | [43644329319](https://github.com/brucepucci/rss-aggregator/actions/runs/43644329319) | Failure | `0 / 0 / 1` |
+| Probe removed; original tree restored | [`97b62ae2e28e3e6632e8413bb32e0053b4aa9a9c`](https://github.com/brucepucci/rss-aggregator/commit/97b62ae2e28e3e6632e8413bb32e0053b4aa9a9c) | [43644411740](https://github.com/brucepucci/rss-aggregator/actions/runs/43644411740) | Success | `0 / 0 / 0` |
+
+All four GitHub-hosted Linux runs completed with successful dependency setup.
+Run metadata was checked against each exact branch head, and the gate's JSON
+summary was parsed from `gh run view <run-id> --log`; job/step conclusions and the
+actual pytest assertion, `F401` diagnostic or `Would reformat` message were also
+verified. Thus the negative results are intended check failures, not environment
+or installation failures. The pytest probe run reported one intentional failure
+and 49 passing default tests. The lint/format runs each passed 50 tests, including
+the probe. Five live tests remained deselected in every run.
+
+Before each publication, `uv run --locked --offline rss-dev check` in the
+disposable clone produced the same check-exit pattern, without changing its
+source. Removing the probe restored exactly tree
+`ce54f4345d958cbc6c7cc60db66882993e5615a6`; local and GitHub baselines then passed
+49 default tests plus Ruff lint/format. No deliberately failing file was added to
+PR #11, its base or main, and no experimental commit was merged into them.
+
+PR #12 was closed **unmerged**, and `git ls-remote` confirmed its remote branch
+was absent after deletion. The intentionally failing commits remain historical
+evidence through that closed PR, not changes in the accepted branch. PR #11's
+head remained `67cf72b` throughout the experiment; only documentation/evidence
+updates were prepared afterward.
+
+This supplies #9's actual successful/controlled-failing CI evidence requirement
+and supersedes the historical outstanding-negative-CI statements above. It does
+not demonstrate branch protection or the broader #7 live/platform integration
+requirements. No live Podman/HTTP, natural-cron, Python 3.10, device/tailnet,
+backup or destructive-cleanup tests were run. Review acceptance, readiness,
+nested integration, combined verification and the final squash/merge remain
+separately authorized actions.
