@@ -8,7 +8,9 @@ package install/upgrade was performed for this adoption.
 
 The original sections below preserve the prepublication local evidence and its
 then-pending work. See [PR #11 review follow-up](#pr-11-review-follow-up) for the
-subsequent publication/CI status and local regression verification.
+local regression verification and the
+[publication/CI checkpoint](#publication-and-ci-checkpoint-2026-11-14) for
+subsequent revision-specific evidence.
 
 ## Proven locally
 
@@ -112,6 +114,11 @@ permission to publish, merge, delete data, or change branch protection.
 
 ## PR #11 review follow-up
 
+**Historical prepublication checkpoint: 2026-11-14.** The fixes described below
+were later published as `4a6116621efd2c91e3dc11575fcb63028779f74e`; see the next
+section for publication/CI evidence. Statements about local/unpublished status
+in this section apply only to that prepublication checkpoint.
+
 Draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) was published
 with head `eff668189c1ffe3ef740e046ce697baf7e8b267e`, targeting
 `feat/issue-1-local-freshrss`, not main. The Actions API confirms that
@@ -144,3 +151,27 @@ this follow-up. **Controlled-failing GitHub pytest/lint/format evidence remains
 outstanding** and requires separately authorized publication; local failures do
 not substitute for it. These local fixes have not yet been published or tested
 on GitHub. Python 3.10 and the remaining platform/device checks were not rerun.
+
+## Publication and CI checkpoint (2026-11-14)
+
+The review fixes were published to draft
+[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) as
+[`4a6116621efd2c91e3dc11575fcb63028779f74e`](https://github.com/brucepucci/rss-aggregator/commit/4a6116621efd2c91e3dc11575fcb63028779f74e),
+tree `b68a21b87fd0be3360b534c0ca3f21a8bb1382c1`, still targeting
+`feat/issue-1-local-freshrss`, not main.
+
+The Actions API was queried using
+`gh run view 43641847554 --repo brucepucci/rss-aggregator --json headSha,conclusion,status,url,createdAt,updatedAt`.
+It confirmed that
+[Python baseline run 43641847554](https://github.com/brucepucci/rss-aggregator/actions/runs/43641847554)
+completed successfully on that exact revision on 2026-11-14. The job's setup,
+`uv sync --locked` and `uv run --locked rss-dev check` steps also reported
+success. This supplements the earlier successful `eff6681` run; neither run
+establishes CI results for subsequent commits.
+
+**Controlled-failing GitHub pytest/lint/format evidence remained outstanding at
+this checkpoint.** The authorized draft exception remained in effect; no complete
+acceptance, integration, readiness change or merge is implied. Broader live,
+platform and device limitations above remain unchanged. Subsequent publication
+and verification results belong in the PR/evidence record with their exact
+revision, rather than updating moving phrases such as “current local fixes.”

@@ -241,7 +241,7 @@ Development configuration is non-secret and required for the commands below:
 | `.python-version` | uv-managed Python 3.13.18. | Update intentionally with compatible project/Ruff targets and verify a fresh sync; do not silently upgrade host packages. |
 | `uv.lock` | Committed application dependency versions/hashes, including compatibility markers. | Regenerate only for intended dependency changes; normal setup/checks use `--locked`, not an implicit lock update. |
 | `.pre-commit-config.yaml` | One complete check-only baseline at pre-push, local/system environment, all files regardless of changed filenames. | Keep it aligned with `rss-dev check`; explicitly run guarded `rss-dev setup` when activating hooks. |
-| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; a published revision passed GitHub Actions (see below), but controlled-failing CI evidence and GitHub verification of current local fixes remain outstanding. |
+| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; see the dated, revision-specific [CI checkpoint](#github-actions-and-7) and PR/evidence record for subsequent results. Controlled-failing CI evidence remains outstanding at that checkpoint. |
 
 For example, to move an **already installed** instance to loopback port 8081:
 
@@ -517,14 +517,22 @@ or offline cache fails; it never silently downloads or rewrites source during pu
 `uv run --locked rss-dev check` baseline on pull requests (including nested PRs)
 and main-branch pushes, with read-only contents permission, immutable action
 references, and uv 0.13.8. Draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11)
-targets `feat/issue-1-local-freshrss`, not main. GitHub Actions
-[run 43639445160](https://github.com/brucepucci/rss-aggregator/actions/runs/43639445160)
-succeeded on published revision `eff668189c1ffe3ef740e046ce697baf7e8b267e`.
-That is passing evidence for that revision, not the current local fixes, which
-are **not yet published or verified on GitHub**. Controlled-failing GitHub CI
-evidence remains outstanding. Local push rejection is not evidence of CI
-execution. Integration/merge still requires separate authorization, and no branch
-protection changes are made.
+targets `feat/issue-1-local-freshrss`, not main.
+
+**Checkpoint: 2026-11-14.** Review-fix revision
+`4a6116621efd2c91e3dc11575fcb63028779f74e` was published to PR #11, and
+[Python baseline run 43641847554](https://github.com/brucepucci/rss-aggregator/actions/runs/43641847554)
+completed successfully on that exact revision. This is revision-specific baseline
+evidence, not a claim about subsequent commits or live integration. Consult
+[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) and the
+[verification record](docs/verification/issue-9.md) for subsequent results; a new
+CI run alone does not require rewriting this historical checkpoint.
+
+At this checkpoint, **controlled-failing GitHub pytest/lint/format evidence
+remained outstanding**, and the authorized draft exception did not establish
+complete acceptance. Local push rejection is not evidence of CI execution.
+Integration/merge still requires separate authorization, and no branch protection
+changes are made.
 
 [#7](https://github.com/brucepucci/rss-aggregator/issues/7) extends this entrypoint
 and workflow with native Linux rootless-Podman coverage, controlled publication
@@ -567,8 +575,8 @@ The historical #1 observation is not claimed as a new #9 run.
 See the [rewrite inventory](docs/implementation/issue-9.md),
 [#9 verification evidence](docs/verification/issue-9.md), and
 [historical #1 evidence](docs/verification/issue-1.md) for actual results and limits.
-Those records describe their original verification checkpoints; they do not prove
-that the current local fixes have been published or run on GitHub.
+Those records identify the revisions and checkpoints actually verified; results
+for one revision do not establish verification of subsequent commits.
 
 ## Python development and adoption
 
@@ -578,7 +586,7 @@ The canonical, copy/paste-friendly policy is [docs/python-standards.md](docs/pyt
 
 1. **Done:** the documentation-only [#8](https://github.com/brucepucci/rss-aggregator/issues/8) change reached main through PR #10 at `d991e39`, without waiting for #1's closure or merge.
 2. **Done on this branch:** incorporate those standards into #1's existing implementation branch, preserving its runtime and history.
-3. [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) is implemented from that updated #1 branch and has draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11), targeting `feat/issue-1-local-freshrss`, not main. Current local review fixes are not yet published or verified on GitHub; further publication and integration/merge require separate authorization.
+3. [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) is implemented from that updated #1 branch. At the **2026-11-14 checkpoint**, review-fix revision `4a61166` was published in draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11), targeting `feat/issue-1-local-freshrss`, not main, and passed the baseline workflow. See the [CI checkpoint](#github-actions-and-7) for exact evidence and limitations; further publication and integration/merge require separate authorization.
 4. After authorized integration, verify the combined #1/#9 branch against both issues. The final main-targeting PR must resolve **both #1 and #9** and squash-merge them as **one implementation commit**, separately from #8's documentation commit.
 
 This is the approved integration plan, not authorization to publish or merge automatically.
@@ -588,11 +596,13 @@ This is the approved integration plan, not authorization to publish or merge aut
 The #9 branch now implements uv-managed tooling, pytest, independent callable
 operations with thin Click adapters, JSON results, typed/documented production
 code, Ruff and managed baseline gates. No Python policy exceptions are granted;
-tests and trivial special methods retain the canonical exemptions. This is local
-branch adoption, not proof it has reached #1 or main or that hooks are installed
-in this repository. The GitHub workflow passed at the published revision cited
-above; controlled-failing CI evidence and GitHub verification of current local
-fixes remain outstanding.
+tests and trivial special methods retain the canonical exemptions. Branch
+adoption does not establish integration into #1/main or hook activation in a
+particular checkout. At the **2026-11-14 checkpoint**, published revision `4a61166`
+passed the GitHub baseline; controlled-failing CI evidence and integration were
+still outstanding. That checkpoint does not establish results for subsequent
+commits. See the [CI checkpoint](#github-actions-and-7) and linked PR/evidence
+record for revision-specific results and remaining acceptance work.
 
 Host-side Python development tooling does not authorize installing FreshRSS's PHP/database runtime on the host, unexpected host-package upgrades, or changes to unrelated resources. All accepted ADRs remain in force; this change neither changes them nor certifies unmerged runtime behavior.
 
