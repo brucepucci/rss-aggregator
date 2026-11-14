@@ -1,6 +1,11 @@
 # Runtime state, machine ownership records, inventories, and local settings
 .local/
 __pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
 *.pyc
 .env
 .env.*
