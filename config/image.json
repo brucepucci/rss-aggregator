@@ -1,0 +1,9 @@
+{
+  "image": "docker.io/freshrss/freshrss@sha256:af44385229541bee24aa9148d0ff8f3b40e095373c63a2c0f74e09a27d3c59df",
+  "version": "1.30.4",
+  "platform": "linux/arm64",
+  "platform_manifest": "sha256:c889a3e8baddfb73dc1cecc553697f250c70cbfc7dbac6212626bf5cbccfc797",
+  "revision": "08f97bd497ace733c151ea1c709d85cd5b65cc53",
+  "security_checked": "2026-11-14",
+  "php_minimum": "8.4.27"
+}

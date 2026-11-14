@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Local-only FreshRSS lifecycle. Python 3.10+, standard library only."""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+STATE = Path(os.environ.get('RSS_STATE_DIR', ROOT / '.local')).expanduser().resolve()
+MACHINE = 'rss-aggregator'
+APP = 'rss-aggregator-freshrss'
+VOLUME = 'rss-aggregator-data'
+CHECK = 'rss-aggregator-check'
+LABEL = 'io.rss-aggregator.owner'
+IMAGE = json.loads((ROOT / 'config/image.json').read_text())
+
+
+class Failure(Exception):
+    pass
+
+
+def run(*args, check=True, input=None):
+    env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE='1',
+               HOMEBREW_NO_INSTALL_UPGRADE='1', HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK='1',
+               HOMEBREW_NO_INSTALL_CLEANUP='1')
+    try:
+        result = subprocess.run(args, text=True, capture_output=True, env=env, input=input, check=False)
+    except OSError as error:
+        raise Failure(f'{args[0]} unavailable: {error}') from error
+    if check and result.returncode:
+        raise Failure(f'{args[0]} failed ({result.returncode}): {result.stderr.strip()}')
+    return result
+
+
+def save(name, value):
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = STATE / name
+    temporary = target.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(target)
+
+
+def packages():
+    return dict(line.split(' ', 1) for line in
+                run('brew', 'list', '--formula', '--versions').stdout.splitlines())
+
+
+def bootstrap():
+    if not shutil.which('brew'):
+        raise Failure('Homebrew is required; install it from https://brew.sh first.')
+    before = packages()
+    save('host-latest.json' if (STATE / 'host-before.json').exists() else 'host-before.json',
+         {'packages': before,
+          'casks': run('brew', 'list', '--cask', '--versions').stdout,
+          'dependencies': run('brew', 'deps', '--installed').stdout,
+          'podman_formula': run('brew', 'info', '--json=v2', 'podman').stdout})
+    if 'podman' in before:
+        return
+    result = run('brew', 'install', '--dry-run', 'podman')
+    preview = result.stdout + result.stderr
+    print(preview)
+    save('install-preview.json', {'output': preview})
+    planned = set(re.findall(r'(?m)^([a-zA-Z0-9@+_.-]+)\s+\d', preview))
+    if planned.intersection(before) or 'upgrade' in preview.lower() or 'reinstall' in preview.lower():
+        raise Failure('Installation preview changes existing packages; user approval required.')
+    try:
+        if 'podman' not in before:
+            print(run('brew', 'install', 'podman').stdout)
+    finally:
+        after = packages()
+        previous = STATE / 'host-additions.json'
+        additions = json.loads(previous.read_text()) if previous.exists() else {}
+        additions.update({name: version for name, version in after.items() if name not in before})
+        save('host-additions.json', additions)
+    changed = [name for name in before if before[name] != after.get(name)]
+    if changed:
+        raise Failure('Unexpected host package changes: ' + ', '.join(changed))
+
+
+def json_run(*args):
+    return json.loads(run(*args).stdout)
+
+
+def inventory(resources=False):
+    if not shutil.which('podman'):
+        return {'machines': [], 'connections': [], 'podman': 'not installed'}
+    snapshot = {'machines': json_run('podman', 'machine', 'list', '--format', 'json'),
+                'connections': json_run('podman', 'system', 'connection', 'list', '--format', 'json')}
+    if resources:
+        snapshot['resources'] = {}
+        running = {m['Name'] for m in snapshot['machines'] if m.get('Running')}
+        for connection in snapshot['connections']:
+            name = connection['Name']
+            if (not connection.get('IsMachine', False) or
+                    (name not in running and name.removesuffix('-root') not in running)):
+                snapshot['resources'][name] = 'Not queried: machine stopped or non-machine connection.'
+                continue
+            results = {}
+            for kind, args in [('containers', ('ps', '--all', '--format', 'json')),
+                               ('volumes', ('volume', 'ls', '--format', 'json')),
+                               ('images', ('images', '--format', 'json'))]:
+                result = run('podman', '--connection', name, *args, check=False)
+                results[kind] = json.loads(result.stdout) if result.returncode == 0 else 'Unavailable'
+            snapshot['resources'][name] = results
+    return snapshot
+
+
+def setup():
+    snapshot = inventory(resources=True)
+    if not (STATE / 'owner.json').exists():
+        if any(m['Name'] == MACHINE for m in snapshot['machines']):
+            raise Failure('Refusing unowned machine rss-aggregator; do not delete or adopt it automatically.')
+        if any(c['Name'] in (MACHINE, MACHINE + '-root') for c in snapshot['connections']):
+            raise Failure('Refusing unowned project connection; resolve the name collision manually.')
+    else:
+        owned()
+    save('podman-latest.json' if (STATE / 'podman-before.json').exists() else 'podman-before.json', snapshot)
+    bootstrap()
+    snapshot = inventory(resources=True)
+    save('podman-pre-machine.json', snapshot)
+    if not (STATE / 'owner.json').exists():
+        # A newly installed CLI can reveal resources that could not be inventoried before installation.
+        if (any(m['Name'] == MACHINE for m in snapshot['machines']) or
+                any(c['Name'] in (MACHINE, MACHINE + '-root') for c in snapshot['connections'])):
+            raise Failure('Refusing unowned project machine/connection discovered after CLI installation.')
+        run('podman', 'machine', 'init', '--cpus', '2', '--memory', '2048',
+            '--disk-size', '20', '--rootful=false', '--update-connection=false', MACHINE)
+        machine = json_run('podman', 'machine', 'inspect', MACHINE)[0]
+        connections = inventory()['connections']
+        for existing in snapshot['connections']:
+            current = next((c for c in connections if c['Name'] == existing['Name']), {})
+            if any(existing.get(key) != current.get(key) for key in ('URI', 'Identity', 'Default')):
+                raise Failure('Podman changed a pre-existing connection/default; inspect locally before continuing.')
+        connection = next(c for c in connections if c['Name'] == MACHINE)
+        save('owner.json', {'token': str(uuid.uuid4()), 'machine': machine,
+                            'connection': connection})
+    print('Project machine is set up. Setup does not start or stop it.')
+
+
+def owned():
+    path = STATE / 'owner.json'
+    if not path.exists():
+        raise Failure('Project is not set up. Run scripts/rss setup.')
+    owner = json.loads(path.read_text())
+    current = json_run('podman', 'machine', 'inspect', MACHINE)[0]
+    for key in ('Name', 'Created', 'ConfigDir', 'SSHConfig', 'Rootful'):
+        if current.get(key) != owner['machine'].get(key):
+            raise Failure('Project machine identity changed; refusing to modify it.')
+    connections = inventory()['connections']
+    connection = next((c for c in connections if c['Name'] == MACHINE), {})
+    for key in ('URI', 'Identity'):
+        if connection.get(key) != owner['connection'].get(key):
+            raise Failure('Project connection identity changed; refusing to modify it.')
+    return owner, current
+
+
+def start():
+    owner, machine = owned()
+    if machine['State'] not in ('stopped', 'running'):
+        raise Failure('Project VM is ' + machine['State'] + '; wait and inspect before retrying.')
+    try:
+        port = int(os.environ.get('RSS_PORT', '8080'))
+    except ValueError as error:
+        raise Failure('RSS_PORT must be an integer between 1024 and 65535.') from error
+    if not 1024 <= port <= 65535:
+        raise Failure('RSS_PORT must be between 1024 and 65535.')
+    if machine['State'] != 'running':
+        conflicts = [m['Name'] for m in inventory()['machines']
+                     if m['Name'] != MACHINE and m.get('Running')]
+        if conflicts:
+            raise Failure('Another machine is running: ' + ', '.join(conflicts) +
+                          '. Stop it yourself if appropriate; it has not been changed.')
+        print(run('podman', 'machine', 'start', '--update-connection=false', MACHINE).stdout)
+    # Check any colliding resources before touching the image or application.
+    app = check_label('container', APP, owner) if exists('container', APP) else None
+    if exists('volume', VOLUME):
+        check_label('volume', VOLUME, owner)
+    if not app or not app['State']['Running']:
+        with socket.socket() as listener:
+            # Permit TCP TIME_WAIT from our previous listener, not another active listener.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                listener.bind(('127.0.0.1', port))
+            except OSError as error:
+                raise Failure(f'Loopback port {port} is occupied; choose RSS_PORT or stop its owner yourself.') from error
+    security(owner)
+    if not exists('volume', VOLUME):
+        podman('volume', 'create', '--label', LABEL + '=' + owner['token'], VOLUME)
+    if app:
+        verified = json.loads((STATE / 'security.json').read_text())
+        expected = verified['image_id']
+        binding = app['HostConfig']['PortBindings'].get('80/tcp', [])
+        if (app['Image'].removeprefix('sha256:') != expected.removeprefix('sha256:') or
+                binding != [{'HostIp': '127.0.0.1', 'HostPort': str(port)}] or
+                app['Config']['Entrypoint'] != ['./Docker/entrypoint.sh'] or
+                app['Config']['Cmd'] != verified['official_command'] or
+                'LISTEN=127.0.0.1:8088' not in app['Config']['Env'] or
+                not any(m.get('Name') == VOLUME and m['Destination'] == '/var/www/FreshRSS/data'
+                        for m in app['Mounts'])):
+            raise Failure('Existing application image/port/entrypoint differs; use replace after checking configuration.')
+        if app['State']['Running']:
+            podman('stop', '--time', '60', APP)
+        podman('start', APP)
+    else:
+        podman('create', '--name', APP, '--pull=never', '--platform', IMAGE['platform'],
+               '--label', LABEL + '=' + owner['token'], '--restart=no',
+               '--publish', f'127.0.0.1:{port}:80',
+               '--mount', f'type=volume,source={VOLUME},destination=/var/www/FreshRSS/data',
+               '--env', 'CRON_MIN=*/20', '--env', 'TZ=UTC', '--env', 'ENABLE_ACCESS_LOG=0',
+               '--env', 'LISTEN=127.0.0.1:8088', '--env', 'TRUSTED_PROXY=0',
+               '--env', 'COPY_LOG_TO_SYSLOG=Off', '--env', 'COPY_SYSLOG_TO_STDERR=Off', IMAGE['image'])
+        podman('cp', str(ROOT / 'config/config-user.custom.php'),
+               APP + ':/var/www/FreshRSS/data/config-user.custom.php')
+        podman('cp', str(ROOT / 'config/public-feed.opml'), APP + ':/var/www/FreshRSS/data/opml.xml')
+        podman('start', APP)
+    security(owner, target=APP)
+    ready(port)
+    scheduler(owner)
+    fetch()
+    print(f'FreshRSS: http://127.0.0.1:{port} (form login; complete installer locally on first run).')
+
+
+def podman(*args, check=True, input=None):
+    return run('podman', '--connection', MACHINE, *args, check=check, input=input)
+
+
+def exists(kind, name):
+    result = podman(kind, 'exists', name, check=False)
+    if result.returncode not in (0, 1):
+        raise Failure(f'Cannot determine {kind} state: {result.stderr.strip()}')
+    return result.returncode == 0
+
+
+def check_label(kind, name, owner):
+    item = json.loads(podman(kind, 'inspect', name).stdout)[0]
+    labels = item.get('Labels') if kind == 'volume' else item.get('Config', {}).get('Labels')
+    if (labels or {}).get(LABEL) != owner['token']:
+        raise Failure(f'Refusing unowned {kind} {name}.')
+    return item
+
+
+def security(owner, target=CHECK):
+    image = IMAGE['image']
+    result = podman('image', 'inspect', image, check=False)
+    if result.returncode:
+        print('Pulling pinned official FreshRSS image...')
+        podman('pull', '--platform', IMAGE['platform'], image)
+        result = podman('image', 'inspect', image)
+    info = json.loads(result.stdout)[0]
+    labels = info.get('Labels', {})
+    if (info['Os'] + '/' + info['Architecture'] != IMAGE['platform'] or
+            image not in info['RepoDigests'] or
+            image.split('@')[0] + '@' + IMAGE['platform_manifest'] not in info['RepoDigests'] or
+            labels.get('org.opencontainers.image.version') != IMAGE['version'] or
+            labels.get('org.opencontainers.image.revision') != IMAGE['revision'] or
+            info['Config']['Entrypoint'] != ['./Docker/entrypoint.sh']):
+        raise Failure('Pinned official image identity/platform/entrypoint mismatch.')
+    if target == CHECK and exists('container', CHECK):
+        check_label('container', CHECK, owner)
+        podman('rm', '--force', '--volumes', CHECK)
+    name = '.project-security-' + uuid.uuid4().hex + '.php'
+    try:
+        # The disposable preflight has no published ports/data/accounts. The actual app
+        # remains on its internal-only listener. Keep upstream startup intact in both.
+        if target == CHECK:
+            podman('run', '--detach', '--name', CHECK, '--pull=never', '--platform', IMAGE['platform'],
+                   '--label', LABEL + '=' + owner['token'], '--env', 'CRON_MIN=',
+                   '--env', 'ENABLE_ACCESS_LOG=0', image)
+        else:
+            check_label('container', APP, owner)
+        podman('cp', str(ROOT / 'config/security-probe.php'), target + ':/var/www/FreshRSS/p/' + name)
+        internal_port = 80 if target == CHECK else 8088
+        code = f'echo file_get_contents("http://127.0.0.1:{internal_port}/{name}");'
+        data = None
+        for _ in range(30):
+            result = podman('exec', target, 'php', '-r', code, check=False)
+            try:
+                data = json.loads(result.stdout)
+                break
+            except ValueError:
+                time.sleep(1)
+        if data is None:
+            raise Failure('Apache PHP security probe did not become ready; application not published.')
+        version = tuple(int(n) for n in data['php'].split('-')[0].split('.')[:3])
+        minimum = tuple(int(n) for n in IMAGE['php_minimum'].split('.'))
+        if version[:2] != minimum[:2] or version < minimum:
+            raise Failure('Unsupported/unfixed PHP runtime: ' + data['php'])
+        if data['sapi'] != 'apache2handler' or data['upload_progress'] not in ('', '0'):
+            raise Failure('Effective Apache PHP session upload progress is not disabled.')
+        record = {'checked_at': datetime.now(timezone.utc).isoformat(),
+                  'image': image, 'image_id': info['Id'], 'platform': IMAGE['platform'],
+                  'platform_manifest': IMAGE['platform_manifest'], 'freshrss': IMAGE['version'],
+                  'advisory_review_date': IMAGE['security_checked'],
+                  'web': data,
+                  'checked_container': target,
+                  'official_command': info['Config']['Cmd'],
+                  'cli_php': podman('exec', target, 'php', '-r', 'echo PHP_VERSION;').stdout}
+        save('security.json', record)
+    finally:
+        # --volumes removes only the disposable check container's anonymous volume, never project data.
+        if target == CHECK:
+            if exists('container', CHECK):
+                check_label('container', CHECK, owner)
+                podman('rm', '--force', '--volumes', CHECK)
+        else:
+            podman('exec', APP, 'rm', '-f', '/var/www/FreshRSS/p/' + name)
+    if target == APP:
+        # Different internal ports let Apache gracefully open port 80 only after the probe is removed.
+        code = ('$p="/etc/apache2/sites-available/FreshRSS.Apache.conf";'
+                '$s=file_get_contents($p);'
+                'if(substr_count($s,"Listen 127.0.0.1:8088")!==1){exit(1);}'
+                'file_put_contents($p,str_replace("Listen 127.0.0.1:8088","Listen 80",$s));')
+        podman('exec', APP, 'php', '-r', code)
+        podman('exec', APP, 'sh', '-c', '. /etc/apache2/envvars; apache2 -k graceful')
+    print('Verified official FreshRSS ' + IMAGE['version'] + ', Apache PHP ' + data['php'] +
+          ', upload progress disabled (' + target + ', probe removed before serving).')
+
+
+def stop():
+    owner, machine = owned()
+    if machine['State'] == 'stopped':
+        print('Project VM already stopped.')
+        return
+    if machine['State'] != 'running':
+        raise Failure('Project VM is ' + machine['State'] + '; wait and inspect before retrying.')
+    # Refuse to stop a VM that has acquired unrelated running containers.
+    containers = json.loads(podman('ps', '--format', 'json').stdout)
+    for item in containers:
+        name = item['Names'][0] if isinstance(item['Names'], list) else item['Names']
+        if name not in (APP, CHECK):
+            raise Failure('Unrelated running container ' + name + '; project VM left running.')
+        check_label('container', name, owner)
+    for name in (APP, CHECK):
+        if exists('container', name):
+            item = check_label('container', name, owner)
+            if item['State']['Running']:
+                # Verify all container processes have exited before asking the VM to stop.
+                podman('stop', '--time', '60', name)
+                if check_label('container', name, owner)['State']['Running']:
+                    raise Failure('Application did not stop; VM left running.')
+    print(run('podman', 'machine', 'stop', MACHINE).stdout)
+    print('Project application writers and VM stopped. No external backup (issue #2 deferred).')
+
+
+def status():
+    if not (STATE / 'owner.json').exists():
+        print('FreshRSS is not set up. Run scripts/rss setup.')
+        return
+    owner, machine = owned()
+    print('Project VM: ' + machine['State'])
+    if machine['State'] == 'running':
+        if exists('container', APP):
+            app = check_label('container', APP, owner)
+            print('FreshRSS: ' + app['State']['Status'])
+            if app['State']['Running']:
+                scheduler(owner)
+                bindings = app['HostConfig']['PortBindings'].get('80/tcp', [])
+                if len(bindings) != 1 or bindings[0]['HostIp'] != '127.0.0.1':
+                    raise Failure('Application loopback publication differs from the project configuration.')
+                ready(int(bindings[0]['HostPort']))
+                print('Loopback HTTP: ready.')
+        else:
+            print('FreshRSS container absent.')
+    path = STATE / 'security.json'
+    if path.exists():
+        record = json.loads(path.read_text())
+        print('Last security check: ' + record['checked_at'] + ', PHP ' + record['web']['php'] +
+              ' (' + record['checked_container'] + ')')
+
+
+def ready(port):
+    from urllib.error import URLError
+    from urllib.request import urlopen
+    for _ in range(30):
+        try:
+            with urlopen(f'http://127.0.0.1:{port}/', timeout=2) as response:
+                if response.status == 200:
+                    return
+        except (URLError, TimeoutError):
+            time.sleep(1)
+    raise Failure('FreshRSS HTTP did not become ready; VM retained for diagnosis.')
+
+
+def scheduler(owner):
+    check_label('container', APP, owner)
+    crontab = podman('exec', APP, 'crontab', '-l').stdout
+    if not any(line.startswith('*/20 * * * * ') and 'actualize_script.php' in line
+               for line in crontab.splitlines()):
+        raise Failure('Effective 20-minute cron job missing.')
+    podman('exec', APP, 'sh', '-c', 'test -r /run/crond.pid && kill -0 "$(cat /run/crond.pid)"')
+    print('Scheduler: cron running, */20 (UTC minutes 00, 20, 40).')
+
+
+def fetch():
+    owner, machine = owned()
+    if machine['State'] != 'running':
+        raise Failure('Start the project VM before fetching.')
+    check_label('container', APP, owner)
+    installed = podman('exec', APP, 'test', '-f', '/var/www/FreshRSS/data/applied_migrations.txt', check=False)
+    if installed.returncode == 1:
+        print('FreshRSS installer pending; after local installation, run scripts/rss fetch for the preconfigured public feed.')
+        return
+    if installed.returncode:
+        raise Failure('Could not determine FreshRSS installation state.')
+    result = podman('exec', '--user', 'www-data', APP, 'php', 'app/actualize_script.php', check=False)
+    if result.returncode:
+        raise Failure('Immediate feed fetching failed; inspect local FreshRSS logs (may contain sensitive URLs).')
+    print('Immediate feed actualization completed (upstream cache/TTL/backoff still apply).')
+
+
+def replace():
+    owner, machine = owned()
+    if machine['State'] != 'running':
+        raise Failure('Start the project before replacing its container.')
+    check_label('volume', VOLUME, owner)
+    if exists('container', APP):
+        check_label('container', APP, owner)
+        podman('stop', '--time', '60', APP)
+        podman('rm', APP)  # Never --volumes: the named data volume survives.
+    start()
+
+
+def verify():
+    _owner, machine = owned()
+    if machine['State'] != 'running':
+        raise Failure('Start the project before verification.')
+    start()  # Reopens serving only after checking the effective application Apache/PHP.
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['setup', 'start', 'status', 'fetch', 'verify', 'replace', 'stop'])
+    args = parser.parse_args()
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE / 'command.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Failure('Another project command is running; wait for it to finish.') from error
+        {'setup': setup, 'start': start, 'status': status, 'stop': stop,
+         'fetch': fetch, 'verify': verify, 'replace': replace}[args.command]()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Failure, ValueError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)
