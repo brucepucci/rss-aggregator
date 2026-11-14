@@ -72,12 +72,14 @@ def check(root: Path | None = None) -> dict:
         earlier check fails; child output is diagnostic stderr, not JSON stdout.
         Tools use the selected checkout's local ``.venv``, never the caller's
         editable installation. This operation does not create or sync it.
+        Ruff fixes and fix-only mode are explicitly disabled, including when
+        the selected checkout's configuration enables them.
     """
     return _tools(
         root,
         [
             ("pytest", ["pytest", "-p", "no:cacheprovider", "-m", "not live"]),
-            ("lint", ["ruff", "check", "--no-cache"]),
+            ("lint", ["ruff", "check", "--no-fix", "--no-fix-only", "--no-cache"]),
             ("format", ["ruff", "format", "--check", "--no-cache"]),
         ],
     )

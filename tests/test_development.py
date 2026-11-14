@@ -279,6 +279,62 @@ def test_explicit_fix_and_format_are_separate(project):
     assert payload["ok"]
 
 
+@pytest.mark.parametrize(
+    "autofix", ["fix = true", "fix-only = true", "fix = true\nfix-only = true"]
+)
+def test_gate_and_push_disable_configured_ruff_fixes(project, autofix):
+    directory, run = project
+    configuration = directory / "pyproject.toml"
+    original_configuration = configuration.read_text()
+    ruff_section = '[tool.ruff]\ntarget-version = "py310"'
+    assert original_configuration.count(ruff_section) == 1
+    configuration.write_text(
+        original_configuration.replace(ruff_section, f"{ruff_section}\n{autofix}")
+    )
+    sample = directory / "tests/test_sample.py"
+    sample.write_text(
+        "import os\nfrom pathlib import Path\n\n\n"
+        'def test_sample():\n    assert Path(".").is_dir()\n'
+    )
+    add_remote(directory, run)
+    result, payload = invoke(run, "setup")
+    assert result.returncode == 0 and payload["active"], result.stderr
+    assert run("git", "add", ".").returncode == 0
+    assert (
+        run(
+            "git", "commit", "-m", "Enable Ruff autofix with a lint violation"
+        ).returncode
+        == 0
+    )
+    before = tracked_snapshot(directory, run)
+
+    result, payload = invoke(run, "check")
+    assert tracked_snapshot(directory, run) == before, result.stderr
+    assert result.returncode == 1 and not payload["ok"], result.stderr
+    assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
+        "pytest": 0,
+        "lint": 1,
+        "format": 0,
+    }
+    assert "F401" in result.stderr
+    assert check(directory) == payload
+    assert tracked_snapshot(directory, run) == before
+
+    result = run("git", "push", "disposable", "HEAD:refs/heads/main")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "F401" in result.stdout + result.stderr
+    assert tracked_snapshot(directory, run) == before
+    result = run("git", "ls-remote", "disposable", "refs/heads/main")
+    assert result.returncode == 0 and not result.stdout.strip()
+
+    result, payload = invoke(run, "fix")
+    assert result.returncode == 0 and payload["ok"], result.stderr
+    assert "import os" not in sample.read_text()
+    assert "from pathlib import Path" in sample.read_text()
+    result, payload = invoke(run, "check")
+    assert result.returncode == 0 and payload["ok"], result.stderr
+
+
 def test_fix_does_not_apply_unsafe_changes_even_if_project_config_enables_them(project):
     directory, run = project
     configuration = directory / "pyproject.toml"

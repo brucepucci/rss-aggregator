@@ -387,7 +387,7 @@ existing-hook inspection retain their documented behavior.
 
 | Command | Purpose, defaults and result |
 | --- | --- |
-| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks, without fixing source. Always run all three; JSON `checks` names are `pytest`, `lint`, `format`. Inherited pytest/import-path overrides are stripped and pytest receives explicit `-m 'not live'`, so ambient selection cannot narrow the suite, enable live tests or substitute the invoking checkout's imports. |
+| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks, without fixing source. Always run all three; JSON `checks` names are `pytest`, `lint`, `format`. Inherited pytest/import-path overrides are stripped and pytest receives explicit `-m 'not live'`, so ambient selection cannot narrow the suite, enable live tests or substitute the invoking checkout's imports. Ruff receives `--no-fix --no-fix-only`, overriding configured autofixes so lint violations fail without rewriting source. |
 | `rss-dev setup [--project DIRECTORY]` | Inspect Git arrangements and activate a pre-push hook only when safe. JSON contains `ok` and `active`, with `reason` and `next_step` for no-remote/manual-resolution cases. No remote: success but `active: false`; rerun after adding a remote. With a remote, conflicting or recognized nonexecutable hooks: failure, `active: false`, existing bytes/mode preserved, manual resolution required. A recognized executable hook is retained unchanged. See [Managed pre-push hooks](#managed-pre-push-hooks). |
 | `rss-dev format [--project DIRECTORY]` | Explicitly rewrite Python formatting using Ruff; no lint fixes. JSON `checks` name: `format`. |
 | `rss-dev fix [--project DIRECTORY]` | Explicitly apply safe Ruff lint fixes only; unsafe fixes disabled, no formatting. JSON `checks` name: `fix`. |
@@ -461,9 +461,13 @@ fixtures use offline uv sync from caches populated by the initial sync. A missin
 cache is an actionable failure, not a skipped check; rerun the initial sync rather
 than enabling network access inside tests.
 
-`rss-dev check` runs **all default pytest tests**, `ruff check`, and
-`ruff format --check`, even if an earlier check fails. It strips inherited
-`PYTEST_*` environment variables (including `PYTEST_ADDOPTS` and
+`rss-dev check` runs **all default pytest tests**,
+`ruff check --no-fix --no-fix-only`, and `ruff format --check`, even if an earlier
+check fails. The explicit lint flags override `[tool.ruff]` settings `fix = true`
+and `fix-only = true`: violations remain nonzero failures and source bytes stay
+unchanged. Use `rss-dev fix` to request safe lint rewriting explicitly.
+
+`check` strips inherited `PYTEST_*` environment variables (including `PYTEST_ADDOPTS` and
 `PYTEST_PLUGINS`) and explicitly passes `-m 'not live'`; ambient pytest options
 cannot select a subset or opt into live tests in the baseline. Child output is
 diagnostic stderr; stdout is `{ "ok": boolean, "checks": [{ "name": ..., "returncode": ... }] }`

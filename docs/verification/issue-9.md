@@ -270,3 +270,37 @@ No production behavior was deliberately broken outside disposable fixtures; no
 live resources or real repository hooks were touched. This is a local
 verification checkpoint, not a claim of a GitHub run, publication, reviewer
 acceptance or integration for these changes.
+
+## Local configured-autofix regression checkpoint (2026-11-14)
+
+This follow-up starts from `692597f45bfc91cb03ab3daaaa357b1a521d83d1` and
+addresses the [check-only Ruff finding](https://github.com/brucepucci/rss-aggregator/pull/11#discussion_r4575981380).
+Ruff honors the selected checkout's `fix` and `fix-only` configuration even
+without an explicit `--fix` option. Omitting that option did not make lint
+read-only.
+
+The three disposable-checkout regressions enable `fix = true`,
+`fix-only = true`, and both together. Each contains an unused `os` import
+alongside a used `Path` import. Before the fix,
+`uv run --locked --offline python -B -m pytest -p no:cacheprovider tests/test_development.py -k disable_configured_ruff_fixes -q`
+failed all three source-preservation assertions: the baseline deleted the unused
+import, with diagnostics reporting one fixed violation. After adding
+`--no-fix --no-fix-only` to the shared baseline's Ruff invocation, the same
+command passed all three cases.
+
+Each regression verifies that CLI and callable checks report statuses
+`pytest=0, lint=1, format=0`, retain byte-for-byte tracked contents and Git
+status, and reject an actual push to a disposable local bare remote without
+changing files or publishing a ref. The explicit `rss-dev fix` still removes the
+unused import, preserves the used import, and permits a subsequent clean check.
+README and implementation guidance document the configuration override.
+
+The full `uv run --locked --offline rss-dev check` passed **60 default tests**
+(including all 31 developer-gate cases), with five live tests deselected, plus
+Ruff lint and format checks on Python 3.13.18. The gate left the working-source
+diff unchanged. CLI help/command-option inventory, documented Ruff disabling
+flags, local document links/anchors and `git diff --check` also passed.
+
+No live resources or real repository hooks were touched. This checkpoint does
+not claim new GitHub CI execution, publication, reviewer acceptance or integration;
+the prior published-head CI and controlled-failure evidence remain historical.

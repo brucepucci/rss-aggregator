@@ -64,6 +64,12 @@ Hook installation uses the same selected environment. Missing environments fail
 without implicit synchronization or fallback to the invoking checkout's tools.
 External/shared uv environments are not selected by these operations.
 
+The baseline invokes Ruff lint with `--no-fix --no-fix-only`, explicitly
+overriding selected-checkout autofix configuration. Configured `fix` or
+`fix-only` mode must not turn checks into source rewriting or conceal a lint
+failure. The explicit `fix` operation retains safe lint mutation; `format`
+remains the separate formatting operation.
+
 ## Preserved safety contract
 
 - Homebrew inventories and addition ledger, upgrade/reinstall refusal, no automatic
