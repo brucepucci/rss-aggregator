@@ -9,8 +9,9 @@ agent, or automatic application startup is installed by this project.
 This branch contains the unmerged implementation of [issue #1](https://github.com/brucepucci/rss-aggregator/issues/1).
 Main at `d991e39` contains documentation and the canonical Python standard, not this
 runtime. The runtime commands below are working branch-specific behavior; Python
-tooling adoption is implemented on the nested #9 branch described below, not yet
-merged back into #1 or main. See [Python development and adoption](#python-development-and-adoption).
+tooling adoption is under review in draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11),
+targeting `feat/issue-1-local-freshrss`, not main. It is not yet merged back into
+#1 or main. See [Python development and adoption](#python-development-and-adoption).
 
 Backups, guarded removal, Tailscale, ReadKit and Linux deployment are **not yet
 implemented**. See [architecture decisions](docs/adr/).
@@ -240,7 +241,7 @@ Development configuration is non-secret and required for the commands below:
 | `.python-version` | uv-managed Python 3.13.18. | Update intentionally with compatible project/Ruff targets and verify a fresh sync; do not silently upgrade host packages. |
 | `uv.lock` | Committed application dependency versions/hashes, including compatibility markers. | Regenerate only for intended dependency changes; normal setup/checks use `--locked`, not an implicit lock update. |
 | `.pre-commit-config.yaml` | One complete check-only baseline at pre-push, local/system environment, all files regardless of changed filenames. | Keep it aligned with `rss-dev check`; explicitly run guarded `rss-dev setup` when activating hooks. |
-| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; actual GitHub passing/failing evidence is still pending publication. |
+| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; a published revision passed GitHub Actions (see below), but controlled-failing CI evidence and GitHub verification of current local fixes remain outstanding. |
 
 For example, to move an **already installed** instance to loopback port 8081:
 
@@ -297,21 +298,56 @@ update the platform/manifest in `config/image.json`, and run full security and
 integration verification on that host. The Mac lifecycle command is not a Linux
 server deployment implementation. Never assume the arm64 manifest is portable.
 
-## Command results and Python interface
+## CLI reference
+
+### Entrypoints and help
+
+Run from a synchronized checkout (`uv sync --locked` first):
+
+| Invocation | Purpose and accepted arguments/options |
+| --- | --- |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the seven operations below. |
+| `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint. |
+| `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. |
+| `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
+
+`--help` at either group or any subcommand prints conventional text usage to
+stdout and exits 0 without operating on the instance or installing hooks. For
+example, `uv run --locked rss --help`, `./scripts/rss start --help`, and
+`uv run --locked rss-dev setup --help`. Click exposes `--help`, not `-h`.
+Invoking a group without a command displays usage and exits 2. Unknown commands,
+extra positional arguments and unsupported options also exit 2 with stderr
+usage/diagnostics, not operation JSON. There is no implicit operation.
+
+Runtime subcommands have **no positional arguments or options except `--help`**;
+in particular, `rss` has no `--project` option. Runtime configuration comes from
+the [settings above](#configuration). The launcher's `--project` is an internal
+uv option selecting its checkout, not an option accepted by `rss`. Likewise,
+`uv run` options such as `--locked` and `--offline` precede the executable name;
+`--offline` allows cached-environment execution, not offline live-service access.
+Failures in uv or the shell launcher can occur before Click starts and produce
+stderr diagnostics/nonzero status without JSON.
+
+### Runtime commands and results
+
+Use `uv run --locked rss COMMAND` (or either runtime alias above) with these exact
+subcommands; each also accepts `--help`. Lifecycle effects are detailed in
+[Normal operation](#normal-operation).
 
 Successful runtime operations emit exactly one indented JSON object; they do not
 emit a result on failure. `--help` is conventional Click help, not operation JSON.
 Runtime/configuration/external-command failures exit 1 with stderr diagnostics;
 invalid command usage exits 2. Capture stdout separately when consuming results.
 
-| Operation | JSON result fields |
-| --- | --- |
-| `setup` | `machine: "rss-aggregator"`, `created: boolean`. No service startup. |
-| `status` | `machine`, `application`; when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
-| `fetch` | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed. |
-| `stop` | `machine: "stopped"`, `already_stopped: boolean`, `backup: "deferred"`. |
-| `start` | `machine: "running"`, `url`, `security`, `scheduler`, `fetch`. |
-| `replace` / `verify` | Start fields plus `replaced: true` / `verified: true`. |
+| Command | Purpose | JSON result fields |
+| --- | --- | --- |
+| `rss setup` | Inventory/install missing Podman CLI and initialize the owned VM without starting services. | `machine: "rss-aggregator"`, `created: boolean`. |
+| `rss start` | Start/restart the owned application after security checks, verify scheduling and fetch feeds. | `machine: "running"`, `url`, `security`, `scheduler`, `fetch`. |
+| `rss status` | Inspect state without starting anything. | `machine`, `application`; when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
+| `rss fetch` | Run feed actualization immediately. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed. |
+| `rss verify` | Restart/recheck the running application before reopening service; briefly interrupts service. | Start fields plus `verified: true`. |
+| `rss replace` | Recreate only the owned application container, preserving its named data volume. | Start fields plus `replaced: true`. |
+| `rss stop` | Stop application writers and the owned VM; no external backup. | `machine: "stopped"`, `already_stopped: boolean`, `backup: "deferred"`. |
 
 `scheduler` contains `running`, `cron` and `timezone`. `security` is the sanitized
 image/PHP audit record also stored in private `security.json`: checked time,
@@ -319,6 +355,61 @@ container, image identity/platform, FreshRSS version, advisory-review
 date, effective web metadata, CLI PHP version and the official command. It is a
 record of a check, not an advisory scan or a guarantee of future security. No
 universal result envelope or extra text-output mode is required.
+
+### Developer commands and results
+
+Each command has syntax
+`uv run --locked rss-dev COMMAND [--project DIRECTORY] [--help]`
+and accepts no positional arguments. `--project DIRECTORY` is optional
+**on each subcommand**, after `check`, `setup`, `format` or `fix`; it is not a
+group-level option. It selects the directory to operate in, defaults to the
+process's **current working directory**, and resolves relative paths from there.
+It is not automatically the executable's source checkout. Files are rejected as
+usage errors; select a synchronized project directory (its Git repository root
+for `setup`). `--help` prints help only. There are no other project-defined flags.
+
+| Command | Purpose, defaults and result |
+| --- | --- |
+| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks, without fixing source. Always run all three; JSON `checks` names are `pytest`, `lint`, `format`. Inherited `PYTEST_*` variables are stripped and pytest receives explicit `-m 'not live'`, so ambient selection cannot narrow the suite or enable live tests. |
+| `rss-dev setup [--project DIRECTORY]` | Inspect Git arrangements and activate a pre-push hook only when safe. JSON contains `ok` and `active`, with `reason` and `next_step` for no-remote/manual-resolution cases. No remote: success but `active: false`; rerun after adding a remote. With a remote, conflicting or recognized nonexecutable hooks: failure, `active: false`, existing bytes/mode preserved, manual resolution required. A recognized executable hook is retained unchanged. See [Managed pre-push hooks](#managed-pre-push-hooks). |
+| `rss-dev format [--project DIRECTORY]` | Explicitly rewrite Python formatting using Ruff; no lint fixes. JSON `checks` name: `format`. |
+| `rss-dev fix [--project DIRECTORY]` | Explicitly apply safe Ruff lint fixes only; unsafe fixes disabled, no formatting. JSON `checks` name: `fix`. |
+
+Examples: `uv run --locked rss-dev check` checks the current directory;
+`uv run --locked rss-dev check --project /path/to/checkout` selects another one.
+For `check`, `format` and `fix`, stdout is one indented JSON object shaped as
+`{"ok": true, "checks": [{"name": "pytest", "returncode": 0}, ...]}` (entries
+vary by command). `ok` is true only if every child succeeds. OS-level child
+launch failures are recorded with return code 127. `setup` instead emits its hook-status
+object, not a `checks` array. Logical failures still emit JSON with `ok: false`
+and exit 1; success exits 0, even for inactive no-remote setup. Child output goes
+to stderr. Invalid CLI usage exits 2 without result JSON. Formatting/fixes are
+explicitly mutating, unlike the baseline; neither starts FreshRSS.
+
+### Pytest selection and project option
+
+`uv run --locked pytest [OPTIONS] [file_or_dir ...]` runs tests directly, with
+human-readable pytest reports rather than the CLI JSON contract. With no paths,
+configuration selects `tests/`; explicit paths/node IDs narrow a direct run, not
+the required full baseline. Project-specific selection and documented controls:
+
+| Argument/option | Purpose and default | Example |
+| --- | --- | --- |
+| `[file_or_dir ...]` | Optional test paths/node IDs; omit for the complete configured suite. | `uv run --locked pytest tests/test_commands.py` |
+| `-m EXPRESSION` | Marker expression; project default is `not live`. Explicit `-m live` selects real-service tests and requires their prerequisites. | `uv run --locked pytest -m live` |
+| `--observe-cron` | Project flag, takes no value, defaults to false. With live tests selected, enable the 20–40 minute observation of two real scheduled executions. Raises a usage error if no live-marked test remains selected; it does not itself select live tests. | `uv run --locked pytest -m live --observe-cron -s` |
+| `-s` | Disable pytest output capture (normally enabled), useful for live observation diagnostics. | As above. |
+| `-h`, `--help` | Conventional pytest text help and configuration, including `--observe-cron`; exits 0 without running tests. | `uv run --locked --offline pytest --help` |
+
+Pytest's remaining upstream options are listed by that help command. Direct
+pytest runs retain pytest's normal environment handling; use `rss-dev check` for
+the guarded baseline. Pytest exits 0 on success, 1 for failed tests, 2 for
+interruption/collection errors, 3 for internal errors, 4 for usage errors
+(including invalid `--observe-cron` selection), or 5 when no tests are collected.
+See [Explicit live/platform checks](#explicit-liveplatform-checks) before selecting
+live tests; a default-suite pass is not live evidence.
+
+### Python interface
 
 Python callers use the same guarded behavior independently of Click:
 
@@ -354,8 +445,11 @@ cache is an actionable failure, not a skipped check; rerun the initial sync rath
 than enabling network access inside tests.
 
 `rss-dev check` runs **all default pytest tests**, `ruff check`, and
-`ruff format --check`, even if an earlier check fails. Child output is diagnostic
-stderr; stdout is `{ "ok": boolean, "checks": [{ "name": ..., "returncode": ... }] }`
+`ruff format --check`, even if an earlier check fails. It strips inherited
+`PYTEST_*` environment variables (including `PYTEST_ADDOPTS` and
+`PYTEST_PLUGINS`) and explicitly passes `-m 'not live'`; ambient pytest options
+cannot select a subset or opt into live tests in the baseline. Child output is
+diagnostic stderr; stdout is `{ "ok": boolean, "checks": [{ "name": ..., "returncode": ... }] }`
 formatted with indentation. Any failed check exits 1. These are check-only gates:
 pytest cache/bytecode writes and Ruff cache writes are disabled within the gate;
 tracked and working source files are not rewritten. A standalone default suite is
@@ -398,10 +492,13 @@ explains that hooks are not installed, and instructs you to rerun setup after
 adding a remote. There is no automatic later discovery. With an existing foreign,
 legacy, symlinked or custom `core.hooksPath` arrangement, setup exits 1, reports
 `active: false` and preserves the arrangement. Resolve it manually before retrying;
-do not overwrite or delete another developer's hooks. Rerunning setup leaves a recognized
-pre-commit hook byte-for-byte unchanged, including developer extensions. If its
-referenced environment is stale, explicitly resolve that existing arrangement
-before reinstalling; setup does not rewrite it automatically. `active` reports
+do not overwrite or delete another developer's hooks. A recognized but
+nonexecutable pre-push hook is also refused with `active: false` and manual
+resolution guidance; setup preserves both its bytes and mode rather than
+claiming it is active or automatically adding execute permission. Rerunning setup
+leaves a recognized executable pre-commit hook byte-for-byte unchanged, including
+developer extensions. If its referenced environment is stale, explicitly resolve
+that existing arrangement before reinstalling; setup does not rewrite it automatically. `active` reports
 hook recognition/installation, not proof that a push has run. Setup does not
 install dependencies or start FreshRSS.
 
@@ -419,9 +516,14 @@ or offline cache fails; it never silently downloads or rewrites source during pu
 `.github/workflows/python.yml` runs the same `uv sync --locked` and
 `uv run --locked rss-dev check` baseline on pull requests (including nested PRs)
 and main-branch pushes, with read-only contents permission, immutable action
-references, and uv 0.13.8. It is configured, **not yet demonstrated on GitHub**:
-actual successful/controlled-failing workflow runs require separately authorized
-publication. Local push rejection is not evidence of CI execution, and no branch
+references, and uv 0.13.8. Draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11)
+targets `feat/issue-1-local-freshrss`, not main. GitHub Actions
+[run 43639445160](https://github.com/brucepucci/rss-aggregator/actions/runs/43639445160)
+succeeded on published revision `eff668189c1ffe3ef740e046ce697baf7e8b267e`.
+That is passing evidence for that revision, not the current local fixes, which
+are **not yet published or verified on GitHub**. Controlled-failing GitHub CI
+evidence remains outstanding. Local push rejection is not evidence of CI
+execution. Integration/merge still requires separate authorization, and no branch
 protection changes are made.
 
 [#7](https://github.com/brucepucci/rss-aggregator/issues/7) extends this entrypoint
@@ -465,6 +567,8 @@ The historical #1 observation is not claimed as a new #9 run.
 See the [rewrite inventory](docs/implementation/issue-9.md),
 [#9 verification evidence](docs/verification/issue-9.md), and
 [historical #1 evidence](docs/verification/issue-1.md) for actual results and limits.
+Those records describe their original verification checkpoints; they do not prove
+that the current local fixes have been published or run on GitHub.
 
 ## Python development and adoption
 
@@ -474,7 +578,7 @@ The canonical, copy/paste-friendly policy is [docs/python-standards.md](docs/pyt
 
 1. **Done:** the documentation-only [#8](https://github.com/brucepucci/rss-aggregator/issues/8) change reached main through PR #10 at `d991e39`, without waiting for #1's closure or merge.
 2. **Done on this branch:** incorporate those standards into #1's existing implementation branch, preserving its runtime and history.
-3. [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) is implemented locally from that updated #1 branch. Its eventual nested PR must target `feat/issue-1-local-freshrss`, not main; review/publication/merge require separate authorization.
+3. [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) is implemented from that updated #1 branch and has draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11), targeting `feat/issue-1-local-freshrss`, not main. Current local review fixes are not yet published or verified on GitHub; further publication and integration/merge require separate authorization.
 4. After authorized integration, verify the combined #1/#9 branch against both issues. The final main-targeting PR must resolve **both #1 and #9** and squash-merge them as **one implementation commit**, separately from #8's documentation commit.
 
 This is the approved integration plan, not authorization to publish or merge automatically.
@@ -485,8 +589,10 @@ The #9 branch now implements uv-managed tooling, pytest, independent callable
 operations with thin Click adapters, JSON results, typed/documented production
 code, Ruff and managed baseline gates. No Python policy exceptions are granted;
 tests and trivial special methods retain the canonical exemptions. This is local
-branch adoption, not proof it has reached #1 or main, that hooks are installed in
-this repository, or that the GitHub workflow has executed.
+branch adoption, not proof it has reached #1 or main or that hooks are installed
+in this repository. The GitHub workflow passed at the published revision cited
+above; controlled-failing CI evidence and GitHub verification of current local
+fixes remain outstanding.
 
 Host-side Python development tooling does not authorize installing FreshRSS's PHP/database runtime on the host, unexpected host-package upgrades, or changes to unrelated resources. All accepted ADRs remain in force; this change neither changes them nor certifies unmerged runtime behavior.
 

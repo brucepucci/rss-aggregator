@@ -18,8 +18,11 @@ def _project(root: Path | None) -> Path:
 
 
 def _run(arguments: list[str], root: Path) -> subprocess.CompletedProcess[str]:
-    """Run a child without bytecode writes and relay diagnostics to stderr."""
-    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    """Run tools without inherited pytest overrides and relay stderr diagnostics."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         result = subprocess.run(
             arguments,
@@ -59,7 +62,7 @@ def check(root: Path | None = None) -> dict:
     return _tools(
         root,
         [
-            ("pytest", ["pytest", "-p", "no:cacheprovider"]),
+            ("pytest", ["pytest", "-p", "no:cacheprovider", "-m", "not live"]),
             ("lint", ["ruff", "check", "--no-cache"]),
             ("format", ["ruff", "format", "--check", "--no-cache"]),
         ],
@@ -113,7 +116,8 @@ def setup(root: Path | None = None) -> dict:
 
     A repository without remotes remains inactive and requires an explicit
     rerun after a remote is added. Custom paths, symlinks, foreign hooks, and
-    legacy hooks require manual resolution; setup never chains or deletes them.
+    legacy or nonexecutable hooks require manual resolution; setup never chains
+    or deletes them.
     This operation expects an already synchronized uv development environment.
     """
     project = _project(root)
@@ -152,6 +156,8 @@ def setup(root: Path | None = None) -> dict:
     if hook.is_symlink() or (hook.exists() and not _owned_hook(hook)):
         return _refusal("An existing foreign or symlinked pre-push hook exists.")
     if hook.exists():
+        if not os.access(hook, os.X_OK):
+            return _refusal("The existing pre-push hook is not executable.")
         # Even a recognized generated hook may have developer-owned extensions.
         # Preserve the existing script rather than overwriting it during setup.
         return {"ok": True, "active": True}

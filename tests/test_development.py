@@ -244,6 +244,23 @@ def test_setup_preserves_extensions_to_an_existing_pre_commit_hook(project):
     assert hook.read_bytes() == extended
 
 
+def test_setup_refuses_nonexecutable_generated_hook_without_changes(project):
+    directory, run = project
+    add_remote(directory, run)
+    result, payload = invoke(run, "setup")
+    assert result.returncode == 0 and payload["active"]
+    hook = directory / ".git/hooks/pre-push"
+    hook.chmod(0o644)
+    original = hook.read_bytes(), hook.stat().st_mode
+
+    result, payload = invoke(run, "setup")
+    assert result.returncode == 1
+    assert not payload["ok"] and not payload["active"]
+    assert "executable" in payload["reason"]
+    assert "manually" in payload["next_step"]
+    assert (hook.read_bytes(), hook.stat().st_mode) == original
+
+
 def test_explicit_fix_and_format_are_separate(project):
     directory, run = project
     sample = directory / "tests/test_sample.py"
@@ -310,6 +327,60 @@ def test_live_tests_are_explicitly_selected_not_part_of_default_gate(project):
     )
     assert result.returncode != 0
     assert "1 failed, 1 deselected" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("variable", "options"),
+    [
+        ("PYTEST_ADDOPTS", "-k test_good"),
+        ("PYTEST_ADDOPTS", "-m live"),
+        ("PYTEST_PLUGINS", "nonexistent_inherited_plugin"),
+    ],
+)
+def test_gate_and_push_ignore_inherited_pytest_overrides(
+    project, tooling_environment, monkeypatch, variable, options
+):
+    directory, run = project
+    add_remote(directory, run)
+    result, payload = invoke(run, "setup")
+    assert result.returncode == 0 and payload["active"]
+    (directory / "tests/test_sample.py").write_text(
+        "def test_good():\n    assert True\n\n\ndef test_bad():\n    assert False\n"
+    )
+    sentinel = directory / "live-was-run"
+    (directory / "tests/test_live_sample.py").write_text(
+        "from pathlib import Path\n\nimport pytest\n\n\n"
+        "@pytest.mark.live\ndef test_live_sample():\n"
+        '    Path("live-was-run").touch()\n'
+    )
+    # The gate must enforce non-live selection even without the configured default.
+    configuration = directory / "pyproject.toml"
+    configuration.write_text(
+        configuration.read_text().replace("addopts = '-m \"not live\"'\n", "")
+    )
+    assert run("git", "add", ".").returncode == 0
+    assert run("git", "commit", "-m", "Add controlled test failure").returncode == 0
+    monkeypatch.setitem(tooling_environment, variable, options)
+    before = tracked_snapshot(directory, run)
+
+    result, payload = invoke(run, "check")
+    assert result.returncode == 1 and not payload["ok"]
+    assert "1 failed, 1 passed, 1 deselected" in result.stderr
+    assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
+        "pytest": 1,
+        "lint": 0,
+        "format": 0,
+    }
+    assert not sentinel.exists()
+    assert tracked_snapshot(directory, run) == before
+
+    result = run("git", "push", "disposable", "HEAD:refs/heads/main")
+    assert result.returncode != 0
+    assert "1 failed, 1 passed, 1 deselected" in result.stdout + result.stderr
+    assert not sentinel.exists()
+    assert tracked_snapshot(directory, run) == before
+    result = run("git", "ls-remote", "disposable", "refs/heads/main")
+    assert result.returncode == 0 and not result.stdout.strip()
 
 
 def test_project_option_works_outside_selected_repository(project, tooling_environment):

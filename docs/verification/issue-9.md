@@ -6,6 +6,10 @@ Ruff 0.14.14 and pre-commit 4.7.0. FreshRSS remains in its original rootless
 Podman VM with the unchanged official image pin; no host PHP/database or Homebrew
 package install/upgrade was performed for this adoption.
 
+The original sections below preserve the prepublication local evidence and its
+then-pending work. See [PR #11 review follow-up](#pr-11-review-follow-up) for the
+subsequent publication/CI status and local regression verification.
+
 ## Proven locally
 
 | Command/check | Actual result |
@@ -105,3 +109,38 @@ were unchanged. Those integration gates remain pending, not silently waived.
 
 This is local implementation/verification evidence, not PR review, approval, or
 permission to publish, merge, delete data, or change branch protection.
+
+## PR #11 review follow-up
+
+Draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) was published
+with head `eff668189c1ffe3ef740e046ce697baf7e8b267e`, targeting
+`feat/issue-1-local-freshrss`, not main. The Actions API confirms that
+[Python baseline run 43639445160](https://github.com/brucepucci/rss-aggregator/actions/runs/43639445160)
+succeeded on that exact head. This supersedes the original pending-publication
+and unperformed-successful-CI statements above; it does not establish CI results
+for the subsequent local fixes.
+
+The review's two correctness findings were reproduced with disposable fixtures:
+setup reported a generated hook without executable permission as active, and
+inherited `PYTEST_ADDOPTS` selected only a passing subset or a synthetic live
+case. Four added regression cases were observed failing before the fixes and
+passing afterward. The fixes strip inherited `PYTEST_*` variables from developer
+tool subprocesses, explicitly select `not live` in the baseline, and refuse an
+existing nonexecutable hook without changing its contents or mode.
+
+`uv run --locked --offline rss-dev check` passed **49 default tests**, with five
+live cases deselected, plus Ruff lint and format checks. The new tests demonstrate
+that subset/live-selection options and an inherited plugin override cannot
+change the expected default-test failure, and actual pushes to disposable local
+bare remotes are rejected. A synthetic live-case sentinel remains absent; source
+snapshots remain unchanged by the gate. The hook regression checks inactive
+refusal, manual-resolution guidance and unchanged hook contents/mode.
+
+README CLI coverage was expanded and checked against implementation/help, and
+AGENTS now explicitly requires complete, accurate CLI documentation. Historical
+live evidence above is not claimed as a new run: no live tests, real hook
+activation, runtime changes, GitHub writes or integration/merge occurred during
+this follow-up. **Controlled-failing GitHub pytest/lint/format evidence remains
+outstanding** and requires separately authorized publication; local failures do
+not substitute for it. These local fixes have not yet been published or tested
+on GitHub. Python 3.10 and the remaining platform/device checks were not rerun.
