@@ -1,5 +1,9 @@
 # Issue #1 — local verification
 
+Historical evidence for `1021070`, before #9's Python adoption. The unittest and
+standalone Python commands below describe that commit, not current entrypoints.
+See [#9 evidence](issue-9.md) and README for the migrated commands and new results.
+
 Date: 2026-11-14. Host: Apple Silicon macOS (Darwin 27.2.0, arm64).
 Executed with Python 3.15 and Homebrew Podman CLI 6.2.0; the dedicated rootless
 VM reported Fedora Podman Machine OS 44 / arm64. This is development verification,
