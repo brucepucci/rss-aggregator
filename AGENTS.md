@@ -9,6 +9,10 @@ Verify documented commands and settings against the implementation before consid
 
 Reviewers must assess whether each change requires updates to the README or affected domain/architecture documentation, including when the diff contains no documentation files. Report missing or stale required documentation as standards violations and identify the sections needing updates.
 
+## Python development
+
+Before writing or reviewing Python, or changing Python tooling, read `docs/python-standards.md`. See `README.md` for repository-specific adoption status, verified commands, and exceptions.
+
 ## Agent skills
 
 ### Issue tracker
