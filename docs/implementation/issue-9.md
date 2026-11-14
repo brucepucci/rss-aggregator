@@ -9,10 +9,11 @@ README runtime instructions with standards/adoption guidance. No runtime source
 changed in that incorporation. #9 branches from `241f90d` in its own worktree.
 The original ignored ownership/runtime state remains in its original checkout.
 
-This adoption must eventually integrate into #1, not directly into main. The
-nested PR target is `feat/issue-1-local-freshrss`; the final main-targeting PR must
-resolve #1 and #9 together through one squash implementation commit. Publication,
-review and these later merges remain separately authorized operations.
+The adoption was integrated into #1's `feat/issue-1-local-freshrss` branch through
+PR #11 at `f88ea85`, not directly into main. The final main-targeting PR must
+resolve #1 and #9 together through one squash implementation commit. At this
+main-PR preparation checkpoint, main integration remains pending. Publication,
+review and the final merge remain separately authorized operations.
 
 ## Actual pre-rewrite surface
 

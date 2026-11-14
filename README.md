@@ -6,12 +6,14 @@ and SQLite in a named volume on the VM's native filesystem. No host PHP or
 database server, Podman Desktop, privileged socket helper, login item, launch
 agent, or automatic application startup is installed by this project.
 
-This branch contains the unmerged implementation of [issue #1](https://github.com/brucepucci/rss-aggregator/issues/1).
-Main at `d991e39` contains documentation and the canonical Python standard, not this
-runtime. The runtime commands below are working branch-specific behavior; Python
-tooling adoption is under review in draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11),
-targeting `feat/issue-1-local-freshrss`, not main. It is not yet merged back into
-#1 or main. See [Python development and adoption](#python-development-and-adoption).
+**Main-PR preparation checkpoint:** this branch combines the local runtime for
+[issue #1](https://github.com/brucepucci/rss-aggregator/issues/1) with
+[#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9).
+[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) merged the adoption
+into `feat/issue-1-local-freshrss` at `f88ea85`. Main at `d991e39` still contained
+only documentation; the combined delivery is prepared for one squash merge into
+main, not yet performed at this checkpoint. Commands below describe this combined
+implementation. See [Python development and adoption](#python-development-and-adoption).
 
 Backups, guarded removal, Tailscale, ReadKit and Linux deployment are **not yet
 implemented**. See [architecture decisions](docs/adr/).
@@ -525,7 +527,8 @@ install dependencies or start FreshRSS.
 
 Linked worktrees share Git hooks. This adoption was verified using **disposable
 repositories/local bare remotes**, not by activating hooks in the shared real
-repository while #1 still lacks #9's configuration. Activate intentionally when
+repository. #9's hook configuration is now integrated into #1's branch through
+PR #11; activation in any checkout remains explicit. Activate intentionally when
 ready and push from a branch containing the hook configuration. The hook runs the
 same full baseline through `uv run --locked --offline rss-dev check`, regardless
 of changed filenames or remote name/provider. It applies to **all Git remotes**,
@@ -537,8 +540,9 @@ or offline cache fails; it never silently downloads or rewrites source during pu
 `.github/workflows/python.yml` runs the same `uv sync --locked` and
 `uv run --locked rss-dev check` baseline on pull requests (including nested PRs)
 and main-branch pushes, with read-only contents permission, immutable action
-references, and uv 0.13.8. Draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11)
-targets `feat/issue-1-local-freshrss`, not main.
+references, and uv 0.13.8. [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11)
+merged the adoption into `feat/issue-1-local-freshrss` at `f88ea85`, not directly
+into main. The checkpoints below retain evidence for their exact revisions.
 
 **Checkpoint: 2026-11-14.** Review-fix revision
 `4a6116621efd2c91e3dc11575fcb63028779f74e` was published to PR #11, and
@@ -621,19 +625,19 @@ The canonical, copy/paste-friendly policy is [docs/python-standards.md](docs/pyt
 
 1. **Done:** the documentation-only [#8](https://github.com/brucepucci/rss-aggregator/issues/8) change reached main through PR #10 at `d991e39`, without waiting for #1's closure or merge.
 2. **Done on this branch:** incorporate those standards into #1's existing implementation branch, preserving its runtime and history.
-3. [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) is implemented from that updated #1 branch. At the **2026-11-14 checkpoint**, review-fix revision `4a61166` was published in draft [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11), targeting `feat/issue-1-local-freshrss`, not main, and passed the baseline workflow. See the [CI checkpoint](#github-actions-and-7) for exact evidence and limitations; further publication and integration/merge require separate authorization.
-4. After authorized integration, verify the combined #1/#9 branch against both issues. The final main-targeting PR must resolve **both #1 and #9** and squash-merge them as **one implementation commit**, separately from #8's documentation commit.
+3. **Done:** [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) was integrated into #1's branch through [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) at `f88ea85`. See the [CI checkpoints](#github-actions-and-7) for revision-specific evidence and limitations; historical draft status is not the current integration status.
+4. Verify the combined #1/#9 branch against both issues for the final main-targeting PR. It must resolve **both #1 and #9** and squash-merge them as **one implementation commit**, separately from #8's documentation commit. Main integration remains pending at this preparation checkpoint; review and merge remain separately authorized.
 
 This is the approved integration plan, not authorization to publish or merge automatically.
 
 ### Enforcement status and exceptions
 
-The #9 branch now implements uv-managed tooling, pytest, independent callable
-operations with thin Click adapters, JSON results, typed/documented production
-code, Ruff and managed baseline gates. No Python policy exceptions are granted;
-tests and trivial special methods retain the canonical exemptions. Branch
-adoption does not establish integration into #1/main or hook activation in a
-particular checkout. At the **2026-11-14 checkpoint**, published revision `4a61166`
+The combined #1/#9 branch implements uv-managed tooling, pytest, independent
+callable operations with thin Click adapters, JSON results, typed/documented
+production code, Ruff and managed baseline gates. No Python policy exceptions are
+granted; tests and trivial special methods retain the canonical exemptions.
+PR #11 establishes integration into #1's branch, not main integration or hook
+activation in a particular checkout. At the **2026-11-14 checkpoint**, published revision `4a61166`
 passed the GitHub baseline; controlled-failing CI evidence and integration were
 still outstanding. That checkpoint does not establish results for subsequent
 commits. See the [CI checkpoint](#github-actions-and-7) and linked PR/evidence
