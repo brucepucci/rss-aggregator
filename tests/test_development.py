@@ -406,3 +406,158 @@ def test_project_option_works_outside_selected_repository(project, tooling_envir
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["ok"]
+
+
+@pytest.fixture
+def distinct_checkouts(project, tooling_environment):
+    invoking, run = project
+    shutil.copytree(
+        ROOT / "src/rss_aggregator",
+        invoking / "src/rss_aggregator",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (invoking / "tests/test_sample.py").unlink()
+    shutil.copyfile(
+        ROOT / "tests/test_json_contract.py",
+        invoking / "tests/test_json_contract.py",
+    )
+    selected = invoking.parent / "selected"
+    shutil.copytree(
+        invoking,
+        selected,
+        ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"),
+    )
+
+    def selected_run(*arguments):
+        return subprocess.run(
+            arguments,
+            cwd=selected,
+            env=tooling_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    for arguments in (
+        ("git", "init", "--initial-branch=main"),
+        ("uv", "sync", "--locked", "--offline"),
+    ):
+        result = selected_run(*arguments)
+        assert result.returncode == 0, result.stdout + result.stderr
+    runtime = selected / "src/rss_aggregator/runtime.py"
+    original = runtime.read_text()
+    guard = 'raise RuntimeFailure(f"Unknown operation: {operation}")'
+    assert original.count(guard) == 1
+    runtime.write_text(original.replace(guard, "return {}"))
+    for execute in (run, selected_run):
+        assert execute("git", "add", ".").returncode == 0
+        assert (
+            execute("git", "commit", "-m", "Disposable contract checkout").returncode
+            == 0
+        )
+    return invoking, run, selected, selected_run
+
+
+@pytest.mark.parametrize("caller", ["cli", "callable"])
+@pytest.mark.parametrize("import_override", [False, True])
+def test_selected_checkout_checks_its_own_implementation(
+    distinct_checkouts, tooling_environment, monkeypatch, caller, import_override
+):
+    invoking, run, selected, selected_run = distinct_checkouts
+    assert (invoking / "tests/test_json_contract.py").read_bytes() == (
+        selected / "tests/test_json_contract.py"
+    ).read_bytes()
+    before = tracked_snapshot(invoking, run), tracked_snapshot(selected, selected_run)
+    result, payload = invoke(run, "check")
+    assert result.returncode == 0 and payload["ok"], result.stderr
+    result, payload = invoke(selected_run, "check")
+    assert result.returncode == 1 and not payload["ok"], result.stderr
+    assert "1 failed, 3 passed" in result.stderr
+    if import_override:
+        monkeypatch.setitem(tooling_environment, "PYTHONPATH", str(invoking / "src"))
+
+    if caller == "cli":
+        arguments = ["rss-dev", "check", "--project", str(selected)]
+    else:
+        arguments = [
+            "python",
+            "-c",
+            "import json, sys; from pathlib import Path; "
+            "from rss_aggregator.development import check; "
+            "result = check(Path(sys.argv[1])); "
+            "print(json.dumps(result, indent=2)); sys.exit(not result['ok'])",
+            str(selected),
+        ]
+    result = run("uv", "run", "--locked", "--offline", *arguments)
+    payload = json.loads(result.stdout)
+    assert result.returncode == 1 and not payload["ok"], result.stderr
+    assert "1 failed, 3 passed" in result.stderr
+    assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
+        "pytest": 1,
+        "lint": 0,
+        "format": 0,
+    }
+    assert (
+        tracked_snapshot(invoking, run),
+        tracked_snapshot(selected, selected_run),
+    ) == before
+
+
+@pytest.mark.parametrize("command", ["check", "format", "fix"])
+def test_unsynchronized_selected_project_does_not_use_invoking_environment(
+    project, command
+):
+    invoking, run = project
+    selected = invoking.parent / "unsynchronized"
+    shutil.copytree(
+        invoking,
+        selected,
+        ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"),
+    )
+    before = {
+        path.relative_to(selected): path.read_bytes()
+        for path in selected.rglob("*")
+        if path.is_file()
+    }
+    result = run(
+        "uv",
+        "run",
+        "--locked",
+        "--offline",
+        "rss-dev",
+        command,
+        "--project",
+        str(selected),
+    )
+    payload = json.loads(result.stdout)
+    assert result.returncode == 1 and not payload["ok"]
+    assert all(item["returncode"] == 127 for item in payload["checks"])
+    assert str(selected / ".venv") in result.stderr
+    assert not (selected / ".venv").exists()
+    assert {
+        path.relative_to(selected): path.read_bytes()
+        for path in selected.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_cross_checkout_setup_uses_selected_hook_environment(distinct_checkouts):
+    invoking, run, selected, selected_run = distinct_checkouts
+    add_remote(selected, selected_run)
+    result = run(
+        "uv",
+        "run",
+        "--locked",
+        "--offline",
+        "rss-dev",
+        "setup",
+        "--project",
+        str(selected),
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"ok": True, "active": True}
+    hook = (selected / ".git/hooks/pre-push").read_text()
+    assert str(selected / ".venv") in hook
+    assert str(invoking / ".venv") not in hook
+    assert not (invoking / ".git/hooks/pre-push").exists()

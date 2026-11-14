@@ -57,6 +57,13 @@ GitHub Actions. No per-helper CLI, internal services, mandatory typechecker or
 coverage-percentage target was added. Production signatures/private docstrings
 follow the canonical standard; tests retain its documentation exemption.
 
+Tool subprocesses use the selected checkout's local `.venv` interpreter in
+isolated import mode, with ambient import/pytest overrides removed; changing
+`--project` selects both the working directory and the editable package context.
+Hook installation uses the same selected environment. Missing environments fail
+without implicit synchronization or fallback to the invoking checkout's tools.
+External/shared uv environments are not selected by these operations.
+
 ## Preserved safety contract
 
 - Homebrew inventories and addition ledger, upgrade/reinstall refusal, no automatic

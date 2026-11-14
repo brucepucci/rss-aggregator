@@ -368,9 +368,26 @@ It is not automatically the executable's source checkout. Files are rejected as
 usage errors; select a synchronized project directory (its Git repository root
 for `setup`). `--help` prints help only. There are no other project-defined flags.
 
+`check`, `format` and `fix` execute tools with the **selected checkout's local
+`.venv` interpreter**, not the invoking checkout's editable installation. For
+example, synchronize B with `uv sync --locked --project /path/to/B` before
+running A's `rss-dev check --project /path/to/B`. Python runs in isolated import
+mode; inherited `PYTHONPATH`/`PYTHONHOME` and `PYTEST_*` overrides are removed
+from child environments. Tests therefore import B's installed production code,
+not A's. Bytecode/cache suppression remains enabled.
+
+These commands never create/synchronize an environment or fall back to A's
+packages: a missing `.venv` interpreter produces failed check entries with return
+code 127; a missing tool also fails nonzero. Re-run the selected checkout's sync
+after dependency changes. External/shared environments configured through uv's
+`UV_PROJECT_ENVIRONMENT` are not selected by `rss-dev`; use the checkout-local
+`.venv`. `setup` also uses that local interpreter when installing a new hook,
+so its generated script references the selected environment. No-remote setup and
+existing-hook inspection retain their documented behavior.
+
 | Command | Purpose, defaults and result |
 | --- | --- |
-| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks, without fixing source. Always run all three; JSON `checks` names are `pytest`, `lint`, `format`. Inherited `PYTEST_*` variables are stripped and pytest receives explicit `-m 'not live'`, so ambient selection cannot narrow the suite or enable live tests. |
+| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks, without fixing source. Always run all three; JSON `checks` names are `pytest`, `lint`, `format`. Inherited pytest/import-path overrides are stripped and pytest receives explicit `-m 'not live'`, so ambient selection cannot narrow the suite, enable live tests or substitute the invoking checkout's imports. |
 | `rss-dev setup [--project DIRECTORY]` | Inspect Git arrangements and activate a pre-push hook only when safe. JSON contains `ok` and `active`, with `reason` and `next_step` for no-remote/manual-resolution cases. No remote: success but `active: false`; rerun after adding a remote. With a remote, conflicting or recognized nonexecutable hooks: failure, `active: false`, existing bytes/mode preserved, manual resolution required. A recognized executable hook is retained unchanged. See [Managed pre-push hooks](#managed-pre-push-hooks). |
 | `rss-dev format [--project DIRECTORY]` | Explicitly rewrite Python formatting using Ruff; no lint fixes. JSON `checks` name: `format`. |
 | `rss-dev fix [--project DIRECTORY]` | Explicitly apply safe Ruff lint fixes only; unsafe fixes disabled, no formatting. JSON `checks` name: `fix`. |

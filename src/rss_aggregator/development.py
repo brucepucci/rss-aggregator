@@ -18,9 +18,11 @@ def _project(root: Path | None) -> Path:
 
 
 def _run(arguments: list[str], root: Path) -> subprocess.CompletedProcess[str]:
-    """Run tools without inherited pytest overrides and relay stderr diagnostics."""
+    """Run tools without ambient import/test overrides and relay diagnostics."""
     environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PYTEST_") and key not in {"PYTHONPATH", "PYTHONHOME"}
     }
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
@@ -40,12 +42,22 @@ def _run(arguments: list[str], root: Path) -> subprocess.CompletedProcess[str]:
     return result
 
 
+def _python(project: Path) -> str:
+    """Select the project's uv environment without resolving interpreter symlinks.
+
+    Missing environments fail at process launch rather than falling back to the
+    caller's packages. Synchronize the selected checkout with uv before use.
+    """
+    executable = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    return str(project / ".venv" / executable)
+
+
 def _tools(root: Path | None, operations: list[tuple[str, list[str]]]) -> dict:
     """Collect every operation's exit status without short-circuiting failures."""
     project = _project(root)
     results = []
     for name, arguments in operations:
-        result = _run([sys.executable, "-m", *arguments], project)
+        result = _run([_python(project), "-I", "-B", "-m", *arguments], project)
         results.append({"name": name, "returncode": result.returncode})
     return {"ok": all(item["returncode"] == 0 for item in results), "checks": results}
 
@@ -58,6 +70,8 @@ def check(root: Path | None = None) -> dict:
     dict
         Overall success and each tool's exit status. All checks run even when an
         earlier check fails; child output is diagnostic stderr, not JSON stdout.
+        Tools use the selected checkout's local ``.venv``, never the caller's
+        editable installation. This operation does not create or sync it.
     """
     return _tools(
         root,
@@ -118,7 +132,7 @@ def setup(root: Path | None = None) -> dict:
     rerun after a remote is added. Custom paths, symlinks, foreign hooks, and
     legacy or nonexecutable hooks require manual resolution; setup never chains
     or deletes them.
-    This operation expects an already synchronized uv development environment.
+    Hook installation expects the selected checkout's synchronized local .venv.
     """
     project = _project(root)
     repository = _run(["git", "rev-parse", "--show-toplevel"], project)
@@ -162,7 +176,16 @@ def setup(root: Path | None = None) -> dict:
         # Preserve the existing script rather than overwriting it during setup.
         return {"ok": True, "active": True}
     result = _run(
-        [sys.executable, "-m", "pre_commit", "install", "--hook-type", "pre-push"],
+        [
+            _python(project),
+            "-I",
+            "-B",
+            "-m",
+            "pre_commit",
+            "install",
+            "--hook-type",
+            "pre-push",
+        ],
         project,
     )
     return {"ok": result.returncode == 0, "active": result.returncode == 0}

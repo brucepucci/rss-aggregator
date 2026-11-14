@@ -232,3 +232,41 @@ requirements. No live Podman/HTTP, natural-cron, Python 3.10, device/tailnet,
 backup or destructive-cleanup tests were run. Review acceptance, readiness,
 nested integration, combined verification and the final squash/merge remain
 separately authorized actions.
+
+## Local cross-checkout regression checkpoint (2026-11-14)
+
+This local follow-up starts from `adc61cdfaf198446feee129bb4e465ac1670070c`
+and addresses the [cross-checkout false-green finding](https://github.com/brucepucci/rss-aggregator/pull/11#discussion_r4575817162).
+Changing only the working directory did not change the invoking interpreter's
+editable package installation. Tests collected from B could therefore import
+A's production code.
+
+The regression uses two independently synchronized disposable checkouts with
+identical copies of the four existing JSON-contract tests. A retains the normal
+implementation; only B's unknown-operation guard is changed to return an empty
+result instead of raising. A's own gate passes; B's own gate fails one test, with
+three passing and lint/format succeeding. Before the fix, both A's CLI
+`check --project B` and callable `check(B)` incorrectly passed all four tests.
+
+`uv run --locked --offline pytest --tb=short tests/test_development.py -k selected_checkout_checks_its_own_implementation`
+was observed failing both original regression cases before the fix. Afterward,
+both paths correctly report B's failing test. Expanded cases also verify that
+inherited `PYTHONPATH` cannot substitute A's imports, source/Git-status snapshots
+stay unchanged, missing selected environments fail with return code 127 rather
+than using A's tools, and cross-checkout hook installation references B's local
+`.venv`, without installing a hook in A.
+
+Tool subprocesses now use the selected checkout's local `.venv` interpreter with
+isolated import mode and explicit bytecode suppression. Ambient import/pytest
+overrides are removed from child environments. The operation does not create or
+synchronize an environment, and it does not fall back to the caller's packages.
+External/shared `UV_PROJECT_ENVIRONMENT` environments are not selected; this local
+`.venv` contract and preparation/failure behavior are documented in README.
+
+`uv run --locked --offline rss-dev check` passed **57 default tests**, five live
+tests deselected, plus Ruff lint and format checks on Python 3.13.18. All 28
+developer-gate cases also passed independently. `git diff --check` passed.
+No production behavior was deliberately broken outside disposable fixtures; no
+live resources or real repository hooks were touched. This is a local
+verification checkpoint, not a claim of a GitHub run, publication, reviewer
+acceptance or integration for these changes.
