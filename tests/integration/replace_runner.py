@@ -11,7 +11,7 @@ import sys
 
 import click
 
-from rss_aggregator import runtime
+from rss_aggregator import recovery, runtime
 
 from .replacement_support import (
     checked_application,
@@ -53,6 +53,8 @@ def run():
     # This is the entire runtime seam. MACHINE, LABEL, ownership checks,
     # subprocess execution, locking and replacement behavior stay unchanged.
     runtime.APP, runtime.VOLUME, runtime.CHECK = app, volume, check
+    runtime.SELECTION = "test-" + token + "-selection.json"
+    recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
     from rss_aggregator.cli import main
 
     main(args=["replace"], prog_name="rss")

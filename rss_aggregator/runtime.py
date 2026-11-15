@@ -16,13 +16,27 @@ from typing import Any, Literal
 from urllib.error import URLError
 from urllib.request import urlopen
 
-Operation = Literal["setup", "start", "status", "fetch", "verify", "replace", "stop"]
+from rss_aggregator.recovery import Recovery, volume_name
+
+Operation = Literal[
+    "setup",
+    "start",
+    "status",
+    "fetch",
+    "verify",
+    "replace",
+    "stop",
+    "backup",
+    "restore",
+    "select-volume",
+]
 
 MACHINE = "rss-aggregator"
 APP = "rss-aggregator-freshrss"
 VOLUME = "rss-aggregator-data"
 CHECK = "rss-aggregator-check"
 LABEL = "io.rss-aggregator.owner"
+SELECTION = "selected-volume.json"
 
 
 class RuntimeFailure(Exception):
@@ -59,7 +73,28 @@ class Runtime:
             .resolve()
         )
 
-    def run(self, operation: Operation) -> dict[str, Any]:
+    @property
+    def selected_volume_path(self) -> Path:
+        """Locate the managed selection record in the existing ownership directory."""
+        return self.state_dir / SELECTION
+
+    @property
+    def volume(self) -> str:
+        """Resolve the explicitly selected owned data volume or the initial default."""
+        path = self.selected_volume_path
+        return (
+            volume_name(json.loads(path.read_text())["volume"])
+            if path.exists()
+            else VOLUME
+        )
+
+    def run(
+        self,
+        operation: Operation,
+        *,
+        archive: Path | None = None,
+        volume: str | None = None,
+    ) -> dict[str, Any]:
         """Execute one public operation under the nonblocking project lock.
 
         Returns
@@ -73,7 +108,11 @@ class Runtime:
             If the operation is unknown, another command holds the lock, or a
             resource safety guard fails. OS and configuration errors propagate.
         """
+        recovery = Recovery(self)
         handlers = {
+            "backup": recovery.backup,
+            "restore": lambda: recovery.restore(archive, volume),
+            "select-volume": lambda: recovery.select_volume(volume),
             "setup": self._setup,
             "start": self._start,
             "status": self._status,
@@ -84,6 +123,12 @@ class Runtime:
         }
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
+        if operation == "restore" and (archive is None or volume is None):
+            raise ValueError(
+                "Restore requires an archive path and a fresh target volume."
+            )
+        if operation == "select-volume" and volume is None:
+            raise ValueError("Select-volume requires an explicit volume name.")
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         with (self.state_dir / "command.lock").open("a") as lock:
             try:
@@ -356,6 +401,7 @@ class Runtime:
             ) from error
         if not 1024 <= port <= 65535:
             raise RuntimeFailure("RSS_PORT must be between 1024 and 65535.")
+        Recovery(self).check_activation()
         if machine["State"] != "running":
             conflicts = [
                 m["Name"]
@@ -379,8 +425,8 @@ class Runtime:
             if self._exists("container", APP)
             else None
         )
-        if self._exists("volume", VOLUME):
-            self._check_label("volume", VOLUME, owner)
+        if self._exists("volume", self.volume):
+            self._check_label("volume", self.volume, owner)
         if not app or not app["State"]["Running"]:
             with socket.socket() as listener:
                 # Permit our previous TCP TIME_WAIT, not an active listener.
@@ -392,9 +438,9 @@ class Runtime:
                         f"Loopback port {port} is occupied; choose RSS_PORT or stop its owner yourself."
                     ) from error
         self._security(owner, target=CHECK)
-        if not self._exists("volume", VOLUME):
+        if not self._exists("volume", self.volume):
             self._podman(
-                "volume", "create", "--label", LABEL + "=" + owner["token"], VOLUME
+                "volume", "create", "--label", LABEL + "=" + owner["token"], self.volume
             )
         if app:
             verified = json.loads((self.state_dir / "security.json").read_text())
@@ -407,7 +453,7 @@ class Runtime:
                 or app["Config"]["Cmd"] != verified["official_command"]
                 or "LISTEN=127.0.0.1:8088" not in app["Config"]["Env"]
                 or not any(
-                    m.get("Name") == VOLUME
+                    m.get("Name") == self.volume
                     and m["Destination"] == "/var/www/FreshRSS/data"
                     for m in app["Mounts"]
                 )
@@ -432,7 +478,7 @@ class Runtime:
                 "--publish",
                 f"127.0.0.1:{port}:80",
                 "--mount",
-                f"type=volume,source={VOLUME},destination=/var/www/FreshRSS/data",
+                f"type=volume,source={self.volume},destination=/var/www/FreshRSS/data",
                 "--env",
                 "CRON_MIN=*/20",
                 "--env",
@@ -466,6 +512,7 @@ class Runtime:
         self._ready(port)
         scheduler = self._scheduler(owner)
         fetch = self._fetch()
+        Recovery(self).record_image(activated=True)
         url = f"http://127.0.0.1:{port}"
         self._diagnostic(
             f"FreshRSS: {url} (form login; complete installer locally on first run)."
@@ -652,62 +699,8 @@ class Runtime:
         self._podman("exec", APP, "php", "-r", code)
 
     def _stop(self) -> dict[str, Any]:
-        """Stop project writers and VM, refusing unrelated running containers."""
-        owner, machine = self._owned()
-        if machine["State"] == "stopped":
-            self._diagnostic("Project VM already stopped.")
-            return {"machine": "stopped", "already_stopped": True, "backup": "deferred"}
-        if machine["State"] != "running":
-            raise RuntimeFailure(
-                "Project VM is "
-                + machine["State"]
-                + "; wait and inspect before retrying."
-            )
-        # machine ssh uses the already verified VM/SSH identity, not a potentially
-        # redirected root connection. Rootful workloads are never project-owned.
-        rootful = self._json_run(
-            "podman",
-            "machine",
-            "ssh",
-            MACHINE,
-            "sudo",
-            "podman",
-            "ps",
-            "--format",
-            "json",
-        )
-        containers = json.loads(self._podman("ps", "--format", "json").stdout)
-        if not isinstance(rootful, list) or not isinstance(containers, list):
-            raise RuntimeFailure(
-                "Cannot inspect both container engines; VM left running."
-            )
-        if rootful:
-            raise RuntimeFailure(
-                "Unrelated running rootful containers; project VM left running."
-            )
-        for item in containers:
-            name = (
-                item["Names"][0] if isinstance(item["Names"], list) else item["Names"]
-            )
-            if name not in (APP, CHECK):
-                raise RuntimeFailure(
-                    "Unrelated running container " + name + "; project VM left running."
-                )
-            self._check_label("container", name, owner)
-        for name in (APP, CHECK):
-            if self._exists("container", name):
-                item = self._check_label("container", name, owner)
-                if item["State"]["Running"]:
-                    self._podman("stop", "--time", "60", name)
-                    if self._check_label("container", name, owner)["State"]["Running"]:
-                        raise RuntimeFailure(
-                            "Application did not stop; VM left running."
-                        )
-        self._diagnostic(self._run("podman", "machine", "stop", MACHINE).stdout)
-        self._diagnostic(
-            "Project application writers and VM stopped. No external backup (issue #2 deferred)."
-        )
-        return {"machine": "stopped", "already_stopped": False, "backup": "deferred"}
+        """Back up quiesced project data before stopping only the owned VM."""
+        return Recovery(self).shutdown()
 
     def _status(self) -> dict[str, Any]:
         """Report owned VM/application state and check running service readiness."""
@@ -715,7 +708,11 @@ class Runtime:
             self._diagnostic("FreshRSS is not set up. Run scripts/rss setup.")
             return {"machine": "absent", "application": "absent"}
         owner, machine = self._owned()
-        result = {"machine": machine["State"], "application": "unknown"}
+        result = {
+            "machine": machine["State"],
+            "application": "unknown",
+            "volume": self.volume,
+        }
         self._diagnostic("Project VM: " + machine["State"])
         if machine["State"] == "running":
             if self._exists("container", APP):
@@ -826,7 +823,8 @@ class Runtime:
         owner, machine = self._owned()
         if machine["State"] != "running":
             raise RuntimeFailure("Start the project before replacing its container.")
-        self._check_label("volume", VOLUME, owner)
+        self._check_label("volume", self.volume, owner)
+        Recovery(self).check_activation()
         if self._exists("container", APP):
             self._check_label("container", APP, owner)
             self._podman("stop", "--time", "60", APP)
