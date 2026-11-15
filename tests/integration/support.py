@@ -238,18 +238,6 @@ class InstanceFixture:
             "Read/starred article state not preserved"
         )
 
-    def cron_starts(self):
-        logs = self.podman(
-            "exec",
-            self.name,
-            "php",
-            "-r",
-            'echo @file_get_contents("/tmp/FreshRSS.log");',
-        )
-        return set(
-            re.findall(r"FreshRSS starting feeds actualization at ([^\s<]+)", logs)
-        )
-
     def controlled_feed(self, number):
         path = self.temp / "controlled.atom"
         entries = "".join(

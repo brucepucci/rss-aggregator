@@ -57,13 +57,6 @@ def test_cron_command_collects_a_changed_controlled_feed(instance):
     )
 
 
-def test_actualization_observer_detects_a_completed_run(instance):
-    instance.podman("exec", instance.name, "sh", "-c", CRON_COMMAND)
-    assert instance.cron_starts(), (
-        "Actualization observer missed a known completed execution"
-    )
-
-
 def test_installed_instance_can_move_to_another_loopback_port(instance):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -90,7 +83,7 @@ def test_installed_instance_can_move_to_another_loopback_port(instance):
     )
 
 
-def test_authenticated_feed_articles_settings_and_replacement(instance, pytestconfig):
+def test_authenticated_feed_articles_settings_and_replacement(instance):
     fixture = instance
     fixture.podman(
         "exec", "--user", "www-data", fixture.name, "php", "app/actualize_script.php"
@@ -143,24 +136,3 @@ def test_authenticated_feed_articles_settings_and_replacement(instance, pytestco
         "Controlled article 1" in fixture.browser.request("/i/?a=normal&get=a&state=3"),
         "Controlled feed fetch failed",
     )
-    if pytestconfig.getoption("--observe-cron"):
-        started = time.monotonic()
-        baseline = fixture.cron_starts()
-        seen = set()
-        fixture.controlled_feed(2)
-        advanced = False
-        while time.monotonic() - started < 2460:
-            seen.update(fixture.cron_starts() - baseline)
-            if seen and not advanced:
-                fixture.wait_article("Controlled article 2")
-                fixture.controlled_feed(3)
-                advanced = True
-            if len(seen) >= 2:
-                fixture.wait_article("Controlled article 3")
-                print(
-                    "Observed natural */20 cron timestamps: " + ", ".join(sorted(seen)),
-                    flush=True,
-                )
-                break
-            time.sleep(5)
-        assert len(seen) >= 2, "Two natural cron executions were not observed"

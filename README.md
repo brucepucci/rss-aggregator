@@ -416,7 +416,7 @@ and exit 1; success exits 0, even for inactive no-remote setup. Child output goe
 to stderr. Invalid CLI usage exits 2 without result JSON. Formatting/fixes are
 explicitly mutating, unlike the baseline; neither starts FreshRSS.
 
-### Pytest selection and project option
+### Pytest selection
 
 `uv run --locked pytest [OPTIONS] [file_or_dir ...]` runs tests directly, with
 human-readable pytest reports rather than the CLI JSON contract. With no paths,
@@ -427,15 +427,14 @@ the required full baseline. Project-specific selection and documented controls:
 | --- | --- | --- |
 | `[file_or_dir ...]` | Optional test paths/node IDs; omit for the complete configured suite. | `uv run --locked pytest tests/test_commands.py` |
 | `-m EXPRESSION` | Marker expression; project default is `not live`. Explicit `-m live` selects real-service tests and requires their prerequisites. | `uv run --locked pytest -m live` |
-| `--observe-cron` | Project flag, takes no value, defaults to false. With live tests selected, enable the 20–40 minute observation of two real scheduled executions. Raises a usage error if no live-marked test remains selected; it does not itself select live tests. | `uv run --locked pytest -m live --observe-cron -s` |
-| `-s` | Disable pytest output capture (normally enabled), useful for live observation diagnostics. | As above. |
-| `-h`, `--help` | Conventional pytest text help and configuration, including `--observe-cron`; exits 0 without running tests. | `uv run --locked --offline pytest --help` |
+| `-s` | Disable pytest output capture (normally enabled), useful for live diagnostics. | `uv run --locked pytest -m live -s` |
+| `-h`, `--help` | Conventional pytest text help and configuration; exits 0 without running tests. | `uv run --locked --offline pytest --help` |
 
 Pytest's remaining upstream options are listed by that help command. Direct
 pytest runs retain pytest's normal environment handling; use `rss-dev check` for
 the guarded baseline. Pytest exits 0 on success, 1 for failed tests, 2 for
-interruption/collection errors, 3 for internal errors, 4 for usage errors
-(including invalid `--observe-cron` selection), or 5 when no tests are collected.
+interruption/collection errors, 3 for internal errors, 4 for usage errors,
+or 5 when no tests are collected.
 See [Explicit live/platform checks](#explicit-liveplatform-checks) before selecting
 live tests; a default-suite pass is not live evidence.
 
@@ -527,7 +526,6 @@ After starting the owned instance, select the retained real Mac/HTTP checks:
 
 ```sh
 uv run --locked pytest -m live
-uv run --locked pytest -m live --observe-cron -s
 ```
 
 Missing Podman, the wrong platform or an unavailable project is an explicit
@@ -537,7 +535,7 @@ the cached pinned image, internet access to the public GitHub feed, and the
 correct existing ownership directory. They interrupt the project session. Use
 `RSS_STATE_DIR` explicitly when operating from another worktree; no automatic
 ownership-state transfer occurs. The old `RSS_LIVE`/`RSS_OBSERVE_CRON` unittest
-commands have been replaced by pytest marker/option selection.
+commands are unsupported; select live tests with `-m live`.
 
 Unique labelled disposable test containers/volumes exercise HTTP installation,
 authentication, public articles, read/star state, replacement and VM stop/start.
@@ -558,10 +556,15 @@ HTML, authentication payloads, private URLs or `--showlocals` output as artifact
 
 Only the fast controlled-feed regression reduces fixture TTL/cache minimums. Its
 publisher advertises `no-cache, max-age=0`, avoiding the image's long-lived asset
-caching. The optional **20–40 minute** observation preserves production settings
-and waits for two genuine scheduler executions, never counting manual refreshes.
-See the current checkpoint below for the integrated candidate's natural-cron result;
-the older #1 observation remains historical.
+caching. Tests verify the installed production `*/20` cron configuration and live
+daemon, and execute the real cron command against changed controlled content.
+They do **not** wait for production schedule intervals or change the production
+schedule. The long observer and `--observe-cron` option have been removed, along
+with the observer-only regression; that option now returns a pytest usage error.
+The retained live suite has five tests. Production-cadence observation is a
+one-off acceptance/soak check, not a routine test or publication requirement;
+previous natural-run evidence below remains historical and is not a claim that
+manual cron-command execution proves scheduler timing.
 
 ## Verification and adoption status
 
@@ -617,9 +620,21 @@ articles with production TTL/cache policy. That is not an integrated #9/PR #13
 rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
-### Current verification and limits
+### Verification checkpoints and limits
 
-- **Local review-fix checkpoint (2026-11-15):** candidate tree
+- **Fast-suite checkpoint (2026-11-15, after observer removal):**
+  `uv run --locked --offline rss-dev check` passed **71 default tests in 44.70s**,
+  five live deselected, with Ruff lint/format clean.
+  `uv run --locked --offline pytest -p no:cacheprovider -m live -q --tb=short`
+  passed **all five live tests in 37.79s**. The removed option is absent from
+  pytest help and rejected with usage exit 4. Production cron remains `*/20`;
+  the real application audit was restored and the VM stopped afterward.
+  No commit/push or new CI run is implied by this local checkpoint.
+
+The earlier review-fix results below describe their exact candidates, before
+observer removal, not the changed test suite.
+
+- **Historical local review-fix checkpoint (2026-11-15):** candidate tree
   `18f4f79e054f4b03fe821b9fc36fd4a69bb0b53b`, based on PR head `bf39851`;
   only this README's evidence was updated afterward. No commit/push is implied.
   `uv sync --locked --offline`
@@ -635,8 +650,8 @@ installation was not repeated for the PR #13 candidate.
   isolated resource names and verifying installed subscription, article identity/
   content and deliberate read/star state through HTTP afterward. It used synthetic
   credentials and a disposable volume, not the real application user's state.
-- **S2 passed locally:** `uv run --locked --offline pytest -p no:cacheprovider
-  -m live --observe-cron -s --tb=short` passed **all six live tests in 1533.26s**.
+- **Historical S2 acceptance (before observer removal):** the former
+  `--observe-cron` run passed **all six live tests in 1533.26s**.
   Natural runs at **2026-11-15 02:40:01 and 03:00:01 UTC** collected successive
   controlled articles verified through HTTP, without shortening production
   scheduling/TTL/cache policy. The suite also reverified effective Apache security,
