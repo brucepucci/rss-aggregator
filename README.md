@@ -652,7 +652,18 @@ example, synchronize B with `uv sync --locked --project /path/to/B` before
 running A's `rss-dev check --project /path/to/B`. Python runs in isolated import
 mode; inherited `PYTHONPATH`/`PYTHONHOME` and `PYTEST_*` overrides are removed
 from child environments. Tests therefore import B's installed production code,
-not A's. Bytecode/cache suppression remains enabled.
+not A's.
+
+All developer operations also remove inherited repository selectors from their
+child environments: `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`,
+`GIT_IMPLICIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`, `GIT_OBJECT_DIRECTORY`,
+`GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_GRAFT_FILE`, `GIT_SHALLOW_FILE`,
+`GIT_REPLACE_REF_BASE` and `GIT_NO_REPLACE_OBJECTS`. A hook's Git context must not
+override the selected project's directory or redirect disposable tests/hook setup
+into another repository. This is a child-environment filter, not a change to the
+parent push process. Git configuration/authentication variables remain intact;
+global/system configuration and `core.hooksPath` safeguards are still honored.
+Bytecode/cache suppression remains enabled.
 
 These commands never create/synchronize an environment or fall back to A's
 packages: a missing `.venv` interpreter produces failed check entries with return
@@ -920,7 +931,23 @@ installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
 
-- **Issue #3 local verification (`issue-3`, based on `cb5ed36`):**
+- **Publication verification correction (after `0167ac3`, on `issue-3`):**
+  Fresh isolated verification of the prepared issue #3 tree passed 190 tests plus
+  Ruff, but its actual pre-push hook failed
+  `test_public_operations_work_without_click`: inherited `GIT_DIR` made callable
+  developer setup inspect the real repository's remote/hooks instead of the selected
+  disposable project. A safe reproduction using only a disposable outer repository
+  failed in 2.63s with `GIT_DIR` and passed in 0.92s without it. Child environments
+  now exclude repository-location/index/object selectors while retaining Git
+  configuration/authentication variables and existing-hook refusal guards. Eight
+  focused CLI/callable regressions passed in 3.29s, covering foreign Git contexts,
+  test-child isolation and preservation of global `core.hooksPath`/foreign hooks;
+  seven had failed before the fix. The original inherited-`GIT_DIR` reproduction
+  then passed in 0.95s. No real hooks were overwritten or bypassed. Full isolated
+  candidate and actual push-hook results are recorded in the publication PR evidence;
+  these focused results alone are not publication verification.
+
+- **Issue #3 implementation checkpoint (`0167ac3`, `issue-3`, based on `cb5ed36`):**
   `uv sync --locked` succeeded. Final `uv run --locked rss-dev check` passed **190
   default tests in 78.40s**, six live deselected, with Ruff lint/format clean.
   Thirty-six new command/runtime checks cover scoped forwarding, repetition,
