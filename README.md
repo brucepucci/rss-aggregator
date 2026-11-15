@@ -6,15 +6,17 @@ and SQLite in a named volume on the VM's native filesystem. No host PHP or
 database server, Podman Desktop, privileged socket helper, login item, launch
 agent, or automatic application startup is installed by this project.
 
-[PR #13](https://github.com/brucepucci/rss-aggregator/pull/13) combines the local
-runtime for [#1](https://github.com/brucepucci/rss-aggregator/issues/1) with
-[#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9).
-Main integration and review acceptance remain pending. See
+[PR #13](https://github.com/brucepucci/rss-aggregator/pull/13) integrated the initial
+local runtime for [#1](https://github.com/brucepucci/rss-aggregator/issues/1) and
+[#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9) on main.
+This branch adds [#2's backup/recovery](https://github.com/brucepucci/rss-aggregator/issues/2);
+its publication and review remain separate. See
 [verification and adoption status](#verification-and-adoption-status) for historical
 evidence and verification of the changes in this checkout.
 
-Backups, guarded removal, Tailscale, ReadKit and Linux deployment are **not yet
-implemented**. See [architecture decisions](docs/adr/).
+Portable backups and guarded restore are implemented locally; see the verification
+checkpoint below for their tested scope. Destructive removal, Tailscale, ReadKit
+and Linux deployment are **not yet implemented**. See [architecture decisions](docs/adr/).
 
 ## Getting Started
 
@@ -40,6 +42,8 @@ From a checkout of this repository:
 ```sh
 uv sync --locked
 uv run --locked rss setup
+# Choose an absolute private directory OUTSIDE this or any other Git checkout.
+export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
 uv run --locked rss start
 uv run --locked rss status
 ```
@@ -133,7 +137,10 @@ browser sessions; your account/password and reading state persist.
 | `./scripts/rss fetch` | Run feed actualization immediately, or explain that the installer is pending. |
 | `./scripts/rss verify` | Restart/recheck the running application, including effective Apache PHP, cron and immediate actualization. Brief service interruption. |
 | `./scripts/rss replace` | Stop/remove **only the owned application container**, then recreate it using the same named data volume and current checked-in configuration. |
-| `./scripts/rss stop` | Verify VM identity and absence of unrelated running workloads in both rootless/rootful engines before stopping any container; stop owned writers, verify exit, then stop only the project VM. Repeating it reports already stopped. |
+| `./scripts/rss backup` | Quiesce writers, create and verify an external archive in `RSS_BACKUP_DIR`, then restore the prior VM/application running state. |
+| `./scripts/rss restore ARCHIVE --volume NAME` | Validate a backup locally, start only the owned VM if necessary, and import into a fresh labelled volume. Does not activate it or overwrite a volume. |
+| `./scripts/rss select-volume NAME` | While the application is stopped and VM running, explicitly select an owned volume for later `start`/`replace`. Does not remove the original volume. |
+| `./scripts/rss stop` | Verify VM identity and absence of unrelated rootless/rootful workloads, stop writers, create/verify an external backup, then stop only the project VM. Backup failure leaves writers stopped and VM running. Repeating a successful stop reports already stopped. |
 
 Commands are serialized by a local lock. Repeated starts restart the application
 but do not create another VM, user, subscription, or data volume. Errors return
@@ -169,22 +176,103 @@ browser-only and loopback-only. Private Tailscale HTTPS and the Google
 Reader-compatible API with a separate API password are planned in issue #3;
 ReadKit's macOS/iOS end-to-end connection is not yet verified.
 
-### Backup and restore — not implemented
+### Backup and restore
 
 The complete FreshRSS `data` directory (SQLite databases, users, settings,
-subscriptions, articles, reading state, feed cache and logs) is stored in
-**`rss-aggregator-data`**, a project-labelled Podman named volume inside the VM.
-It is **not** a Mac bind mount and **not** an external backup. The ordinary Podman
-VM may expose its default Mac shared directories, but the database does not use
-them. Container replacement and VM stop/start preserve the volume; VM deletion
-or loss does not.
+subscriptions, articles, reading state, feed cache and logs) lives in a labelled
+Podman named volume on the VM's native filesystem, initially `rss-aggregator-data`.
+The selected volume is **not** itself a backup: VM loss destroys it. No extensions
+are used initially; extension code outside `data` is not covered by this format.
 
-Per the approved [ADR 0002 deferral](docs/adr/0002-portable-state-with-consistent-external-backups.md),
-normal shutdown does **not** require/create a backup until issue #2's backup
-infrastructure exists. There is no supported backup/restore command yet. Do not
-store irreplaceable articles here or delete the VM assuming it can be recovered.
-OPML is only a subscription export, not an instance backup. Future backups will
-contain secrets and require external, private storage.
+Set `RSS_BACKUP_DIR` to an absolute directory outside every Git checkout. New
+backup directories are created with mode `0700`; existing directories must already
+be private and owned by you. Archives use mode `0600`. This is **not encryption**:
+treat each archive as a credential, including when copying it to another host.
+
+```sh
+export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
+./scripts/rss backup
+./scripts/rss stop
+```
+
+Both operations stop all owned HTTP/cron writers and verify both VM engines are
+idle before exporting the selected volume. The project lock serializes managed
+commands; do not mount/write the volume through independent Podman commands or
+VM shell sessions during export. Unrelated running workloads cause refusal before
+any container is stopped. Explicit backup resumes a previously running application
+through the normal security gate, or temporarily starts/stops a previously stopped
+VM without starting the application. A resume failure is an error even if the
+archive was published; inspect private `last-backup.json` and `status` locally.
+
+Normal shutdown now requires a successful external backup before stopping the VM.
+If export/configuration/verification fails, the VM stays running, application
+writers stay stopped, and source data and prior archives remain. Fix the cause
+and retry `stop`. An already-stopped VM is not restarted just to repeat shutdown.
+If no selected data volume exists, shutdown reports `backup.status: "no_data"`.
+No backups are pruned or uploaded automatically. Keep independent copies on durable
+storage; a local archive on the same Mac does not protect against losing that Mac.
+OPML is only a subscription export, not an instance backup.
+
+The portable format is a standard, uncompressed ZIP containing only `manifest.json`
+and `data.tar`. The manifest records format/version, UTC creation time, exact image
+configuration/platform, included state, and the payload size/SHA-256. Publication
+is atomic and follows a full read-back/integrity check; JSON also reports the whole
+ZIP SHA-256. Checksums detect corruption, not malicious replacement or authenticity.
+The destination filesystem must support hard links for atomic non-overwriting
+publication; unsupported filesystems fail safely. Interrupted unpublished output is never a valid final archive; prior archives are
+never overwritten. See [the format and recovery guide](docs/backup-restore.md).
+
+#### Recovery on this or a clean host
+
+Use a compatible Apple Silicon Mac with Homebrew/uv and virtualization available.
+Copy a trusted archive and matching reviewed project configuration to the new host;
+the original VM is not required. Install locked dependencies and run `rss setup`
+to create a fresh owned VM. Never copy/fabricate `owner.json` from the old host.
+For an existing running instance, first run `rss stop` with a working backup directory.
+
+```sh
+uv sync --locked
+./scripts/rss setup
+./scripts/rss restore /absolute/private/path/backup.zip --volume rss-recovered
+./scripts/rss select-volume rss-recovered
+# If no application container exists:
+./scripts/rss start
+# If an old, stopped application container exists, use replace INSTEAD of start:
+# ./scripts/rss replace
+```
+
+Restore checks format, integrity, image compatibility and every tar member **before**
+starting a VM or creating a volume. It refuses every existing target, even an empty
+owned volume, and the currently selected name even when absent (to prevent implicit
+activation). Failed imports retain the incomplete target unselected for diagnosis;
+`select-volume` refuses incomplete targets. Choose another fresh name to retry. No implicit overwrite/delete command exists.
+Links, special/sparse files, unsafe/duplicate paths and unsupported archive versions
+are rejected. Numeric ownership and ordinary permissions are preserved; unsafe tar
+metadata is not passed through to the engine. A restore never activates itself.
+`select-volume` requires a stopped application and running VM; `replace` preserves
+the old named volume. `rss status` reports the selected name; record it before
+selecting another volume. To select a previously restored volume after later VM
+shutdown, first confirm ownership with `rss status`, then start only the VM using
+`podman machine start --update-connection=false rss-aggregator`, select the volume,
+and use `replace` (or `start` if no container exists). The VM-start command alone
+does not start the application. Do not edit ownership JSON to force selection.
+
+Restore initially requires the **exact checked-in image configuration recorded in
+the archive**, not merely a newer FreshRSS version. Use the reviewed matching pin
+first, check its current advisories, and run the normal effective-PHP security gate
+before entering credentials. An old backup does not authorize bypassing a failed
+gate. An arm64 platform manifest is not an x86 deployment plan: other architectures
+and native Linux recovery remain unverified. After successful recovery, verify
+login, subscriptions, article content and both unread/read and starred state.
+If moving ports/hosts, adjust FreshRSS's base URL inside the restored container as
+shown under Configuration; do not print archived settings or secrets in evidence.
+
+For an intentional image update: first create and verify a backup, review current
+advisories and the new official image/platform identity, explicitly update the pin,
+then `replace` and verify security, login, fetching and persisted reading state.
+There are no unattended updates. To roll back a database migration, restore its
+pre-update backup into a fresh volume with its matching image; never assume an
+older FreshRSS can open a newer database.
 
 ### Safe cleanup
 
@@ -214,6 +302,13 @@ command is added here.
 - **Homebrew upgrade approval required:** inspect `.local/install-preview.json`;
   no installation has been attempted by that invocation. Resolve the dependency
   plan explicitly before retrying. Partial installation additions are recorded.
+- **Backup failure or missing `RSS_BACKUP_DIR`:** shutdown leaves writers stopped
+  and the VM running. Choose a private external directory, check free disk space
+  and engine availability, then retry `stop`. Previous good archives and the source
+  volume remain. Do not force VM deletion or remove data as a workaround.
+- **Restore compatibility/target refusal:** use the archive's exact reviewed image
+  configuration and a fresh target name. A failed import target is retained and
+  is not automatically selected. Do not overwrite it or the source to force retry.
 - **Registry/VM/network unavailable:** commands return an error without stopping
   other machines. Restore connectivity/virtualization and retry. Startup failure
   does not imply the VM was stopped.
@@ -245,6 +340,9 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | Setting | Purpose and default | How to change/apply |
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
+| `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
+| `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
+| `.local/recovery-volumes.json`, `.local/last-backup.json` (managed local records) | Volume image provenance/import completeness, and most recently published archive location/checksum. | Preserve with ownership state. Do not edit incomplete imports into ready state. An unattached volume without known image provenance is refused for backup; start it with its reviewed matching pin first. |
 | `RSS_STATE_DIR` (optional environment variable) | Ownership/inventory/lock/security record directory; `<checkout>/.local`. Not the FreshRSS database location. | Set an absolute private path **outside Git** before setup and use it consistently. Changing it does not adopt or migrate an existing machine. |
 | `config/image.json` | Official Debian FreshRSS `1.30.4`, digest-pinned OCI index, explicit `linux/arm64`, verified platform manifest and source revision. | Change only after checking current advisories and verifying registry identity/runtime. `replace` applies a pin change. No floating-tag update command. |
 | `config/config-user.custom.php` | New-user defaults: no age/maximum article purge; TTL `60` seconds. | Every `start` (also through `verify`/`replace`) copies it while the application is stopped; retry repeats both template copies. **Existing users are not rewritten**: change their settings locally in FreshRSS, including feed/category overrides. |
@@ -325,7 +423,7 @@ Run from a synchronized checkout (`uv sync --locked` first):
 
 | Invocation | Purpose and accepted arguments/options |
 | --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the seven operations below. |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the ten operations below. |
 | `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint. |
 | `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. |
 | `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
@@ -338,8 +436,10 @@ Invoking a group without a command displays usage and exits 2. Unknown commands,
 extra positional arguments and unsupported options also exit 2 with stderr
 usage/diagnostics, not operation JSON. There is no implicit operation.
 
-Runtime subcommands have **no positional arguments or options except `--help`**;
-in particular, `rss` has no `--project` option. Runtime configuration comes from
+Lifecycle commands and `backup` have no positional arguments/options except
+`--help`. `restore ARCHIVE --volume NAME` requires a local archive file and fresh
+target name; `select-volume NAME` requires an owned volume name. In particular,
+`rss` has no `--project` option. Runtime configuration comes from
 the [settings above](#configuration). The launcher's `--project` is an internal
 uv option selecting its checkout, not an option accepted by `rss`. Likewise,
 `uv run` options such as `--locked` and `--offline` precede the executable name;
@@ -362,11 +462,14 @@ invalid command usage exits 2. Capture stdout separately when consuming results.
 | --- | --- | --- |
 | `rss setup` | Inventory/install missing Podman CLI and initialize the owned VM without starting services. | `machine: "rss-aggregator"`, `created: boolean`. |
 | `rss start` | Start/restart the owned application after security checks, verify scheduling and fetch feeds. | `machine: "running"`, `url`, `security`, `scheduler`, `fetch`. |
-| `rss status` | Inspect state without starting anything. | `machine`, `application`; when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
+| `rss status` | Inspect state without starting anything. | `machine`, `application`, selected `volume` when configured; when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
 | `rss fetch` | Run feed actualization immediately. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed. |
 | `rss verify` | Restart/recheck the running application before reopening service; briefly interrupts service. | Start fields plus `verified: true`. |
 | `rss replace` | Recreate only the owned application container, preserving its named data volume. | Start fields plus `replaced: true`. |
-| `rss stop` | Stop application writers and the owned VM; no external backup. | `machine: "stopped"`, `already_stopped: boolean`, `backup: "deferred"`. |
+| `rss backup` | Create a quiesced external archive and restore the prior running state. | `archive`, `sha256`, `verified: true`, `manifest`. |
+| `rss restore ARCHIVE --volume NAME` | Validate and import into a fresh owned volume without activation. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
+| `rss select-volume NAME` | Select an owned volume while the application is stopped. | `volume`, `selected: true`, `next_step`. |
+| `rss stop` | Back up application state before stopping the owned VM. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `status: "already_stopped"` / `"no_data"`). |
 
 `scheduler` contains `running`, `cron` and `timezone`. `security` is the sanitized
 image/PHP audit record also stored in private `security.json`: checked time,
@@ -458,7 +561,9 @@ result = Runtime().run("status")
 resolve from the editable source checkout and current `RSS_STATE_DIR`, not an
 import-time singleton. `run` serializes callable callers as well as CLI callers;
 errors raise `RuntimeFailure` or configuration/OS exceptions for the caller to
-handle. There are seven lifecycle operations, not a public command for every helper.
+handle. `run("backup")`, `run("restore", archive=Path(...), volume="fresh-name")`
+and `run("select-volume", volume="owned-name")` share the same lock and safeguards.
+There are ten operations, not a public command for every helper.
 
 ## Development verification
 
@@ -545,13 +650,24 @@ Missing Podman, the wrong platform or an unavailable project is an explicit
 failure when selected, not a skip reported as full coverage. These remain Mac
 VM-specific tests; they do not implement #7's native Linux runner. They require
 the cached pinned image, internet access to the public GitHub feed, and the
-correct existing ownership directory. They interrupt the project session. Use
-`RSS_STATE_DIR` explicitly when operating from another worktree; no automatic
+correct existing ownership directory. They interrupt the project session. Set `RSS_BACKUP_DIR` to a private external
+directory before the suite: existing VM-restart tests now exercise normal shutdown
+backups. Use the usual `umask 022` for public controlled-feed fixture files (backup
+archives remain explicitly `0600` regardless); an inherited `077` can make those
+public fixture files unreadable by Apache. Use `RSS_STATE_DIR` explicitly when
+operating from another worktree; no automatic
 ownership-state transfer occurs. The old `RSS_LIVE`/`RSS_OBSERVE_CRON` unittest
 commands are unsupported; select live tests with `-m live`.
 
 Unique labelled disposable test containers/volumes exercise HTTP installation,
 authentication, public articles, read/star state, replacement and VM stop/start.
+The recovery drill backs up a running and a stopped synthetic-user instance,
+removes its entire leased source container/volume, restores into a fresh volume,
+explicitly selects it, and verifies login, subscription, content, both read/unread
+states and a star through HTTP. It redirects only reserved resource/selection/record
+names, retaining production Click behavior, the real ownership checks and lock.
+No original source data is available during recovery. This is the spec's equivalent
+isolated recovery drill, not a second physical Mac demonstration.
 Cleanup removes only those fixtures. The installed-state replacement test invokes
 unchanged production Click `replace` in a subprocess with only application, data
 volume and preflight-container names redirected to reserved test names. It retains
@@ -574,7 +690,7 @@ daemon, and execute the real cron command against changed controlled content.
 They do **not** wait for production schedule intervals or change the production
 schedule. The long observer and `--observe-cron` option have been removed, along
 with the observer-only regression; that option now returns a pytest usage error.
-The retained live suite has five tests. Production-cadence observation is a
+The live suite has six tests, including the issue #2 recovery drill. Production-cadence observation is a
 one-off acceptance/soak check, not a routine test or publication requirement;
 previous natural-run evidence below remains historical and is not a claim that
 manual cron-command execution proves scheduler timing.
@@ -593,9 +709,9 @@ installation, unrelated-resource changes or unexpected shared-package upgrades.
 [#8](https://github.com/brucepucci/rss-aggregator/issues/8)'s documentation-only
 standard reached main separately through PR #10 (`d991e39`).
 [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) integrated #9 into
-#1's branch (`f88ea85`), not main. The approved delivery is to resolve **both #1
-and #9** through **one squash implementation commit** in PR #13, separate from
-#8. Review, acceptance and merge remain separately authorized; hooks are activated
+#1's branch (`f88ea85`), not main. PR #13 subsequently delivered **both #1 and #9**
+to main as squash commit `22ea43e`, separate from #8. This branch adds issue #2;
+publication, review and merge remain separately authorized. Hooks are activated
 per checkout only by explicit setup (and shared by linked worktrees).
 
 ### Historical evidence — not new results
@@ -634,6 +750,37 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **Issue #2 local checkpoint (2026-11-15, `feat/issue-2-backup-restore` based on `22ea43e`):**
+  On Apple Silicon / macOS 27.2 / Python 3.13.18 / Podman 6.2.0,
+  `uv run --locked --offline rss-dev check` passed **113 default tests in 105.16s**,
+  six live deselected, with Ruff lint/format clean.
+  With an explicitly configured private external `RSS_BACKUP_DIR` and `umask 022`,
+  `uv run --locked --offline pytest -p no:cacheprovider -m live -q --tb=short`
+  passed **all six live tests in 55.90s**. The new drill exercised production
+  Click backup while running/stopped, complete removal of its disposable source,
+  restore into a fresh volume, explicit selection and HTTP verification of login,
+  subscription, article content, read/unread and starred state. Command-boundary
+  regressions cover failed/interrupted exports, private external destinations,
+  shutdown backup failure, incomplete-target refusal, wrong-image refusal without
+  interrupting service, conflicts and malicious/corrupt archives including PAX
+  traversal and sparse/link entries. Tracer regressions were observed failing
+  before their implementations.
+  An earlier full live attempt had **two failures / four passes** because inherited
+  `umask 077` made existing public publisher fixture files root-owned `0600`:
+  HTTP 403 reproduced, and changing only their mode to `0644` restored HTTP 200.
+  Those unrelated fixture implementations were not changed; the normal-umask run
+  above is the passing result, not a claim of umask-independent live fixtures.
+  Real verify, backup-on-shutdown and explicit backup from an already-stopped VM
+  also succeeded. Both resulting archives independently passed `/usr/bin/unzip -tq`,
+  whole-ZIP SHA-256 comparisons and mode `0600` checks. Fixture containers/volumes
+  and reserved test records were removed; only the real application/data volume
+  remained before shutdown. The real security audit was restored, the VM left
+  stopped and loopback port 8080 confirmed closed. Verification-only archives were
+  retained in a private temporary host directory outside Git; this is **not** a
+  durable user backup configuration. No permanent `RSS_BACKUP_DIR`, real credentials,
+  new dependency, new CI run, physical second-host recovery or Linux/x86 verification
+  is claimed. Publication/review remain separate.
 
 - **Readiness/fixture checkpoint (2026-11-15, local changes based on `00e33a8`):**
   `uv run --locked --offline rss-dev check` passed **75 default tests in 42.09s**,
@@ -686,8 +833,9 @@ observer removal, not the changed test suite.
   and Linux/Mac integration responsibilities. Extend the existing entrypoint and
   workflow rather than introducing a competing baseline. Feature issues retain
   their own acceptance tests; passing mocks is not real-service evidence.
-- ReadKit/device/tailnet access, private-feed authorization, portable backup/restore
-  and destructive cleanup remain unimplemented/unverified. The volume is not a
+- ReadKit/device/tailnet access, private-feed authorization and destructive cleanup
+  remain unimplemented/unverified. Backup/restore verification is separately scoped
+  in the issue #2 checkpoint. The volume is not a
   backup. No baseline pass or historical run establishes complete acceptance,
   production security or permission to merge.
 
@@ -698,4 +846,4 @@ observer removal, not the changed test suite.
 - [Private Tailscale access and shared reading state](docs/adr/0003-private-tailscale-access-and-shared-reading-state.md)
 
 These decisions describe accepted architecture. The local runtime above implements
-only #1's initial slice; subsequent features remain explicitly deferred.
+#1's local runtime plus #2's backup/recovery slice; remaining features are deferred.

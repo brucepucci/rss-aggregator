@@ -1,16 +1,18 @@
-"""Expose the FreshRSS runtime as seven JSON-producing Click commands."""
+"""Expose the FreshRSS lifecycle and recovery as JSON-producing commands."""
 
 import json
+from pathlib import Path
+from typing import Any
 
 import click
 
 from rss_aggregator.runtime import Operation, Runtime, RuntimeFailure
 
 
-def _execute(operation: Operation) -> None:
+def _execute(operation: Operation, **options: Any) -> None:
     """Emit one successful result or translate runtime/configuration errors."""
     try:
-        result = Runtime().run(operation)
+        result = Runtime().run(operation, **options)
     except (
         RuntimeFailure,
         OSError,
@@ -66,5 +68,30 @@ def replace() -> None:
 
 @main.command()
 def stop() -> None:
-    """Stop project writers and VM without creating an external backup."""
+    """Back up stopped writers before stopping the project VM."""
     _execute("stop")
+
+
+@main.command()
+def backup() -> None:
+    """Create a verified external backup, preserving the prior running state."""
+    _execute("backup")
+
+
+@main.command()
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--volume",
+    required=True,
+    help="Fresh target volume name; never overwrites or activates.",
+)
+def restore(archive: Path, volume: str) -> None:
+    """Validate ARCHIVE and restore its data into a fresh owned volume."""
+    _execute("restore", archive=archive, volume=volume)
+
+
+@main.command("select-volume")
+@click.argument("volume")
+def select_volume(volume: str) -> None:
+    """Explicitly select an owned data volume while the application is stopped."""
+    _execute("select-volume", volume=volume)
