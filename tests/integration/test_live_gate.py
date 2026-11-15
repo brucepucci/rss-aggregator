@@ -5,6 +5,7 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
+import uuid
 from http.client import RemoteDisconnected
 from pathlib import Path
 
@@ -68,7 +69,29 @@ def test_effective_apache_override_blocks_serving_and_removes_probe(live_project
     finally:
         result = execute("rm", "-f", OVERRIDE)
         assert result.returncode == 0, "Could not remove test-only override"
-        result = project("start")
-        assert result.returncode == 0, (
-            "Application did not recover after override removal"
-        )
+        # Simulate the file left by a previous interrupted/failed cleanup. The
+        # retry must remove old names, not just its newly generated probe.
+        token = uuid.uuid4().hex
+        stale = "/var/www/FreshRSS/p/.project-security-" + token + ".php"
+        unrelated = "/var/www/FreshRSS/p/.project-security-note-" + token + ".php"
+        try:
+            result = execute(
+                "php",
+                "-r",
+                'file_put_contents($argv[1], "<?php echo PHP_VERSION;");'
+                'file_put_contents($argv[2], "<?php // unrelated fixture");',
+                stale,
+                unrelated,
+            )
+            assert result.returncode == 0, "Could not create stale diagnostic fixture"
+            result = project("start")
+            assert result.returncode == 0, (
+                "Application did not recover after override removal"
+            )
+            result = execute("test", "-e", stale)
+            assert result.returncode == 1, "Retry published a stale diagnostic endpoint"
+            assert execute("test", "-e", unrelated).returncode == 0, (
+                "Probe cleanup removed a file outside the generated-name pattern"
+            )
+        finally:
+            assert execute("rm", "-f", stale, unrelated).returncode == 0

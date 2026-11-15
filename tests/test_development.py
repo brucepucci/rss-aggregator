@@ -47,11 +47,9 @@ def project(tmp_path, tooling_environment):
         ".pre-commit-config.yaml",
     ):
         shutil.copyfile(ROOT / name, project / name)
-    package = project / "src/rss_aggregator"
+    package = project / "rss_aggregator"
     package.mkdir(parents=True)
-    shutil.copyfile(
-        ROOT / "src/rss_aggregator/development.py", package / "development.py"
-    )
+    shutil.copyfile(ROOT / "rss_aggregator/development.py", package / "development.py")
     (package / "__init__.py").write_text('"""Disposable acceptance package."""\n')
     tests = project / "tests"
     tests.mkdir()
@@ -468,11 +466,13 @@ def test_project_option_works_outside_selected_repository(project, tooling_envir
 def distinct_checkouts(project, tooling_environment):
     invoking, run = project
     shutil.copytree(
-        ROOT / "src/rss_aggregator",
-        invoking / "src/rss_aggregator",
+        ROOT / "rss_aggregator",
+        invoking / "rss_aggregator",
         dirs_exist_ok=True,
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    (invoking / "config").mkdir()
+    shutil.copyfile(ROOT / "config/image.json", invoking / "config/image.json")
     (invoking / "tests/test_sample.py").unlink()
     shutil.copyfile(
         ROOT / "tests/test_json_contract.py",
@@ -501,7 +501,7 @@ def distinct_checkouts(project, tooling_environment):
     ):
         result = selected_run(*arguments)
         assert result.returncode == 0, result.stdout + result.stderr
-    runtime = selected / "src/rss_aggregator/runtime.py"
+    runtime = selected / "rss_aggregator/runtime.py"
     original = runtime.read_text()
     guard = 'raise RuntimeFailure(f"Unknown operation: {operation}")'
     assert original.count(guard) == 1
@@ -529,17 +529,32 @@ def test_selected_checkout_checks_its_own_implementation(
     assert result.returncode == 0 and payload["ok"], result.stderr
     result, payload = invoke(selected_run, "check")
     assert result.returncode == 1 and not payload["ok"], result.stderr
-    assert "1 failed, 3 passed" in result.stderr
+    assert "1 failed, 4 passed" in result.stderr
+    environment_override = ""
     if import_override:
-        monkeypatch.setitem(tooling_environment, "PYTHONPATH", str(invoking / "src"))
+        monkeypatch.setitem(tooling_environment, "PYTHONPATH", str(invoking))
+        monkeypatch.setitem(tooling_environment, "HOME", str(invoking))
+        # Set an invalid Python home after startup so only the gate's children
+        # must tolerate it, not the interpreter launching the public operation.
+        environment_override = (
+            f"import os; os.environ['PYTHONHOME'] = {str(invoking)!r}; "
+        )
 
     if caller == "cli":
-        arguments = ["rss-dev", "check", "--project", str(selected)]
+        arguments = [
+            "python",
+            "-c",
+            environment_override
+            + "from rss_aggregator.development import main; main()",
+            "check",
+            "--project",
+            str(selected),
+        ]
     else:
         arguments = [
             "python",
             "-c",
-            "import json, sys; from pathlib import Path; "
+            environment_override + "import json, sys; from pathlib import Path; "
             "from rss_aggregator.development import check; "
             "result = check(Path(sys.argv[1])); "
             "print(json.dumps(result, indent=2)); sys.exit(not result['ok'])",
@@ -548,7 +563,7 @@ def test_selected_checkout_checks_its_own_implementation(
     result = run("uv", "run", "--locked", "--offline", *arguments)
     payload = json.loads(result.stdout)
     assert result.returncode == 1 and not payload["ok"], result.stderr
-    assert "1 failed, 3 passed" in result.stderr
+    assert "1 failed, 4 passed" in result.stderr
     assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
         "pytest": 1,
         "lint": 0,

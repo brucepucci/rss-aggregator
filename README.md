@@ -6,14 +6,12 @@ and SQLite in a named volume on the VM's native filesystem. No host PHP or
 database server, Podman Desktop, privileged socket helper, login item, launch
 agent, or automatic application startup is installed by this project.
 
-**Main-PR preparation checkpoint:** this branch combines the local runtime for
-[issue #1](https://github.com/brucepucci/rss-aggregator/issues/1) with
+[PR #13](https://github.com/brucepucci/rss-aggregator/pull/13) combines the local
+runtime for [#1](https://github.com/brucepucci/rss-aggregator/issues/1) with
 [#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9).
-[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) merged the adoption
-into `feat/issue-1-local-freshrss` at `f88ea85`. Main at `d991e39` still contained
-only documentation; the combined delivery is prepared for one squash merge into
-main, not yet performed at this checkpoint. Commands below describe this combined
-implementation. See [Python development and adoption](#python-development-and-adoption).
+Main integration and review acceptance remain pending. See
+[verification and adoption status](#verification-and-adoption-status) for historical
+evidence and verification of the changes in this checkout.
 
 Backups, guarded removal, Tailscale, ReadKit and Linux deployment are **not yet
 implemented**. See [architecture decisions](docs/adr/).
@@ -79,9 +77,17 @@ project. No package is automatically uninstalled.
 pinned image, and checks the **effective Apache PHP runtime**, first in an
 unpublished disposable container and then in the actual application. The actual
 application initially listens only on container loopback port 8088, **not** the
-published container port 80. Only after the check passes and its temporary probe
-is removed does Apache open port 80. The official entrypoint and default command
-are retained. Mac publication is **`127.0.0.1:8080` only**, not LAN/IPv6/all interfaces.
+published container port 80. Only after the check passes and cleanup removes
+**all** project probes (`.project-security-<32 lowercase hex digits>.php`), including
+stale probes from interrupted attempts, and verifies none remain does Apache open
+port 80. Cleanup/query failure keeps serving closed. The official entrypoint and
+default command are retained. Mac publication is **`127.0.0.1:8080` only**, not
+LAN/IPv6/all interfaces.
+
+Every start copies **both** checked-in new-user templates into the data volume
+while the application is stopped, including when reusing an existing container.
+If a copy fails, startup stops; retrying repeats both copies before serving.
+Existing FreshRSS users' settings and subscriptions are not rewritten.
 
 Podman may print suggestions to install its privileged helper or Desktop. **Do not
 follow those suggestions for this project**; explicit CLI connections need neither.
@@ -116,18 +122,23 @@ browser sessions; your account/password and reading state persist.
 | Command | Behavior |
 | --- | --- |
 | `./scripts/rss setup` | Inventory/install missing CLI; initialize an absent owned machine; preserve an existing setup. |
-| `./scripts/rss start` | Start the VM if needed; restart an existing application to re-run the security gate; check cron; immediately run feed actualization. |
+| `./scripts/rss start` | Start the VM if needed; stop/reuse or create the application, copy both new-user templates, re-run the security gate, check cron and immediately run feed actualization. |
 | `./scripts/rss status` | Report VM/application state, inspect installed cron and its live daemon, show last security-check time. Does not start anything. |
 | `./scripts/rss fetch` | Run feed actualization immediately, or explain that the installer is pending. |
 | `./scripts/rss verify` | Restart/recheck the running application, including effective Apache PHP, cron and immediate actualization. Brief service interruption. |
 | `./scripts/rss replace` | Stop/remove **only the owned application container**, then recreate it using the same named data volume and current checked-in configuration. |
-| `./scripts/rss stop` | Stop application writers, verify the containers have exited, then stop only the project VM. Repeating it reports already stopped. |
+| `./scripts/rss stop` | Verify VM identity and absence of unrelated running workloads in both rootless/rootful engines before stopping any container; stop owned writers, verify exit, then stop only the project VM. Repeating it reports already stopped. |
 
 Commands are serialized by a local lock. Repeated starts restart the application
 but do not create another VM, user, subscription, or data volume. Errors return
 nonzero; resources are retained for diagnosis rather than automatically rolled
 back or deleted. A failed startup can leave the VM running; use `status` and
-`stop`. A VM with unrelated **running** containers is not stopped automatically.
+`stop`. Before stopping **any** container, `stop` verifies machine/SSH and rootless
+connection identity, queries the rootless engine through that connection, and
+queries the rootful engine with `podman machine ssh rss-aggregator sudo podman ps`.
+It does not trust an unverified root connection. Unrelated running workloads in
+either engine, or failure of either query, cause refusal without stopping containers.
+Rootful workloads are never project-owned; stop them manually only when safe.
 
 FreshRSS runs actualization on startup and via the official image's enabled cron
 at **UTC minutes 00, 20 and 40** (`CRON_MIN=*/20`). This is wall-clock scheduling,
@@ -230,8 +241,8 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_STATE_DIR` (optional environment variable) | Ownership/inventory/lock/security record directory; `<checkout>/.local`. Not the FreshRSS database location. | Set an absolute private path **outside Git** before setup and use it consistently. Changing it does not adopt or migrate an existing machine. |
 | `config/image.json` | Official Debian FreshRSS `1.30.4`, digest-pinned OCI index, explicit `linux/arm64`, verified platform manifest and source revision. | Change only after checking current advisories and verifying registry identity/runtime. `replace` applies a pin change. No floating-tag update command. |
-| `config/config-user.custom.php` | New-user defaults: no age/maximum article purge; TTL `60` seconds. | `replace` copies the template; **existing users are not rewritten**. Change existing-user settings locally in FreshRSS, including feed/category overrides. |
-| `config/public-feed.opml` | One public FreshRSS releases feed for new users. | `replace` copies the import template; existing subscriptions remain unchanged. Enter private feeds locally only in a later slice. |
+| `config/config-user.custom.php` | New-user defaults: no age/maximum article purge; TTL `60` seconds. | Every `start` (also through `verify`/`replace`) copies it while the application is stopped; retry repeats both template copies. **Existing users are not rewritten**: change their settings locally in FreshRSS, including feed/category overrides. |
+| `config/public-feed.opml` | One public FreshRSS releases feed for new users. | Every `start` copies it while stopped, including with an existing container; existing subscriptions remain unchanged. Enter private feeds locally only in a later slice. |
 | VM resources (fixed in command) | Machine `rss-aggregator`, rootless, initial 2 CPUs / 2048 MiB RAM / 20 GiB disk. | No project resize/delete command; do not change machine identity or connection records to work around ownership checks. |
 | Container settings (fixed in command) | `CRON_MIN=*/20`, `TZ=UTC`, `ENABLE_ACCESS_LOG=0`, syslog copying off, `TRUSTED_PROXY=0`, `--restart=no`, internal security-gate listener. | Keep the official entrypoint/default command; apply reviewed changes with `replace`. No host cron/service registration. |
 
@@ -243,7 +254,7 @@ Development configuration is non-secret and required for the commands below:
 | `.python-version` | uv-managed Python 3.13.18. | Update intentionally with compatible project/Ruff targets and verify a fresh sync; do not silently upgrade host packages. |
 | `uv.lock` | Committed application dependency versions/hashes, including compatibility markers. | Regenerate only for intended dependency changes; normal setup/checks use `--locked`, not an implicit lock update. |
 | `.pre-commit-config.yaml` | One complete check-only baseline at pre-push, local/system environment, all files regardless of changed filenames. | Keep it aligned with `rss-dev check`; explicitly run guarded `rss-dev setup` when activating hooks. |
-| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; see the dated, revision-specific passing and controlled-failure [CI checkpoints](#github-actions-and-7), with subsequent results in the PR/evidence record. |
+| `.github/workflows/python.yml` | Same baseline on PRs/main updates, uv 0.13.8, immutable action references. | Review and verify changes; see [verification and adoption status](#verification-and-adoption-status) for revision-specific CI evidence and limits. |
 
 For example, to move an **already installed** instance to loopback port 8081:
 
@@ -453,53 +464,27 @@ uv sync --locked
 uv run --locked rss-dev check
 ```
 
-The application lockfile `uv.lock` is committed. Click is a runtime dependency;
-pytest, Ruff and pre-commit are development dependencies. `.python-version` pins
-Python 3.13.18. Initial sync may download the managed interpreter, packages and
-build backend; no Homebrew upgrade or global pip installation is involved. The
-baseline itself uses installed tools and isolated fixtures, with no network,
-credentials, production service or real Podman resources. Its disposable Git
-fixtures use offline uv sync from caches populated by the initial sync. A missing
-cache is an actionable failure, not a skipped check; rerun the initial sync rather
-than enabling network access inside tests.
+The initial sync installs locked tooling and may download Python 3.13.18,
+packages and the build backend; no global pip or Homebrew upgrade is involved.
+The baseline then uses installed tools and isolated fixtures without network,
+credentials, production services or real Podman resources. Disposable Git fixtures
+sync offline from the warmed cache. Missing caches fail rather than skip: rerun
+initial sync instead of allowing network inside tests.
 
-`rss-dev check` runs **all default pytest tests**,
-`ruff check --no-fix --no-fix-only`, and `ruff format --check`, even if an earlier
-check fails. The explicit lint flags override `[tool.ruff]` settings `fix = true`
-and `fix-only = true`: violations remain nonzero failures and source bytes stay
-unchanged. Use `rss-dev fix` to request safe lint rewriting explicitly.
-
-`check` strips inherited `PYTEST_*` environment variables (including `PYTEST_ADDOPTS` and
-`PYTEST_PLUGINS`) and explicitly passes `-m 'not live'`; ambient pytest options
-cannot select a subset or opt into live tests in the baseline. Child output is
-diagnostic stderr; stdout is `{ "ok": boolean, "checks": [{ "name": ..., "returncode": ... }] }`
-formatted with indentation. Any failed check exits 1. These are check-only gates:
-pytest cache/bytecode writes and Ruff cache writes are disabled within the gate;
-tracked and working source files are not rewritten. A standalone default suite is
-`uv run --locked pytest`; live tests are collected but deselected by default.
-
-Explicit, separate mutating commands are:
-
-```sh
-uv run --locked rss-dev format
-uv run --locked rss-dev fix
-```
-
-`format` uses only Ruff's formatter. `fix` applies only safe Ruff lint fixes,
-explicitly disables unsafe fixes even if configuration enables them, and does not
-format. Their JSON summaries have the same check-name/returncode shape. All
-`rss-dev` commands accept `--project <checkout-root>` after the subcommand; the
-callable counterparts are `check`, `setup`, `format_code`, and `fix` in
-`rss_aggregator.development`. They do not require a Click context.
+The [developer CLI reference](#developer-commands-and-results) defines the complete
+check-only baseline, environment isolation, JSON/exit semantics and explicit
+mutating `rss-dev format` / `rss-dev fix` commands. Checks disable pytest/Ruff
+caches and bytecode writes and do not rewrite source. Direct `uv run --locked pytest`
+selects the default suite; live tests are collected but deselected. Callable
+counterparts `check`, `setup`, `format_code` and `fix` in
+`rss_aggregator.development` require no Click context.
 
 Ruff selects `E4,E7,E9,F,I,D,UP`: baseline errors, unused names, import sorting,
-NumPy-compatible docstrings and modernization, targeting declared Python 3.10.
-Ruff replaces overlapping formatter/import/docstring/modernization tools, not by
-literally running Black/isort/etc. Tests are exempt from Ruff `D`; no production
-exceptions are granted. All production callables, including private methods,
-have annotated signatures and proportional NumPy-style docstrings. Review still
-assesses usefulness/private-callable documentation beyond what Ruff enforces.
-There is no mandatory separate typechecker or coverage-percentage threshold.
+NumPy docstrings and modernization, targeting Python 3.10. It replaces overlapping
+formatter/import/docstring tools, not by literally running them. Tests are exempt
+from `D`; production signatures (including private callables) must be annotated
+and have proportional NumPy-style docstrings. Review assesses usefulness beyond
+Ruff's enforcement. No separate typechecker or coverage threshold is required.
 
 ### Managed pre-push hooks
 
@@ -509,75 +494,32 @@ After sync, explicitly activate local enforcement:
 uv run --locked rss-dev setup
 ```
 
-With a Git remote, this installs a uv-managed pre-commit **pre-push** hook using
-`.pre-commit-config.yaml`. With no remote, setup succeeds with `active: false`,
-explains that hooks are not installed, and instructs you to rerun setup after
-adding a remote. There is no automatic later discovery. With an existing foreign,
-legacy, symlinked or custom `core.hooksPath` arrangement, setup exits 1, reports
-`active: false` and preserves the arrangement. Resolve it manually before retrying;
-do not overwrite or delete another developer's hooks. A recognized but
-nonexecutable pre-push hook is also refused with `active: false` and manual
-resolution guidance; setup preserves both its bytes and mode rather than
-claiming it is active or automatically adding execute permission. Rerunning setup
-leaves a recognized executable pre-commit hook byte-for-byte unchanged, including
-developer extensions. If its referenced environment is stale, explicitly resolve
-that existing arrangement before reinstalling; setup does not rewrite it automatically. `active` reports
-hook recognition/installation, not proof that a push has run. Setup does not
-install dependencies or start FreshRSS.
+With a remote, setup installs uv-managed pre-commit's **pre-push** hook using
+`.pre-commit-config.yaml`. Without a remote it succeeds inactive; rerun after
+adding one (no automatic discovery). Foreign/legacy/symlinked hooks, custom
+`core.hooksPath`, or recognized nonexecutable hooks are preserved and refused
+with exit 1 and manual-resolution guidance. Never overwrite someone else's hooks.
+A recognized executable hook, including extensions, stays byte-for-byte unchanged;
+resolve stale referenced environments manually. `active` means recognized/installed,
+not proof a push ran. Setup neither installs dependencies nor starts FreshRSS.
 
-Linked worktrees share Git hooks. This adoption was verified using **disposable
-repositories/local bare remotes**, not by activating hooks in the shared real
-repository. #9's hook configuration is now integrated into #1's branch through
-PR #11; activation in any checkout remains explicit. Activate intentionally when
-ready and push from a branch containing the hook configuration. The hook runs the
-same full baseline through `uv run --locked --offline rss-dev check`, regardless
-of changed filenames or remote name/provider. It applies to **all Git remotes**,
-can be absent or bypassed, and is not a security boundary. A missing uv environment
-or offline cache fails; it never silently downloads or rewrites source during push.
+**Linked worktrees share hooks:** activate intentionally and push from a branch
+containing the configuration. Historical tests used disposable repositories/local
+bare remotes, not this shared Git directory. The hook runs the complete baseline
+through `uv run --locked --offline rss-dev check`, irrespective of changed filenames
+or remote provider. Missing environments/caches fail; pushes never silently download
+or rewrite source. Hooks cover **all Git remotes**, can be absent/bypassed and are
+not a security boundary.
 
-### GitHub Actions and #7
+### GitHub Actions
 
 `.github/workflows/python.yml` runs the same `uv sync --locked` and
-`uv run --locked rss-dev check` baseline on pull requests (including nested PRs)
-and main-branch pushes, with read-only contents permission, immutable action
-references, and uv 0.13.8. [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11)
-merged the adoption into `feat/issue-1-local-freshrss` at `f88ea85`, not directly
-into main. The checkpoints below retain evidence for their exact revisions.
-
-**Checkpoint: 2026-11-14.** Review-fix revision
-`4a6116621efd2c91e3dc11575fcb63028779f74e` was published to PR #11, and
-[Python baseline run 43641847554](https://github.com/brucepucci/rss-aggregator/actions/runs/43641847554)
-completed successfully on that exact revision. This is revision-specific baseline
-evidence, not a claim about subsequent commits or live integration. Consult
-[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) and the
-[verification record](docs/verification/issue-9.md) for subsequent results; a new
-CI run alone does not require rewriting this historical checkpoint.
-
-At this checkpoint, **controlled-failing GitHub pytest/lint/format evidence
-remained outstanding**, and the authorized draft exception did not establish
-complete acceptance. Local push rejection is not evidence of CI execution.
-Integration/merge still requires separate authorization, and no branch protection
-changes are made.
-
-**Controlled-failure checkpoint: 2026-11-14.** With explicit authorization,
-disposable [PR #12](https://github.com/brucepucci/rss-aggregator/pull/12) exercised
-the unchanged baseline workflow with separate pytest, lint and formatting
-failures. Each Actions run rejected exactly the intended check after successful
-dependency setup, while the other checks passed. After removing the probe,
-[run 43644411740](https://github.com/brucepucci/rss-aggregator/actions/runs/43644411740)
-passed on the restored tree, identical to PR #11 revision `67cf72b`.
-The experiment was closed **without merging**, and its remote branch was deleted.
-The [revision/run-specific evidence](docs/verification/issue-9.md#controlled-failure-ci-checkpoint-2026-11-14)
-supplies #9's controlled-failing CI requirement; the earlier outstanding-status
-statements describe their historical checkpoints. It does not establish branch
-protection, live/platform coverage, review acceptance or permission to integrate
-or merge.
-
-[#7](https://github.com/brucepucci/rss-aggregator/issues/7) extends this entrypoint
-and workflow with native Linux rootless-Podman coverage, controlled publication
-fixtures/failure cases, a coverage matrix and Mac provider/manual-device limits.
-It must not create a competing baseline or treat mocked checks as proof of real
-PHP security, fetching, persistence, backups, tailnet access or ReadKit behavior.
+`uv run --locked rss-dev check` baseline on pull requests and main-branch pushes,
+with read-only contents permission, immutable action references and uv 0.13.8.
+CI and local gates check; they do not silently format/fix files. Historical
+passing/failing runs and current acceptance limits are listed
+[below](#verification-and-adoption-status); a workflow definition is not execution
+evidence or branch protection.
 
 ### Explicit live/platform checks
 
@@ -599,61 +541,123 @@ commands have been replaced by pytest marker/option selection.
 
 Unique labelled disposable test containers/volumes exercise HTTP installation,
 authentication, public articles, read/star state, replacement and VM stop/start.
-Cleanup removes only those fixtures. The security test temporarily adds an
-Apache INI override to the real owned application, proves failed verification
-keeps it inaccessible with no diagnostic left behind, then removes the override
-and restores verified service. Let its recovery handler finish. Do not publish
+Cleanup removes only those fixtures. The installed-state replacement test invokes
+unchanged production Click `replace` in a subprocess with only application, data
+volume and preflight-container names redirected to reserved test names. It retains
+the real VM/connection ownership checks and command lock, uses the existing owner
+record (never a fabricated copy), and verifies subscription, article content and
+read/star state through authenticated HTTP after replacement. Cleanup is anchored
+to its retained test-labelled volume. This check writes the normal `security.json`
+audit in the selected ownership directory; it does not replace the real application
+or its data. The security test temporarily adds an Apache INI override to the real
+owned application, proves failed verification keeps it inaccessible with no
+diagnostic left behind, then removes the override and restores verified service.
+It also checks that retry removes a stale generated probe but preserves a file
+outside the exact generated-name pattern. Let its recovery handler finish. Do not publish
 HTML, authentication payloads, private URLs or `--showlocals` output as artifacts.
 
 Only the fast controlled-feed regression reduces fixture TTL/cache minimums. Its
 publisher advertises `no-cache, max-age=0`, avoiding the image's long-lived asset
 caching. The optional **20–40 minute** observation preserves production settings
 and waits for two genuine scheduler executions, never counting manual refreshes.
-The historical #1 observation is not claimed as a new #9 run.
+See the current checkpoint below for the integrated candidate's natural-cron result;
+the older #1 observation remains historical.
 
-See the [rewrite inventory](docs/implementation/issue-9.md),
-[#9 verification evidence](docs/verification/issue-9.md), and
-[historical #1 evidence](docs/verification/issue-1.md) for actual results and limits.
-Those records identify the revisions and checkpoints actually verified; results
-for one revision do not establish verification of subsequent commits.
+## Verification and adoption status
 
-## Python development and adoption
+The canonical policy is [docs/python-standards.md](docs/python-standards.md),
+discovered through [AGENTS.md](AGENTS.md). This branch implements uv, pytest,
+callable operations with thin Click/JSON adapters, production annotations and
+proportional NumPy-style docstrings, Ruff, guarded pre-push setup and matching CI.
+No Python policy exceptions are granted beyond the standard's exemptions for
+tests and trivial special methods. Production code is in top-level `rss_aggregator/`; `scripts/rss`
+is only a compatibility launcher. Host tooling does not authorize host PHP/database
+installation, unrelated-resource changes or unexpected shared-package upgrades.
 
-The canonical, copy/paste-friendly policy is [docs/python-standards.md](docs/python-standards.md); [AGENTS.md](AGENTS.md) points agents to it. Repository-specific setup and exceptions belong here, not in the reusable policy.
+[#8](https://github.com/brucepucci/rss-aggregator/issues/8)'s documentation-only
+standard reached main separately through PR #10 (`d991e39`).
+[PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) integrated #9 into
+#1's branch (`f88ea85`), not main. The approved delivery is to resolve **both #1
+and #9** through **one squash implementation commit** in PR #13, separate from
+#8. Review, acceptance and merge remain separately authorized; hooks are activated
+per checkout only by explicit setup (and shared by linked worktrees).
 
-### Approved rollout
+### Historical evidence — not new results
 
-1. **Done:** the documentation-only [#8](https://github.com/brucepucci/rss-aggregator/issues/8) change reached main through PR #10 at `d991e39`, without waiting for #1's closure or merge.
-2. **Done on this branch:** incorporate those standards into #1's existing implementation branch, preserving its runtime and history.
-3. **Done:** [#9 — adoption/rewrite](https://github.com/brucepucci/rss-aggregator/issues/9) was integrated into #1's branch through [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) at `f88ea85`. See the [CI checkpoints](#github-actions-and-7) for revision-specific evidence and limitations; historical draft status is not the current integration status.
-4. Verify the combined #1/#9 branch against both issues for the final main-targeting PR. It must resolve **both #1 and #9** and squash-merge them as **one implementation commit**, separately from #8's documentation commit. Main integration remains pending at this preparation checkpoint; review and merge remain separately authorized.
+The existing [PR #13 body](https://github.com/brucepucci/rss-aggregator/pull/13)
+records head `bf39851538aefa612cf3d21298c7617fd141892e`, tree
+`ccab46669276a62109a4e82faccee5c7fc8fc7c8`: fresh archived-checkout sync,
+**60 default tests plus Ruff lint/format passed** (five live deselected).
+Separately, **five Mac/HTTP live tests passed in 35.01s**: effective Apache
+security failure/recovery, synthetic-user authentication, public/controlled feeds,
+purge settings, read/star state, fixture replacement, VM restart and port migration.
+Apache/CLI PHP 8.4.27, disabled web upload progress, UTC `*/20` daemon/schedule and
+final VM/listener shutdown were verified. Source stayed unchanged; no real
+credentials or shared hooks were provisioned. These results cover **that candidate,
+not these maintainer fixes**.
 
-This is the approved integration plan, not authorization to publish or merge automatically.
+Historical GitHub CI evidence (2026-11-14):
 
-### Enforcement status and exceptions
+| Check | Revision / run |
+| --- | --- |
+| Passing PR #11 baseline | `4a61166`: [43641847554](https://github.com/brucepucci/rss-aggregator/actions/runs/43641847554) |
+| Controlled pytest failure | `1977d38`: [43644086364](https://github.com/brucepucci/rss-aggregator/actions/runs/43644086364) |
+| Controlled lint failure | `9d4f425`: [43644229824](https://github.com/brucepucci/rss-aggregator/actions/runs/43644229824) |
+| Controlled format failure | `8104199`: [43644329319](https://github.com/brucepucci/rss-aggregator/actions/runs/43644329319) |
+| Restored tree, all checks passing | `97b62ae` (same tree as `67cf72b`): [43644411740](https://github.com/brucepucci/rss-aggregator/actions/runs/43644411740) |
 
-The combined #1/#9 branch implements uv-managed tooling, pytest, independent
-callable operations with thin Click adapters, JSON results, typed/documented
-production code, Ruff and managed baseline gates. No Python policy exceptions are
-granted; tests and trivial special methods retain the canonical exemptions.
-PR #11 establishes integration into #1's branch, not main integration or hook
-activation in a particular checkout. At the **2026-11-14 checkpoint**, published revision `4a61166`
-passed the GitHub baseline; controlled-failing CI evidence and integration were
-still outstanding. That checkpoint does not establish results for subsequent
-commits. See the [CI checkpoint](#github-actions-and-7) and linked PR/evidence
-record for revision-specific results and remaining acceptance work. The later
-controlled-failure checkpoint above supplies the negative-CI evidence; it does
-not establish integration or full issue acceptance.
+The failure experiments used disposable [PR #12](https://github.com/brucepucci/rss-aggregator/pull/12),
+closed unmerged with its branch deleted. Dependencies installed successfully; each
+run failed only the intended check. They supply #9's negative-CI evidence, not
+branch protection or results for newer revisions. No new CI result is claimed here.
 
-Host-side Python development tooling does not authorize installing FreshRSS's PHP/database runtime on the host, unexpected host-package upgrades, or changes to unrelated resources. All accepted ADRs remain in force; this change neither changes them nor certifies unmerged runtime behavior.
+#1's pre-adoption `1021070` run historically observed two **natural** executions
+at 2026-11-14 18:20:01 and 18:40:01 UTC collecting newly published controlled
+articles with production TTL/cache policy. That is not an integrated #9/PR #13
+rerun. The earlier real Homebrew footprint is listed under installation above;
+installation was not repeated for the PR #13 candidate.
 
-### Verification responsibilities
+### Current verification and limits
 
-- **#8 (merged specification):** delivered the canonical policy and discovery/documentation guidance only; it installed no tools and changed no production Python, tests, hooks or CI workflows.
-- **#9 (baseline adoption):** supply uv-managed tooling, pytest, callable APIs with useful Click boundaries, production typing/docstrings, Ruff, pre-push gates, and matching GitHub Actions checks. The complete default suite must be deterministic and isolated, with no credentials, network, or production services. Preserve meaningful command-boundary success/failure coverage and prove checks reject controlled failures without rewriting files. Actual passing/failing local-hook and CI evidence belongs to adoption, not this specification.
-- **[#7 (shared integration infrastructure)](https://github.com/brucepucci/rss-aggregator/issues/7):** owns broader real rootless-Podman/runtime/HTTP coverage and platform responsibilities, with separately selected integration suites, safe fixtures, and explicit Mac VM-provider/manual-device limits. Feature issues retain their own acceptance tests. Coordinate shared entrypoints/workflows with #9 rather than creating competing systems or making either a new blocker for the other.
-
-A baseline pass is not proof of effective PHP security, real feed fetching, durable reading state, actual backup recovery, tailnet access, paid-feed authorization, or physical ReadKit client behavior. Record actual checks, unavailable prerequisites, unperformed checks, and platform limitations rather than claiming full coverage.
+- **Local review-fix checkpoint (2026-11-15):** candidate tree
+  `18f4f79e054f4b03fe821b9fc36fd4a69bb0b53b`, based on PR head `bf39851`;
+  only this README's evidence was updated afterward. No commit/push is implied.
+  `uv sync --locked --offline`
+  and `uv run --locked --offline rss-dev check` passed: **71 default tests**, six
+  live deselected, Ruff lint/format clean. This includes template-copy failure/retry,
+  rootful/rootless shutdown refusal/failure and cleanup retry simulations, package
+  relocation, and checkout-B isolation under hostile import/home overrides.
+  Real owned VM start/stop/start/status and the live security/stale-probe check
+  passed on Apple Silicon / Python 3.13.18. No Homebrew installation, hook activation
+  or new GitHub CI run was performed.
+- **S1 passed locally:** `pytest -m live tests/integration/test_live_replace.py`
+  passed in **10.96s**, exercising the real Click replacement implementation under
+  isolated resource names and verifying installed subscription, article identity/
+  content and deliberate read/star state through HTTP afterward. It used synthetic
+  credentials and a disposable volume, not the real application user's state.
+- **S2 passed locally:** `uv run --locked --offline pytest -p no:cacheprovider
+  -m live --observe-cron -s --tb=short` passed **all six live tests in 1533.26s**.
+  Natural runs at **2026-11-15 02:40:01 and 03:00:01 UTC** collected successive
+  controlled articles verified through HTTP, without shortening production
+  scheduling/TTL/cache policy. The suite also reverified effective Apache security,
+  stale-probe cleanup, public/controlled fetching, purge defaults, read/star state,
+  real Click replacement, VM restart and port migration. Fixture teardown passed;
+  the real application audit was restored and the VM stopped afterward. An earlier
+  interrupted attempt was not counted; its ownership-checked test resources were
+  removed before this successful rerun.
+- Python 3.10 (the declared minimum), alternate image architectures, native Linux
+  rootless-Podman integration and other Mac providers/versions are unverified.
+  CI's Linux **baseline** is not native-container integration. No separate
+  typechecker or visual browser automation is claimed.
+- [#7](https://github.com/brucepucci/rss-aggregator/issues/7) owns broader controlled
+  publisher/error cases, interruption-safe fixtures, a platform coverage matrix
+  and Linux/Mac integration responsibilities. Extend the existing entrypoint and
+  workflow rather than introducing a competing baseline. Feature issues retain
+  their own acceptance tests; passing mocks is not real-service evidence.
+- ReadKit/device/tailnet access, private-feed authorization, portable backup/restore
+  and destructive cleanup remain unimplemented/unverified. The volume is not a
+  backup. No baseline pass or historical run establishes complete acceptance,
+  production security or permission to merge.
 
 ## Architecture
 

@@ -15,10 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_absent_status_is_indented_json(tmp_path):
-    env = dict(os.environ, RSS_STATE_DIR=str(tmp_path), PYTHONPATH=str(ROOT / "src"))
+    env = dict(os.environ, RSS_STATE_DIR=str(tmp_path), PYTHONPATH=str(ROOT))
     result = subprocess.run(
         [sys.executable, "-m", "rss_aggregator", "status"],
-        cwd=ROOT,
+        cwd=tmp_path,
         env=env,
         text=True,
         capture_output=True,
@@ -28,6 +28,18 @@ def test_absent_status_is_indented_json(tmp_path):
     assert result.stdout.startswith("{\n")
     assert json.loads(result.stdout)["machine"] == "absent"
     assert not (tmp_path / "owner.json").exists()
+
+
+def test_default_runtime_resolves_checkout_root_and_config_outside_checkout(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("RSS_STATE_DIR", raising=False)
+    runtime = Runtime()
+    assert runtime.root == ROOT
+    assert runtime.state_dir == ROOT / ".local"
+    assert runtime._image() == json.loads((ROOT / "config/image.json").read_text())
+    assert not (tmp_path / ".local").exists()
 
 
 def test_callable_instances_resolve_current_environment_independently(

@@ -27,7 +27,7 @@ class CommandFixture:
             RSS_STATE_DIR=str(state),
             RSS_PORT=str(port),
             PATH=str(self.bin),
-            PYTHONPATH=str(ROOT / "src"),
+            PYTHONPATH=str(ROOT),
         )
         self.tool(
             "podman",
@@ -57,7 +57,14 @@ class CommandFixture:
         path.chmod(0o755)
 
     def machine(
-        self, *, running=False, other=False, replaced=False, extra="", state=None
+        self,
+        *,
+        running=False,
+        other=False,
+        replaced=False,
+        extra="",
+        state=None,
+        rootful="[]",
     ):
         machine = {
             "Name": "rss-aggregator",
@@ -89,6 +96,9 @@ args = sys.argv[1:]
 if args == ['machine', 'list', '--format', 'json']: print({json.dumps(machines)!r})
 elif args == ['system', 'connection', 'list', '--format', 'json']: print({json.dumps([connection])!r})
 elif args == ['machine', 'inspect', 'rss-aggregator']: print({json.dumps([machine])!r})
+elif args == ['machine', 'ssh', 'rss-aggregator', 'sudo', 'podman', 'ps', '--format', 'json']:
+ if {rootful!r} is None: raise SystemExit('rootful inspection failed')
+ print({rootful!r})
 {extra}
 else: raise SystemExit('UNEXPECTED MUTATION: ' + ' '.join(args))
 """,
@@ -354,16 +364,44 @@ def test_invalid_port_rejected_before_vm_start(command, port):
     assert "UNEXPECTED MUTATION" not in result.stderr
 
 
-def test_stop_preserves_unrelated_running_containers(command):
+@pytest.mark.parametrize("namespace", ["rootless", "rootful"])
+def test_stop_preserves_unrelated_running_containers(command, namespace):
+    workload = '[{"Names":["personal-workload"]}]'
     command.machine(
         running=True,
-        extra="""elif '--connection' in args:
- if args[2] == 'ps': print('[{"Names":["personal-workload"]}]')
+        rootful=workload if namespace == "rootful" else "[]",
+        extra=f"""elif '--connection' in args:
+ if args[2] == 'ps': print({(workload if namespace == "rootless" else "[]")!r})
  else: raise SystemExit('UNEXPECTED MUTATION')""",
     )
     result = command.run("stop")
     assert result.returncode != 0
-    assert "personal-workload" in result.stderr
+    assert "VM left running" in result.stderr
+    assert "UNEXPECTED MUTATION" not in result.stderr
+
+
+@pytest.mark.parametrize("rootful", [None, "not-json", "{}", "null"])
+def test_stop_refuses_failed_rootful_inspection_before_mutations(command, rootful):
+    command.machine(
+        running=True,
+        rootful=rootful,
+        extra="""elif args == ['--connection', 'rss-aggregator', 'ps', '--format', 'json']: print('[]')""",
+    )
+    result = command.run("stop")
+    assert result.returncode != 0
+    assert "UNEXPECTED MUTATION" not in result.stderr
+
+
+def test_stop_refuses_failed_rootless_inspection_before_mutations(command):
+    command.machine(
+        running=True,
+        extra="""elif '--connection' in args:
+ if args[2] == 'ps': raise SystemExit('rootless inspection failed')
+ else: raise SystemExit('UNEXPECTED MUTATION')""",
+    )
+    result = command.run("stop")
+    assert result.returncode != 0
+    assert "rootless inspection failed" in result.stderr
     assert "UNEXPECTED MUTATION" not in result.stderr
 
 

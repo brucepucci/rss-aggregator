@@ -45,7 +45,7 @@ class Runtime:
     def __init__(self, root: Path | None = None, state_dir: Path | None = None) -> None:
         """Resolve instance paths without inspecting or changing native resources."""
         self.root = (
-            (root if root is not None else Path(__file__).resolve().parents[2])
+            (root if root is not None else Path(__file__).resolve().parents[1])
             .expanduser()
             .resolve()
         )
@@ -391,7 +391,7 @@ class Runtime:
                     raise RuntimeFailure(
                         f"Loopback port {port} is occupied; choose RSS_PORT or stop its owner yourself."
                     ) from error
-        self._security(owner)
+        self._security(owner, target=CHECK)
         if not self._exists("volume", VOLUME):
             self._podman(
                 "volume", "create", "--label", LABEL + "=" + owner["token"], VOLUME
@@ -417,7 +417,6 @@ class Runtime:
                 )
             if app["State"]["Running"]:
                 self._podman("stop", "--time", "60", APP)
-            self._podman("start", APP)
         else:
             image = self._image()
             self._podman(
@@ -450,17 +449,19 @@ class Runtime:
                 "COPY_SYSLOG_TO_STDERR=Off",
                 image["image"],
             )
-            self._podman(
-                "cp",
-                str(self.root / "config/config-user.custom.php"),
-                APP + ":/var/www/FreshRSS/data/config-user.custom.php",
-            )
-            self._podman(
-                "cp",
-                str(self.root / "config/public-feed.opml"),
-                APP + ":/var/www/FreshRSS/data/opml.xml",
-            )
-            self._podman("start", APP)
+        # Repeat both copies while stopped, including after a partial first start.
+        # These are new-user templates, never existing users' settings or feeds.
+        self._podman(
+            "cp",
+            str(self.root / "config/config-user.custom.php"),
+            APP + ":/var/www/FreshRSS/data/config-user.custom.php",
+        )
+        self._podman(
+            "cp",
+            str(self.root / "config/public-feed.opml"),
+            APP + ":/var/www/FreshRSS/data/opml.xml",
+        )
+        self._podman("start", APP)
         security = self._security(owner, target=APP)
         self._ready(port)
         scheduler = self._scheduler(owner)
@@ -613,7 +614,7 @@ class Runtime:
                     self._check_label("container", CHECK, owner)
                     self._podman("rm", "--force", "--volumes", CHECK)
             else:
-                self._podman("exec", APP, "rm", "-f", "/var/www/FreshRSS/p/" + name)
+                self._clear_probes()
         if target == APP:
             # Gracefully open port 80 only after the effective PHP probe is removed.
             code = (
@@ -637,6 +638,19 @@ class Runtime:
         )
         return record
 
+    def _clear_probes(self) -> None:
+        """Remove current and stale project probes, verifying cleanup before serving."""
+        code = (
+            '$dir="/var/www/FreshRSS/p/";'
+            '$pattern="/^\\\\.project-security-[a-f0-9]{32}\\\\.php$/D";'
+            "$files=scandir($dir);if($files===false){exit(1);}"
+            "foreach($files as $file){if(preg_match($pattern,$file)"
+            "&&!unlink($dir.$file)){exit(1);}}"
+            "clearstatcache();$files=scandir($dir);if($files===false){exit(1);}"
+            "foreach($files as $file){if(preg_match($pattern,$file)){exit(1);}}"
+        )
+        self._podman("exec", APP, "php", "-r", code)
+
     def _stop(self) -> dict[str, Any]:
         """Stop project writers and VM, refusing unrelated running containers."""
         owner, machine = self._owned()
@@ -649,7 +663,28 @@ class Runtime:
                 + machine["State"]
                 + "; wait and inspect before retrying."
             )
+        # machine ssh uses the already verified VM/SSH identity, not a potentially
+        # redirected root connection. Rootful workloads are never project-owned.
+        rootful = self._json_run(
+            "podman",
+            "machine",
+            "ssh",
+            MACHINE,
+            "sudo",
+            "podman",
+            "ps",
+            "--format",
+            "json",
+        )
         containers = json.loads(self._podman("ps", "--format", "json").stdout)
+        if not isinstance(rootful, list) or not isinstance(containers, list):
+            raise RuntimeFailure(
+                "Cannot inspect both container engines; VM left running."
+            )
+        if rootful:
+            raise RuntimeFailure(
+                "Unrelated running rootful containers; project VM left running."
+            )
         for item in containers:
             name = (
                 item["Names"][0] if isinstance(item["Names"], list) else item["Names"]
