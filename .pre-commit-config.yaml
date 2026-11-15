@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: development-check
+        name: Complete development checks
+        entry: uv run --locked --offline rss-dev check
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
