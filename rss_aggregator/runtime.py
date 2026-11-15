@@ -751,13 +751,13 @@ class Runtime:
         return result
 
     def _ready(self, port: int) -> None:
-        """Wait for HTTP 200 on the loopback publication, retaining failed VMs."""
+        """Retry transient HTTP failures up to 30 times, retaining failed VMs."""
         for _ in range(30):
             try:
                 with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
                     if response.status == 200:
                         return
-            except (URLError, TimeoutError):
+            except (URLError, TimeoutError, ConnectionError):
                 time.sleep(1)
         raise RuntimeFailure(
             "FreshRSS HTTP did not become ready; VM retained for diagnosis."

@@ -89,6 +89,12 @@ while the application is stopped, including when reusing an existing container.
 If a copy fails, startup stops; retrying repeats both copies before serving.
 Existing FreshRSS users' settings and subscriptions are not rewritten.
 
+After publication, HTTP readiness makes at most 30 attempts with a 2-second request
+timeout. URL errors, timeouts and transient connection failures (including dropped
+responses and resets) retry after 1 second. Only successful readiness proceeds to
+scheduler verification and immediate fetching. Exhaustion returns an error and
+retains the VM/application for diagnosis; it does not imply HTTP is closed.
+
 Podman may print suggestions to install its privileged helper or Desktop. **Do not
 follow those suggestions for this project**; explicit CLI connections need neither.
 
@@ -468,7 +474,14 @@ packages and the build backend; no global pip or Homebrew upgrade is involved.
 The baseline then uses installed tools and isolated fixtures without network,
 credentials, production services or real Podman resources. Disposable Git fixtures
 sync offline from the warmed cache. Missing caches fail rather than skip: rerun
-initial sync instead of allowing network inside tests.
+initial sync instead of allowing network inside tests. Hook-refusal permutations
+use minimal disposable repositories and the already-installed developer CLI, without
+synchronizing environments. Full environments remain for installation, actual pushes
+and cross-checkout isolation. Fixture-only A/B import sentinels check selected-code
+isolation without rewriting lifecycle source or relying on unrelated test counts;
+Runtime root/configuration checks remain separate. Readiness regressions combine
+controlled Podman responses with a real disposable loopback HTTP server; they are
+not live-VM fault-injection evidence.
 
 The [developer CLI reference](#developer-commands-and-results) defines the complete
 check-only baseline, environment isolation, JSON/exit semantics and explicit
@@ -622,13 +635,17 @@ installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
 
-- **Fast-suite checkpoint (2026-11-15, after observer removal):**
-  `uv run --locked --offline rss-dev check` passed **71 default tests in 44.70s**,
-  five live deselected, with Ruff lint/format clean.
+- **Readiness/fixture checkpoint (2026-11-15, local changes based on `00e33a8`):**
+  `uv run --locked --offline rss-dev check` passed **75 default tests in 42.09s**,
+  five live deselected, with Ruff lint/format clean. Four readiness regressions
+  failed before the fix and passed afterward: real HTTP disconnects and controlled
+  connection resets, both recoverable and persistent. They verify that recovery
+  reaches scheduler/fetch stages and persistent failures stop at 30 attempts.
+  Developer tests retain CLI/callable hostile-environment isolation and actual
+  push coverage, now using import sentinels and lighter hook-refusal fixtures.
   `uv run --locked --offline pytest -p no:cacheprovider -m live -q --tb=short`
-  passed **all five live tests in 37.79s**. The removed option is absent from
-  pytest help and rejected with usage exit 4. Production cron remains `*/20`;
-  the real application audit was restored and the VM stopped afterward.
+  passed **all five live tests in 38.35s**. Production cron remains `*/20`;
+  the real application audit was restored, the VM stopped and loopback port closed.
   No commit/push or new CI run is implied by this local checkpoint.
 
 The earlier review-fix results below describe their exact candidates, before

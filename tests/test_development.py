@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,9 +32,39 @@ def tooling_environment(tmp_path_factory):
         PYTHONDONTWRITEBYTECODE="1",
         PRE_COMMIT_HOME=str(tmp_path_factory.mktemp("pre-commit-cache")),
     )
-    for variable in ("UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV"):
+    for variable in (
+        "UV_PROJECT",
+        "UV_PROJECT_ENVIRONMENT",
+        "VIRTUAL_ENV",
+        "PYTHONPATH",
+        "PYTHONHOME",
+    ):
         environment.pop(variable, None)
     return environment
+
+
+@pytest.fixture
+def hook_repository(tmp_path, tooling_environment):
+    directory = tmp_path / "project"
+    directory.mkdir()
+
+    def run(*arguments):
+        return subprocess.run(
+            arguments,
+            cwd=directory,
+            env=tooling_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    for arguments in (
+        ("git", "init", "--initial-branch=main"),
+        ("git", "remote", "add", "disposable", str(tmp_path / "unused-remote.git")),
+    ):
+        result = run(*arguments)
+        assert result.returncode == 0, result.stdout + result.stderr
+    return directory, run
 
 
 @pytest.fixture
@@ -181,18 +212,21 @@ def test_check_and_actual_push_reject_failures_without_fixes(
     "arrangement",
     ["foreign", "legacy", "symlink", "dangling", "hooks-symlink", "custom"],
 )
-def test_setup_preserves_conflicting_hook_arrangements(project, arrangement):
-    directory, run = project
-    add_remote(directory, run)
+def test_setup_preserves_conflicting_hook_arrangements(hook_repository, arrangement):
+    directory, run = hook_repository
     hooks = directory / ".git/hooks"
     hook = hooks / "pre-push"
     foreign = b"#!/bin/sh\n# Keep this developer-owned hook.\nexit 0\n"
     target = directory.parent / "external-hook"
     target.write_bytes(foreign)
+    target.chmod(0o740)
     if arrangement == "foreign":
         hook.write_bytes(foreign)
+        hook.chmod(0o751)
     elif arrangement == "legacy":
-        (hooks / "pre-push.legacy").write_bytes(foreign)
+        legacy = hooks / "pre-push.legacy"
+        legacy.write_bytes(foreign)
+        legacy.chmod(0o640)
     elif arrangement in ("symlink", "dangling"):
         hook.symlink_to(
             target if arrangement == "symlink" else target.with_suffix(".missing")
@@ -204,23 +238,46 @@ def test_setup_preserves_conflicting_hook_arrangements(project, arrangement):
         custom = directory.parent / "custom-hooks"
         custom.mkdir()
         (custom / "pre-push").write_bytes(foreign)
+        (custom / "pre-push").chmod(0o750)
         result = run("git", "config", "core.hooksPath", str(custom))
         assert result.returncode == 0
 
-    before = {
-        str(path): (path.is_symlink(), path.read_bytes())
-        for path in directory.parent.rglob("*")
-        if path.is_file() and ".venv" not in path.parts
-    }
-    result, payload = invoke(run, "setup")
-    assert result.returncode != 0
+    def snapshot():
+        return {
+            path.relative_to(directory.parent): (
+                path.lstat().st_mode,
+                os.readlink(path)
+                if path.is_symlink()
+                else path.read_bytes()
+                if path.is_file()
+                else None,
+            )
+            for path in directory.parent.rglob("*")
+        }
+
+    before = snapshot()
+    status = run("git", "status", "--porcelain=v1", "--untracked-files=all")
+    assert status.returncode == 0, status.stderr
+    result = run(
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        "from rss_aggregator.development import main; main()",
+        "setup",
+        "--project",
+        str(directory),
+    )
+    payload = json.loads(result.stdout)
+    assert result.returncode == 1, result.stderr
     assert not payload["ok"] and not payload["active"]
     assert "manually" in payload["next_step"]
     assert target.read_bytes() == foreign
-    for name, (symlink, content) in before.items():
-        path = Path(name)
-        assert path.is_symlink() == symlink
-        assert path.read_bytes() == content
+    assert snapshot() == before
+    after_status = run("git", "status", "--porcelain=v1", "--untracked-files=all")
+    assert after_status.returncode == 0, after_status.stderr
+    assert after_status.stdout == status.stdout
+    assert not (directory / ".venv").exists()
     if arrangement in ("symlink", "dangling"):
         assert hook.is_symlink()
     if arrangement == "hooks-symlink":
@@ -465,18 +522,17 @@ def test_project_option_works_outside_selected_repository(project, tooling_envir
 @pytest.fixture
 def distinct_checkouts(project, tooling_environment):
     invoking, run = project
-    shutil.copytree(
-        ROOT / "rss_aggregator",
-        invoking / "rss_aggregator",
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("__pycache__"),
+    (invoking / "rss_aggregator/checkout_sentinel.py").write_text(
+        '"""Fixture-only editable-install identity and contract."""\n\n'
+        'ORIGIN = "A"\nCONTRACT_PASSES = True\n'
     )
-    (invoking / "config").mkdir()
-    shutil.copyfile(ROOT / "config/image.json", invoking / "config/image.json")
     (invoking / "tests/test_sample.py").unlink()
-    shutil.copyfile(
-        ROOT / "tests/test_json_contract.py",
-        invoking / "tests/test_json_contract.py",
+    (invoking / "tests/test_checkout_sentinel.py").write_text(
+        "from rss_aggregator import checkout_sentinel\n\n\n"
+        "def test_checkout_contract():\n"
+        "    assert checkout_sentinel.CONTRACT_PASSES, (\n"
+        '        f"SELECTED_CHECKOUT_SENTINEL_FAILURE:{checkout_sentinel.ORIGIN}"\n'
+        "    )\n"
     )
     selected = invoking.parent / "selected"
     shutil.copytree(
@@ -495,17 +551,16 @@ def distinct_checkouts(project, tooling_environment):
             check=False,
         )
 
+    (selected / "rss_aggregator/checkout_sentinel.py").write_text(
+        '"""Fixture-only editable-install identity and contract."""\n\n'
+        'ORIGIN = "B"\nCONTRACT_PASSES = False\n'
+    )
     for arguments in (
         ("git", "init", "--initial-branch=main"),
         ("uv", "sync", "--locked", "--offline"),
     ):
         result = selected_run(*arguments)
         assert result.returncode == 0, result.stdout + result.stderr
-    runtime = selected / "rss_aggregator/runtime.py"
-    original = runtime.read_text()
-    guard = 'raise RuntimeFailure(f"Unknown operation: {operation}")'
-    assert original.count(guard) == 1
-    runtime.write_text(original.replace(guard, "return {}"))
     for execute in (run, selected_run):
         assert execute("git", "add", ".").returncode == 0
         assert (
@@ -521,15 +576,23 @@ def test_selected_checkout_checks_its_own_implementation(
     distinct_checkouts, tooling_environment, monkeypatch, caller, import_override
 ):
     invoking, run, selected, selected_run = distinct_checkouts
-    assert (invoking / "tests/test_json_contract.py").read_bytes() == (
-        selected / "tests/test_json_contract.py"
+    assert (invoking / "tests/test_checkout_sentinel.py").read_bytes() == (
+        selected / "tests/test_checkout_sentinel.py"
     ).read_bytes()
+    assert (invoking / ".venv").is_dir()
+    assert (selected / ".venv").is_dir()
+    assert not (invoking / ".venv").samefile(selected / ".venv")
     before = tracked_snapshot(invoking, run), tracked_snapshot(selected, selected_run)
     result, payload = invoke(run, "check")
     assert result.returncode == 0 and payload["ok"], result.stderr
     result, payload = invoke(selected_run, "check")
     assert result.returncode == 1 and not payload["ok"], result.stderr
-    assert "1 failed, 4 passed" in result.stderr
+    assert "SELECTED_CHECKOUT_SENTINEL_FAILURE:B" in result.stderr
+    assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
+        "pytest": 1,
+        "lint": 0,
+        "format": 0,
+    }
     environment_override = ""
     if import_override:
         monkeypatch.setitem(tooling_environment, "PYTHONPATH", str(invoking))
@@ -563,7 +626,7 @@ def test_selected_checkout_checks_its_own_implementation(
     result = run("uv", "run", "--locked", "--offline", *arguments)
     payload = json.loads(result.stdout)
     assert result.returncode == 1 and not payload["ok"], result.stderr
-    assert "1 failed, 4 passed" in result.stderr
+    assert "SELECTED_CHECKOUT_SENTINEL_FAILURE:B" in result.stderr
     assert {item["name"]: item["returncode"] for item in payload["checks"]} == {
         "pytest": 1,
         "lint": 0,
