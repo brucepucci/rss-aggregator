@@ -401,6 +401,7 @@ class Runtime:
             ) from error
         if not 1024 <= port <= 65535:
             raise RuntimeFailure("RSS_PORT must be between 1024 and 65535.")
+        Recovery(self).check_activation()
         if machine["State"] != "running":
             conflicts = [
                 m["Name"]
@@ -508,10 +509,10 @@ class Runtime:
         )
         self._podman("start", APP)
         security = self._security(owner, target=APP)
-        Recovery(self).record_image()
         self._ready(port)
         scheduler = self._scheduler(owner)
         fetch = self._fetch()
+        Recovery(self).record_image(activated=True)
         url = f"http://127.0.0.1:{port}"
         self._diagnostic(
             f"FreshRSS: {url} (form login; complete installer locally on first run)."
@@ -823,6 +824,7 @@ class Runtime:
         if machine["State"] != "running":
             raise RuntimeFailure("Start the project before replacing its container.")
         self._check_label("volume", self.volume, owner)
+        Recovery(self).check_activation()
         if self._exists("container", APP):
             self._check_label("container", APP, owner)
             self._podman("stop", "--time", "60", APP)

@@ -53,6 +53,11 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
     target = fixture.volume + "-recovered"
     selection = controller.state_dir / ("test-" + fixture.token + "-selection.json")
     records = controller.state_dir / ("test-" + fixture.token + "-recovery.json")
+    fixture_locator = controller.state_dir / (
+        "test-" + fixture.token + "-last-backup.json"
+    )
+    locator = controller.state_dir / "last-backup.json"
+    original_locator = locator.read_bytes() if locator.exists() else None
     original_selection = (
         controller.selected_volume_path.read_bytes()
         if controller.selected_volume_path.exists()
@@ -193,9 +198,14 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
             controller._podman("volume", "rm", target)
         selection.unlink(missing_ok=True)
         records.unlink(missing_ok=True)
+        fixture_locator.unlink(missing_ok=True)
         if original_running:
             result = project("start")
             expect(
                 result.returncode == 0,
                 "Could not restore the original application after recovery test",
             )
+        expect(
+            (locator.read_bytes() if locator.exists() else None) == original_locator,
+            "Recovery fixture changed the user's backup locator",
+        )

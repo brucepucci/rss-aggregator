@@ -148,6 +148,43 @@ def test_backup_creates_private_verified_full_state_archive_without_starting_app
     assert "synthetic configuration" not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("has_locator", [False, True])
+def test_recovery_runner_preserves_real_backup_locator(project, has_locator):
+    from tests.integration.replacement_support import replacement_names
+
+    token = "0123456789abcdef"
+    app, source, _check = replacement_names(token)
+    state = project.engine()
+    container = state["containers"].pop(APP)
+    container["Mounts"][0]["Name"] = source
+    state["containers"][app] = container
+    state["volumes"][source] = state["volumes"].pop(VOLUME)
+    project.update(**state)
+    locator = project.state_dir / "last-backup.json"
+    original = b'{"archive":"/private/durable/user-backup.zip","sha256":"original"}\n'
+    if has_locator:
+        locator.write_bytes(original)
+    result = subprocess.run(
+        [sys.executable, "-m", "tests.integration.backup_runner"],
+        input=json.dumps({"token": token, "operation": "backup"}),
+        env=project.env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    if has_locator:
+        assert locator.read_bytes() == original
+    else:
+        assert not locator.exists()
+    fixture_locator = project.state_dir / ("test-" + token + "-last-backup.json")
+    assert (
+        json.loads(fixture_locator.read_text())["archive"]
+        == json.loads(result.stdout)["archive"]
+    )
+
+
 def test_failed_restore_target_cannot_be_selected(project):
     backup = project.run("backup")
     assert backup.returncode == 0, backup.stderr

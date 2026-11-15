@@ -20,6 +20,9 @@ from typing import Any, BinaryIO
 _FORMAT = "rss-aggregator-backup"
 _INCLUDES = "complete FreshRSS data directory; no extensions in initial deployment"
 _METADATA_LIMIT = 64 * 1024
+_PATH_DEPTH_LIMIT = 64
+_PATH_METADATA_LIMIT = 8 * 1024 * 1024
+_PATH_STRING_OVERHEAD = 256
 _CHUNK = 1024 * 1024
 _PAX_FIELDS = {"path", "size", "uid", "gid", "mtime"}
 
@@ -273,7 +276,7 @@ def _pax(data: bytes) -> dict[str, str]:
 
 
 def _path(name: str) -> str:
-    """Normalize export paths while rejecting traversal and ambiguous separators."""
+    """Normalize safe export paths, allowing at most 64 non-root components."""
     if (
         not name
         or len(name.encode("utf-8")) > 4096
@@ -285,7 +288,10 @@ def _path(name: str) -> str:
     components = name.split("/")
     if ".." in components:
         raise ValueError
-    return "/".join(part for part in components if part not in {"", "."}) or "."
+    normalized = "/".join(part for part in components if part not in {"", "."}) or "."
+    if normalized != "." and normalized.count("/") + 1 > _PATH_DEPTH_LIMIT:
+        raise ValueError
+    return normalized
 
 
 def _number(value: str, fractional: bool = False) -> int:
@@ -316,7 +322,13 @@ def _repack(source: BinaryIO, target: BinaryIO) -> None:
 
     Header extensions are parsed with bounded allocations rather than allowing
     tarfile to load arbitrary PAX or GNU metadata. File content is streamed.
+    Normalized paths have at most 64 components. Before constructing ancestor
+    strings, charge each member name and every ancestor against an 8 MiB
+    cumulative budget: four times its UTF-8 byte length plus 256 bytes for
+    string/set overhead. Shared ancestors are conservatively charged again for
+    every member, even when already retained. Payload bytes are not capped.
     """
+    path_metadata = 0
     seen: set[str] = set()
     files: set[str] = set()
     ancestors: set[str] = set()
@@ -381,7 +393,14 @@ def _repack(source: BinaryIO, target: BinaryIO) -> None:
             is_directory = member.type == tarfile.DIRTYPE
             if name in seen or (name == "." and not is_directory):
                 raise ValueError
-            parents = name.split("/")[:-1]
+            components = name.split("/")
+            prefix_bytes = 0
+            for index, component in enumerate(components):
+                prefix_bytes += len(component.encode("utf-8")) + (index > 0)
+                path_metadata += 4 * prefix_bytes + _PATH_STRING_OVERHEAD
+            if path_metadata > _PATH_METADATA_LIMIT:
+                raise ValueError
+            parents = components[:-1]
             parent_paths = {"/".join(parents[:i]) for i in range(1, len(parents) + 1)}
             if parent_paths & files or (not is_directory and name in ancestors):
                 raise ValueError

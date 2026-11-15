@@ -28,9 +28,10 @@ def run():
     )
     runtime.APP, runtime.VOLUME, runtime.CHECK = app, source, check
     # Keep ownership/lock/security enforcement real, but never change the user's
-    # selected volume or recovery records. No runtime method is replaced.
+    # selected volume, recovery records or backup locator. No method is replaced.
     runtime.SELECTION = "test-" + token + "-selection.json"
     recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
+    recovery.BACKUP_RECORD = "test-" + token + "-last-backup.json"
     operation = request["operation"]
     args = [operation]
     if operation == "restore":

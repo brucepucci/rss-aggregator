@@ -247,7 +247,12 @@ owned volume, and the currently selected name even when absent (to prevent impli
 activation). Failed imports retain the incomplete target unselected for diagnosis;
 `select-volume` refuses incomplete targets. Choose another fresh name to retry. No implicit overwrite/delete command exists.
 Links, special/sparse files, unsafe/duplicate paths and unsupported archive versions
-are rejected. Numeric ownership and ordinary permissions are preserved; unsafe tar
+are rejected. Normalized paths are limited to 64 components, with an 8 MiB cumulative
+path-metadata budget checked before allocating ancestor strings. Both backup and
+restore enforce these limits without capping file payload size; see the
+[format guide](docs/backup-restore.md#format-version-1) for accounting. If legitimate
+state exceeds a limit, backup fails rather than omitting data; review the limit
+before changing code. Numeric ownership and ordinary permissions are preserved; unsafe tar
 metadata is not passed through to the engine. A restore never activates itself.
 `select-volume` requires a stopped application and running VM; `replace` preserves
 the old named volume. `rss status` reports the selected name; record it before
@@ -260,14 +265,22 @@ does not start the application. Do not edit ownership JSON to force selection.
 Restore initially requires the **exact checked-in image configuration recorded in
 the archive**, not merely a newer FreshRSS version. Use the reviewed matching pin
 first, check its current advisories, and run the normal effective-PHP security gate
-before entering credentials. An old backup does not authorize bypassing a failed
+before entering credentials. The recorded image is rechecked at the first `start`
+or `replace`, before template writes/startup and before `replace` stops/removes an
+old container. Changing the pin after selection does not bypass this guard; refusal
+preserves provenance. Only a completed start (security, readiness, scheduler and
+initial fetch checks) marks the volume activated; backing it up does not. Older
+provenance records without an activation marker require one matching start before
+an intentional pin update. Do not edit the marker to bypass recovery compatibility.
+An old backup does not authorize bypassing a failed
 gate. An arm64 platform manifest is not an x86 deployment plan: other architectures
 and native Linux recovery remain unverified. After successful recovery, verify
 login, subscriptions, article content and both unread/read and starred state.
 If moving ports/hosts, adjust FreshRSS's base URL inside the restored container as
 shown under Configuration; do not print archived settings or secrets in evidence.
 
-For an intentional image update: first create and verify a backup, review current
+After completing the matching initial recovery activation, an intentional image
+update remains supported: first create and verify a backup, review current
 advisories and the new official image/platform identity, explicitly update the pin,
 then `replace` and verify security, login, fetching and persisted reading state.
 There are no unattended updates. To roll back a database migration, restore its
@@ -342,7 +355,7 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
-| `.local/recovery-volumes.json`, `.local/last-backup.json` (managed local records) | Volume image provenance/import completeness, and most recently published archive location/checksum. | Preserve with ownership state. Do not edit incomplete imports into ready state. An unattached volume without known image provenance is refused for backup; start it with its reviewed matching pin first. |
+| `.local/recovery-volumes.json`, `.local/last-backup.json` (managed local records) | Volume image provenance/import completeness and completed first-activation marker, and most recently published archive location/checksum. | Preserve with ownership state. Do not edit incomplete imports into ready state or bypass activation markers. First activation requires the recorded pin; records without a marker require one matching start before an image update. An unattached volume without known image provenance is refused for backup; start it with its reviewed matching pin first. |
 | `RSS_STATE_DIR` (optional environment variable) | Ownership/inventory/lock/security record directory; `<checkout>/.local`. Not the FreshRSS database location. | Set an absolute private path **outside Git** before setup and use it consistently. Changing it does not adopt or migrate an existing machine. |
 | `config/image.json` | Official Debian FreshRSS `1.30.4`, digest-pinned OCI index, explicit `linux/arm64`, verified platform manifest and source revision. | Change only after checking current advisories and verifying registry identity/runtime. `replace` applies a pin change. No floating-tag update command. |
 | `config/config-user.custom.php` | New-user defaults: no age/maximum article purge; TTL `60` seconds. | Every `start` (also through `verify`/`replace`) copies it while the application is stopped; retry repeats both template copies. **Existing users are not rewritten**: change their settings locally in FreshRSS, including feed/category overrides. |
@@ -664,13 +677,18 @@ authentication, public articles, read/star state, replacement and VM stop/start.
 The recovery drill backs up a running and a stopped synthetic-user instance,
 removes its entire leased source container/volume, restores into a fresh volume,
 explicitly selects it, and verifies login, subscription, content, both read/unread
-states and a star through HTTP. It redirects only reserved resource/selection/record
-names, retaining production Click behavior, the real ownership checks and lock.
+states and a star through HTTP. It redirects only reserved resource, selection,
+provenance and backup-locator names, retaining production Click behavior, the real
+ownership checks and lock. Fixture backups use `test-<token>-last-backup.json`,
+removed during fixture cleanup; the user's `last-backup.json` bytes (or absence)
+are preserved by this drill. The separate VM-restart tests still exercise normal
+shutdown and update the real locator with a real instance backup in `RSS_BACKUP_DIR`.
 No original source data is available during recovery. This is the spec's equivalent
 isolated recovery drill, not a second physical Mac demonstration.
 Cleanup removes only those fixtures. The installed-state replacement test invokes
-unchanged production Click `replace` in a subprocess with only application, data
-volume and preflight-container names redirected to reserved test names. It retains
+unchanged production Click `replace` in a subprocess with application, data volume,
+preflight-container, selection and provenance names redirected to reserved test
+names. It retains
 the real VM/connection ownership checks and command lock, uses the existing owner
 record (never a fabricated copy), and verifies subscription, article content and
 read/star state through authenticated HTTP after replacement. Cleanup is anchored
@@ -750,6 +768,28 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **PR #15 feedback-fix checkpoint (2026-11-15, local changes based on `c5778aa`):**
+  Addressed C1–C3 with first-activation image checks, bounded archive-path metadata,
+  and an isolated recovery-fixture backup locator. On Apple Silicon / macOS 27.2 /
+  Python 3.13.18 / Podman 6.2.0, `uv run --locked --offline rss-dev check` passed
+  **128 default tests in 108.77s**, six live deselected, with Ruff lint/format clean.
+  With private external `RSS_BACKUP_DIR` and `umask 022`,
+  `uv run --locked --offline pytest -p no:cacheprovider -m live -q --tb=short`
+  passed **six live tests in 57.77s**, including the source-absent authenticated
+  recovery drill and backup-locator preservation assertion. Regression failures
+  were observed before fixes: a changed first-activation pin launched successfully,
+  deep paths amplified retained memory, and fixture backups replaced the normal
+  locator (or created it when absent). The bounded deep-path regression's measured
+  peak Python allocation fell from **76,318,265 to approximately 7,800,000 bytes**,
+  including installed-CLI imports/startup; this is not a universal process-RSS bound.
+  Matching first activation, failed-start retry, backup-before-first-start, legacy
+  provenance and a later deliberate pin update have controlled lifecycle coverage;
+  the synthetic version-change tests do not execute a real database upgrade or
+  downgrade. Real start, verify and backup-on-shutdown succeeded. The VM was left
+  stopped again; private verification archives are temporary, not durable backup
+  configuration. No new CI, physical second-host, Linux/x86 or Python 3.10 result
+  is claimed. These fixes remain local until separately published.
 
 - **Issue #2 local checkpoint (2026-11-15, `feat/issue-2-backup-restore` based on `22ea43e`):**
   On Apple Silicon / macOS 27.2 / Python 3.13.18 / Podman 6.2.0,

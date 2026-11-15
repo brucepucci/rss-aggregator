@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
 
 RECOVERY_RECORD = "recovery-volumes.json"
+BACKUP_RECORD = "last-backup.json"
 
 
 def volume_name(value: str) -> str:
@@ -127,6 +128,7 @@ class Recovery:
     def _source_image(self, owner: dict[str, Any]) -> dict[str, Any]:
         """Record only the pinned identity actually attached to the source app."""
         runtime = self.runtime
+        self.check_activation()
         image = runtime._image()
         info = runtime._json_run(
             "podman", "--connection", self.machine, "image", "inspect", image["image"]
@@ -164,18 +166,49 @@ class Recovery:
                 )
         record_path = runtime.state_dir / RECOVERY_RECORD
         records = json.loads(record_path.read_text()) if record_path.exists() else {}
-        if records.get(runtime.volume) != {"status": "ready", "image": image}:
+        record = records.get(runtime.volume, {})
+        if record.get("status") != "ready" or record.get("image") != image:
             raise self.failure(
                 "Cannot establish the unattached volume's image. Start it with the reviewed matching pin before backup."
             )
         return image
 
-    def record_image(self) -> None:
-        """Retain verified volume provenance even if its container is later replaced."""
+    def check_activation(self) -> None:
+        """Require the recorded image until a volume completes its first start.
+
+        Older records without an activation marker are treated conservatively:
+        start once with their recorded pin before attempting an image update.
+        This guard never changes provenance, including on refusal.
+        """
         runtime = self.runtime
         path = runtime.state_dir / RECOVERY_RECORD
         records = json.loads(path.read_text()) if path.exists() else {}
-        records[runtime.volume] = {"status": "ready", "image": runtime._image()}
+        record = records.get(runtime.volume)
+        if record is None:
+            return
+        if record.get("status") != "ready":
+            raise self.failure("Restore target is incomplete and cannot be activated.")
+        if record.get("activated") is not True and record["image"] != runtime._image():
+            raise self.failure(
+                "First activation requires the recorded image; restore the matching pin and complete start or replace before an intentional image update."
+            )
+
+    def record_image(self, *, activated: bool = False) -> None:
+        """Retain provenance; only a completed start marks first activation.
+
+        Taking a snapshot must not discharge a pending recovery activation.
+        Once activated, deliberate reviewed pin updates remain supported.
+        """
+        self.check_activation()
+        runtime = self.runtime
+        path = runtime.state_dir / RECOVERY_RECORD
+        records = json.loads(path.read_text()) if path.exists() else {}
+        records[runtime.volume] = {
+            "status": "ready",
+            "image": runtime._image(),
+            "activated": activated
+            or records.get(runtime.volume, {}).get("activated") is True,
+        }
         runtime._save(RECOVERY_RECORD, records)
 
     def snapshot(
@@ -207,7 +240,7 @@ class Recovery:
                 )
             result = create_archive(payload, directory, image)
         runtime._save(
-            "last-backup.json",
+            BACKUP_RECORD,
             {"archive": result["archive"], "sha256": result["sha256"]},
         )
         return result
@@ -290,7 +323,11 @@ class Recovery:
             records = (
                 json.loads(record_path.read_text()) if record_path.exists() else {}
             )
-            records[volume] = {"status": "incomplete", "image": manifest["image"]}
+            records[volume] = {
+                "status": "incomplete",
+                "image": manifest["image"],
+                "activated": False,
+            }
             runtime._save(RECOVERY_RECORD, records)
             runtime._podman(
                 "volume", "create", "--label", self.label + "=" + owner["token"], volume

@@ -42,12 +42,32 @@ It rebuilds an ordinary tar with numeric owners and permission
 bits, removing special mode bits and untrusted extended metadata before import.
 No archive member is extracted onto the host filesystem by its own pathname.
 
+To bound validation memory, normalized paths may have at most **64 non-root
+components** (the existing 4,096 UTF-8 byte pathname limit still applies). Before
+constructing full ancestor strings, validation charges every normalized member
+name and each ancestor **4 × UTF-8 byte length + 256 bytes** against an **8 MiB
+(8,388,608 byte) cumulative path-metadata budget**. Shared ancestors are charged
+again for each member; even empty/shallow members consume the budget. Backup
+creation and restore both reject excessive metadata, without a file-payload byte
+cap or silently excluding files. Legitimate state beyond these limits requires
+reviewing the limit before changing code; a failed backup leaves previous archives
+and source data intact.
+
 The manifest's image fields are required to equal the reviewed configuration in
 `config/image.json`. This deliberately conservative compatibility rule avoids
 silently restoring with a different release/platform/security policy. Archive
 checks do not authorize running a known-vulnerable image. Reassess advisories and
 retain the existing effective Apache PHP gate. The image's arm64 platform manifest
 is not a portable executable for an x86 machine.
+
+A restored volume remains pending first activation even after selection or backup.
+`start` and `replace` recheck its recorded image before writing templates or starting
+it; `replace` also checks before stopping/removing the old container. A mismatching
+pin is refused without overwriting provenance. Only a completed start through
+security, readiness, scheduler and initial-fetch checks records `activated: true`.
+Failed starts and snapshots leave this guard pending. Legacy provenance records
+without this marker conservatively require one matching start before any image
+update. The marker is managed state, not a user-configurable override.
 
 ## Consistency and failure behavior
 
@@ -106,7 +126,9 @@ not start it or create another archive. There is no bypass to delete data.
 
 ## Image updates and rollback
 
-Create a verified pre-update backup. Review the replacement official image's current
+First complete the initial recovery activation with its recorded matching pin.
+After that, deliberate image updates remain supported. Create a verified pre-update
+backup. Review the replacement official image's current
 advisories, digest, platform and actual PHP configuration, update the pin explicitly,
 then replace and verify application behavior and reading state. No unattended image
 update is supported. If rollback is required after a database migration, restore

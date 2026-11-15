@@ -20,7 +20,8 @@ class Engine:
         self.runtime = runtime
         self.port = port
         self.app = None
-        self.volume = False
+        self.volumes = set()
+        self.restored = {}
         self.probes = set()
         self.templates = {}
         self.calls = []
@@ -46,6 +47,8 @@ class Engine:
 
     def run(self, *args, check=True, input=None):
         self.calls.append(args)
+        if args[:4] == ("podman", "machine", "ssh", "rss-aggregator"):
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         assert args[:3] == ("podman", "--connection", "rss-aggregator")
         args = args[3:]
         output = ""
@@ -55,15 +58,28 @@ class Engine:
         elif args[:2] == ("container", "exists"):
             status = 0 if args[2] == APP and self.app else 1
         elif args[:2] == ("volume", "exists"):
-            status = 0 if self.volume else 1
+            status = 0 if args[2] in self.volumes else 1
         elif args[:2] == ("volume", "create"):
-            self.volume = True
+            self.volumes.add(args[-1])
+        elif args[:2] == ("volume", "import"):
+            self.restored[args[2]] = Path(args[3]).read_bytes()
+        elif args[:2] == ("volume", "export"):
+            Path(args[args.index("--output") + 1]).write_bytes(self.restored[args[-1]])
+        elif args[0] == "ps":
+            output = json.dumps(
+                [{"Names": [APP]}] if self.app and self.app["State"]["Running"] else []
+            )
         elif args[:2] == ("volume", "inspect"):
             output = json.dumps([{"Labels": {LABEL: "test-owner"}}])
         elif args[:2] == ("container", "inspect"):
             assert args[2] == APP
             output = json.dumps([self.app])
         elif args[0] == "create":
+            volume = (
+                args[args.index("--mount") + 1].split("source=", 1)[1].split(",", 1)[0]
+                if "--mount" in args
+                else VOLUME
+            )
             self.app = {
                 "Config": {
                     **self.image["Config"],
@@ -79,8 +95,10 @@ class Engine:
                         ]
                     }
                 },
-                "Mounts": [{"Name": VOLUME, "Destination": "/var/www/FreshRSS/data"}],
+                "Mounts": [{"Name": volume, "Destination": "/var/www/FreshRSS/data"}],
             }
+        elif args[0] == "rm" and args[1] == APP:
+            self.app = None
         elif args[0] in ("run", "rm"):
             assert CHECK in args
         elif args[0] == "cp":
