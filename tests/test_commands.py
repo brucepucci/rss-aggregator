@@ -114,6 +114,7 @@ def command(tmp_path):
     "preview",
     [
         "Would upgrade shared 1.0 -> 2.0",
+        "Would reinstall shared 1.0",
         "==> Would install dependencies for podman:\nshared 2.0\n",
     ],
 )
@@ -166,6 +167,9 @@ packages = json.loads(path.read_text())
 args = sys.argv[1:]
 if args == ['list', '--formula', '--versions']:
  print('\\n'.join(name + ' ' + version for name, version in packages.items()))
+elif args == ['list', '--cask', '--versions']: print('healthy 2.0')
+elif args == ['info', '--json=v2', '--installed', '--cask'] or args == ['list', '--cask']:
+ raise SystemExit('FALLBACK MUST NOT RUN')
 elif args == ['install', '--dry-run', 'podman']:
  print('Would install:\\npodman 6.2.0\\nvm-runtime 1.0')
 elif args == ['install', 'podman']:
@@ -178,6 +182,10 @@ else: print('{}')
     assert json.loads(first.stdout)["created"] is True
     assert "installed helper" in first.stderr
     initial = (command.state / "host-before.json").read_bytes()
+    inventory = json.loads(initial)
+    assert inventory["casks"] == "healthy 2.0\n"
+    assert "cask_names" not in inventory
+    assert "cask_inventory_warning" not in inventory
     second = command.run("setup")
     assert second.returncode == 0, second.stderr
     assert json.loads(second.stdout)["created"] is False
@@ -195,6 +203,192 @@ else: print('{}')
     assert state["details"]["rss-aggregator"]["Rootful"] is False
     assert not any(m["Running"] for m in state["machines"])
     assert [c["Name"] for c in state["connections"] if c["Default"]] == ["personal"]
+
+
+@pytest.fixture
+def incomplete_cask_setup(command):
+    packages = command.state / "packages.json"
+    packages.write_text(
+        json.dumps(
+            {
+                "packages": {"shared": "1.0"},
+                "casks": {"discord": "0.0.398.upgrading", "healthy": "2.0"},
+            }
+        )
+    )
+    podman = command.state / "podman-state.json"
+    podman.write_text(
+        json.dumps(
+            {
+                "machines": [{"Name": "personal", "Running": False}],
+                "details": {},
+                "connections": [
+                    {
+                        "Name": "personal",
+                        "URI": "ssh://personal",
+                        "Identity": "/personal/key",
+                        "Default": True,
+                    }
+                ],
+            }
+        )
+    )
+    command.env["FAKE_BREW_INSTALLED"] = str(packages)
+    command.env["FAKE_PODMAN_STATE"] = str(podman)
+    command.tool("brew", (ROOT / "tests/fake_bootstrap_brew.py").read_text())
+    command.tool("podman", (ROOT / "tests/fake_bootstrap_podman.py").read_text())
+    return command
+
+
+def test_setup_preserves_incomplete_casks_with_read_only_fallback(
+    incomplete_cask_setup,
+):
+    command = incomplete_cask_setup
+    result = command.run("setup")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"machine": "rss-aggregator", "created": True}
+    warning = "Error: Cask 'discord' is not installed."
+    assert warning in result.stderr
+    initial = (command.state / "host-before.json").read_bytes()
+    inventory = json.loads(initial)
+    assert inventory["casks"] == "healthy 2.0\n"
+    assert inventory["cask_names"] == "discord\nhealthy\n"
+    assert warning in inventory["cask_inventory_warning"]
+    assert inventory["packages"] == {"shared": "1.0"}
+    assert inventory["dependencies"] == "shared:\n"
+    assert json.loads((command.state / "host-additions.json").read_text()) == {
+        "podman": "6.2.0",
+        "vm-runtime": "1.0",
+    }
+    host = json.loads(Path(command.env["FAKE_BREW_INSTALLED"]).read_text())
+    assert host == {
+        "packages": {"shared": "1.0", "podman": "6.2.0", "vm-runtime": "1.0"},
+        "casks": {"discord": "0.0.398.upgrading", "healthy": "2.0"},
+    }
+    podman = json.loads(Path(command.env["FAKE_PODMAN_STATE"]).read_text())
+    assert podman["machines"][0] == {"Name": "personal", "Running": False}
+    assert podman["connections"][0] == {
+        "Name": "personal",
+        "URI": "ssh://personal",
+        "Identity": "/personal/key",
+        "Default": True,
+    }
+    assert not any(machine["Running"] for machine in podman["machines"])
+    second = command.run("setup")
+    assert second.returncode == 0, second.stderr
+    assert json.loads(second.stdout)["created"] is False
+    assert (command.state / "host-before.json").read_bytes() == initial
+    latest = json.loads((command.state / "host-latest.json").read_text())
+    assert latest["cask_names"] == inventory["cask_names"]
+    assert latest["cask_inventory_warning"] == inventory["cask_inventory_warning"]
+
+
+@pytest.mark.parametrize("query", ["JSON", "NAMES"])
+def test_setup_aborts_before_mutation_if_cask_fallback_fails(
+    incomplete_cask_setup, query
+):
+    command = incomplete_cask_setup
+    command.env["FAKE_CASK_FAIL"] = query
+    paths = [
+        Path(command.env[key]) for key in ("FAKE_BREW_INSTALLED", "FAKE_PODMAN_STATE")
+    ]
+    before = [path.read_bytes() for path in paths]
+    result = command.run("setup")
+    assert result.returncode == 1
+    assert "Cask 'discord' is not installed" in result.stderr
+    assert f"Cask {query} query failed" in result.stderr
+    assert [path.read_bytes() for path in paths] == before
+    for name in (
+        "host-before.json",
+        "host-additions.json",
+        "install-preview.json",
+        "owner.json",
+    ):
+        assert not (command.state / name).exists()
+
+
+@pytest.mark.parametrize(
+    ("query", "output"),
+    [
+        ("JSON", "not JSON"),
+        ("JSON", "[]"),
+        ("JSON", "{}"),
+        ("JSON", '{"casks": {}}'),
+        ("JSON", '{"casks": ["healthy"]}'),
+        ("JSON", '{"casks": [{"installed": "2.0"}]}'),
+        ("JSON", '{"casks": [{"token": "healthy"}]}'),
+        ("JSON", '{"casks": [{"token": "healthy", "installed": null}]}'),
+        ("JSON", '{"casks": [{"token": "healthy", "installed": ["2.0"]}]}'),
+        ("JSON", '{"casks": [{"token": "healthy", "installed": ""}]}'),
+        ("JSON", '{"casks": [{"token": "healthy", "installed": "2.0\\n3.0"}]}'),
+        ("JSON", '{"casks": [{"token": "unknown", "installed": "2.0"}]}'),
+        (
+            "JSON",
+            '{"casks": [{"token": "healthy", "installed": "2.0"}, {"token": "healthy", "installed": "3.0"}]}',
+        ),
+        ("NAMES", ""),
+        ("NAMES", "discord healthy\n"),
+        ("NAMES", "discord\nhealthy\nhealthy\n"),
+        ("NAMES", "discord\nhealthy\n\x1b\n"),
+    ],
+)
+def test_setup_rejects_unusable_cask_fallback(incomplete_cask_setup, query, output):
+    command = incomplete_cask_setup
+    command.env["FAKE_CASK_" + query] = output
+    paths = [
+        Path(command.env[key]) for key in ("FAKE_BREW_INSTALLED", "FAKE_PODMAN_STATE")
+    ]
+    before = [path.read_bytes() for path in paths]
+    result = command.run("setup")
+    assert result.returncode == 1, result.stderr
+    assert "Unusable Homebrew cask inventory" in result.stderr
+    assert [path.read_bytes() for path in paths] == before
+    for name in (
+        "host-before.json",
+        "host-additions.json",
+        "install-preview.json",
+        "owner.json",
+    ):
+        assert not (command.state / name).exists()
+
+
+@pytest.mark.parametrize(
+    "preview",
+    [
+        "Would upgrade shared 1.0 -> 2.0",
+        "Would reinstall shared 1.0",
+        "Would install:\nshared 2.0\npodman 6.2.0",
+    ],
+)
+def test_cask_fallback_does_not_bypass_installation_approval(
+    incomplete_cask_setup, preview
+):
+    command = incomplete_cask_setup
+    command.env["FAKE_INSTALL_PREVIEW"] = preview
+    paths = [
+        Path(command.env[key]) for key in ("FAKE_BREW_INSTALLED", "FAKE_PODMAN_STATE")
+    ]
+    before = [path.read_bytes() for path in paths]
+    result = command.run("setup")
+    assert result.returncode == 1
+    assert "approval" in result.stderr
+    assert [path.read_bytes() for path in paths] == before
+    assert (command.state / "host-before.json").exists()
+    assert not (command.state / "host-additions.json").exists()
+    assert not (command.state / "owner.json").exists()
+
+
+@pytest.mark.parametrize("names", ["", "discord\nhealthy\n"])
+def test_cask_fallback_accepts_empty_version_inventory(incomplete_cask_setup, names):
+    command = incomplete_cask_setup
+    command.env["FAKE_CASK_JSON"] = '{"casks": []}'
+    command.env["FAKE_CASK_NAMES"] = names
+    result = command.run("setup")
+    assert result.returncode == 0, result.stderr
+    inventory = json.loads((command.state / "host-before.json").read_text())
+    assert inventory["casks"] == ""
+    assert inventory["cask_names"] == names
+    assert "Cask 'discord' is not installed" in inventory["cask_inventory_warning"]
 
 
 def test_setup_refuses_an_unowned_machine_before_mutation(command):

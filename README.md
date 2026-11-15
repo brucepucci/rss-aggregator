@@ -9,8 +9,10 @@ agent, or automatic application startup is installed by this project.
 [PR #13](https://github.com/brucepucci/rss-aggregator/pull/13) integrated the initial
 local runtime for [#1](https://github.com/brucepucci/rss-aggregator/issues/1) and
 [#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9) on main.
-This branch adds [#2's backup/recovery](https://github.com/brucepucci/rss-aggregator/issues/2);
-its publication and review remain separate. See
+[PR #15](https://github.com/brucepucci/rss-aggregator/pull/15) integrated
+[#2's backup/recovery](https://github.com/brucepucci/rss-aggregator/issues/2).
+This branch fixes [#14's incomplete-cask inventory failure](https://github.com/brucepucci/rss-aggregator/issues/14);
+publication and review remain separate. See
 [verification and adoption status](#verification-and-adoption-status) for historical
 evidence and verification of the changes in this checkout.
 
@@ -69,6 +71,17 @@ not adopted. If the preview includes an upgrade/reinstall of an existing package
 setup stops: obtain explicit approval and resolve the host dependency plan before
 retrying. There is deliberately no bypass flag. Automatic Homebrew updates,
 installation upgrades, dependent checks and install cleanup are disabled.
+
+If `brew list --cask --versions` fails (for example, because an unrelated cask has
+an interrupted upgrade), setup warns on stderr and uses two read-only queries:
+`brew info --json=v2 --installed --cask` for installed versions and
+`brew list --cask` for raw cask names. The host audit retains names omitted by the
+JSON query and the original warning; it never invents versions for incomplete
+records. Failure or unusable output from either fallback query stops setup before
+installation or VM initialization. Setup does not repair, reinstall, upgrade or
+remove unrelated applications, and the fallback does not bypass installation
+approval or ownership safeguards. See the managed host inventory fields under
+[Configuration](#configuration).
 
 Initial verification on 2026-11-14 installed only **podman 6.2.0**, **libkrunfw
 5.6.4**, **libepoxy 1.5.10**, **molten-vk 1.4.2**, **libkrun 1.19.8**, and
@@ -315,6 +328,15 @@ command is added here.
 - **Homebrew upgrade approval required:** inspect `.local/install-preview.json`;
   no installation has been attempted by that invocation. Resolve the dependency
   plan explicitly before retrying. Partial installation additions are recorded.
+- **Incomplete unrelated Homebrew cask:** a cask-version query error is a warning
+  if both read-only fallback queries succeed with usable data. Inspect the private
+  `host-before.json` (or `host-latest.json` on later runs) for raw names and the
+  original warning; an omitted version does not mean the application was removed.
+  If either fallback query fails or its data is unusable, setup exits 1 before
+  installation/VM initialization. Inspect `brew info --json=v2 --installed --cask`
+  (installed-version JSON) and `brew list --cask` (one raw name per line) locally;
+  both must succeed, with valid matching records, before retrying setup. Do not
+  remove or reinstall an unrelated application just to make project setup pass.
 - **Backup failure or missing `RSS_BACKUP_DIR`:** shutdown leaves writers stopped
   and the VM running. Choose a private external directory, check free disk space
   and engine availability, then retry `stop`. Previous good archives and the source
@@ -354,6 +376,7 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
+| `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
 | `.local/recovery-volumes.json`, `.local/last-backup.json` (managed local records) | Volume image provenance/import completeness and completed first-activation marker, and most recently published archive location/checksum. | Preserve with ownership state. Do not edit incomplete imports into ready state or bypass activation markers. First activation requires the recorded pin; records without a marker require one matching start before an image update. An unattached volume without known image provenance is refused for backup; start it with its reviewed matching pin first. |
 | `RSS_STATE_DIR` (optional environment variable) | Ownership/inventory/lock/security record directory; `<checkout>/.local`. Not the FreshRSS database location. | Set an absolute private path **outside Git** before setup and use it consistently. Changing it does not adopt or migrate an existing machine. |
@@ -716,7 +739,7 @@ manual cron-command execution proves scheduler timing.
 ## Verification and adoption status
 
 The canonical policy is [docs/python-standards.md](docs/python-standards.md),
-discovered through [AGENTS.md](AGENTS.md). This branch implements uv, pytest,
+discovered through [AGENTS.md](AGENTS.md). The repository implements uv, pytest,
 callable operations with thin Click/JSON adapters, production annotations and
 proportional NumPy-style docstrings, Ruff, guarded pre-push setup and matching CI.
 No Python policy exceptions are granted beyond the standard's exemptions for
@@ -728,8 +751,9 @@ installation, unrelated-resource changes or unexpected shared-package upgrades.
 standard reached main separately through PR #10 (`d991e39`).
 [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) integrated #9 into
 #1's branch (`f88ea85`), not main. PR #13 subsequently delivered **both #1 and #9**
-to main as squash commit `22ea43e`, separate from #8. This branch adds issue #2;
-publication, review and merge remain separately authorized. Hooks are activated
+to main as squash commit `22ea43e`, separate from #8. PR #15 delivered issue #2
+as `3cb1aed`. This branch fixes issue #14; publication, review and merge remain
+separately authorized. Hooks are activated
 per checkout only by explicit setup (and shared by linked worktrees).
 
 ### Historical evidence — not new results
@@ -768,6 +792,23 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **Issue #14 local checkpoint (`fix/issue-14-cask-inventory`, based on `3cb1aed`):**
+  `uv sync --locked` succeeded. Before changes, `uv run --locked rss-dev check`
+  passed 128 default tests. After the fix, the same full baseline passed
+  **154 default tests in 108.34s**, six live deselected, with Ruff lint/format clean.
+  `uv run --locked pytest tests/test_commands.py --tb=short` passed all **57**
+  command tests; `uv run --locked rss setup --help` exited 0 with the unchanged
+  no-argument/no-option setup interface (except `--help`). The incomplete-cask
+  success regression failed before the fallback; unusable-data regressions failed
+  before validation was added. Isolated external-command fixtures cover fallback
+  success/repetition, both query failures, malformed/inconsistent data, empty
+  inventories, original-warning/raw-name retention, unrelated-resource preservation,
+  and upgrade/reinstall refusal. These are simulated setup checks, **not an actual
+  new-Mac setup or real incomplete-cask repair**. No real Homebrew installation,
+  Podman lifecycle operation, live test, new CI run or Python 3.10 check was run
+  for this change. No separate typechecker is configured. Work remains local
+  until separately published; issue handoff is not PR review or approval.
 
 - **PR #15 feedback-fix checkpoint (2026-11-15, local changes based on `c5778aa`):**
   Addressed C1–C3 with first-activation image checks, bounded archive-path metadata,

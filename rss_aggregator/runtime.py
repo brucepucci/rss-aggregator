@@ -192,6 +192,58 @@ class Runtime:
             ).stdout.splitlines()
         )
 
+    def _cask_inventory(self) -> dict[str, str]:
+        """Record cask versions, retaining incomplete names on read-only fallback."""
+        result = self._run("brew", "list", "--cask", "--versions", check=False)
+        if result.returncode == 0:
+            return {"casks": result.stdout}
+        warning = (
+            f"brew list --cask --versions failed ({result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+        self._diagnostic(warning + "; using read-only cask inventory fallback.")
+        problem = (
+            "Unusable Homebrew cask inventory; setup stopped before installation. "
+            "Inspect the read-only cask queries and resolve the inventory before retrying."
+        )
+        try:
+            records = self._json_run(
+                "brew", "info", "--json=v2", "--installed", "--cask"
+            )
+        except json.JSONDecodeError as error:
+            raise RuntimeFailure(problem) from error
+        names = self._run("brew", "list", "--cask").stdout
+        tokens = names.splitlines()
+        if (
+            not isinstance(records, dict)
+            or not isinstance(records.get("casks"), list)
+            or any(not re.fullmatch(r"[a-z0-9][a-z0-9+_.@-]*", name) for name in tokens)
+            or len(tokens) != len(set(tokens))
+        ):
+            raise RuntimeFailure(problem)
+        known: dict[str, str] = {}
+        for cask in records["casks"]:
+            if not isinstance(cask, dict):
+                raise RuntimeFailure(problem)
+            token, installed = cask.get("token"), cask.get("installed")
+            if (
+                not isinstance(token, str)
+                or token not in tokens
+                or token in known
+                or not isinstance(installed, str)
+                or not installed
+                or any(char.isspace() or not char.isprintable() for char in installed)
+            ):
+                raise RuntimeFailure(problem)
+            known[token] = installed
+        return {
+            "casks": "".join(
+                f"{token} {version}\n" for token, version in known.items()
+            ),
+            "cask_names": names,
+            "cask_inventory_warning": warning,
+        }
+
     def _bootstrap(self) -> None:
         """Install only missing Podman after recording and checking host changes."""
         if not shutil.which("brew"):
@@ -205,7 +257,7 @@ class Runtime:
             else "host-before.json",
             {
                 "packages": before,
-                "casks": self._run("brew", "list", "--cask", "--versions").stdout,
+                **self._cask_inventory(),
                 "dependencies": self._run("brew", "deps", "--installed").stdout,
                 "podman_formula": self._run(
                     "brew", "info", "--json=v2", "podman"
