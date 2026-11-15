@@ -253,9 +253,9 @@ class Recovery:
         directory = self._directory()
         owner, was_stopped = self._ensure_vm()
         was_running = False
-        was_private = PrivateAccess(runtime).status(owner)["status"] == "running"
         quiesced = False
         try:
+            was_private = PrivateAccess(runtime).status(owner)["status"] == "running"
             runtime._check_label("volume", runtime.volume, owner)
             self._source_image(owner)
             if runtime._exists("container", self.app):
@@ -267,10 +267,7 @@ class Recovery:
             return self.snapshot(owner, directory)
         finally:
             if was_running and quiesced:
-                if was_private:
-                    runtime._start(private_https=True)
-                else:
-                    runtime._start()
+                runtime._start(private_https=was_private)
             elif was_stopped:
                 self._engines_idle(owner, stop=False)
                 runtime._run("podman", "machine", "stop", self.machine)

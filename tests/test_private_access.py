@@ -6,6 +6,8 @@ import json
 import socket
 import subprocess
 from http.client import BadStatusLine
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
 from urllib.request import OpenerDirector
@@ -24,18 +26,47 @@ def private_command(tmp_path):
     command = CommandFixture(tmp_path)
     command.machine(running=True)
     command.env["RSS_TAILSCALE"] = "1"
+    config = {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {
+            "reader.example.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+            }
+        },
+    }
+
+    class LocalAPI(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == "/localapi/v0/serve-config"
+            self.send_response(200)
+            self.send_header("Etag", "fixture-unowned")
+            self.end_headers()
+            self.wfile.write(json.dumps(config).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), LocalAPI)
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    command.env["FIXTURE_LOCALAPI_PORT"] = str(server.server_port)
     command.tool(
         "tailscale",
-        """import json, sys
+        """import json, os, sys
 args = sys.argv[1:]
 if args == ['status', '--json']:
  print(json.dumps({'BackendState':'Running','Self':{'DNSName':'reader.example.ts.net.'},'CertDomains':['reader.example.ts.net']}))
-elif args == ['serve', 'status', '--json']:
- print(json.dumps({'TCP':{'443':{'HTTPS':True}},'Web':{'reader.example.ts.net:443':{'Handlers':{'/':{'Proxy':'http://127.0.0.1:9000'}}}}}))
+elif args == ['debug', 'local-creds']:
+ print('curl -u:fixture http://localhost:' + os.environ['FIXTURE_LOCALAPI_PORT'] + '/localapi/v0/status')
 else: raise SystemExit('UNEXPECTED TAILSCALE MUTATION')
 """,
     )
-    return command
+    try:
+        yield command
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 def test_start_refuses_unowned_serve_listener_before_changing_application(
@@ -67,6 +98,7 @@ class PrivateEngine(Engine):
         self.tailscale_calls = []
         self.installed = True
         self.fail_serve = False
+        self.before_mutation = None
         self.fail_security = False
         self.reconfigured = []
         self.backend = "Running"
@@ -80,6 +112,23 @@ class PrivateEngine(Engine):
             "base_url": "http://127.0.0.1:" + str(port),
         }
         self.settings_override = {}
+
+    def read(self):
+        return copy.deepcopy(self.config), json.dumps(self.config, sort_keys=True)
+
+    def write(self, config, etag):
+        if self.before_mutation:
+            self.before_mutation()
+        if etag != json.dumps(self.config, sort_keys=True):
+            raise RuntimeFailure(
+                "Serve configuration changed concurrently; no change applied."
+            )
+        assert self.published and not self.probes
+        if self.fail_serve:
+            raise RuntimeFailure(
+                "Project Serve change failed; inspect authorization locally."
+            )
+        self.config = copy.deepcopy(config)
 
     def run(self, *args, check=True, input=None):
         if args[0] == "tailscale":
@@ -104,27 +153,6 @@ class PrivateEngine(Engine):
                         }
                     ]
                 }
-            elif tail == (
-                "serve",
-                "--bg",
-                "--https=443",
-                "--set-path=/",
-                f"http://127.0.0.1:{self.port}",
-            ):
-                assert self.published and not self.probes
-                if self.fail_serve:
-                    return subprocess.CompletedProcess(
-                        args, 1, "", "private-admin-url secret"
-                    )
-                self.config.setdefault("TCP", {})["443"] = {"HTTPS": True}
-                self.config.setdefault("Web", {})["reader.example.ts.net:443"] = {
-                    "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{self.port}"}}
-                }
-                output = {}
-            elif tail == ("serve", "--https=443", "--set-path=/", "off"):
-                self.config["TCP"].pop("443", None)
-                self.config["Web"].pop("reader.example.ts.net:443", None)
-                output = {}
             else:
                 raise AssertionError(f"Unexpected Tailscale command: {tail}")
             return subprocess.CompletedProcess(args, status, json.dumps(output), "")
@@ -215,9 +243,78 @@ def private_runtime(tmp_path, monkeypatch):
         "rss_aggregator.runtime.urlopen", MagicMock(return_value=response)
     )
     monkeypatch.setattr(runtime, "_run", engine.run)
+    monkeypatch.setattr(
+        "rss_aggregator.private_access.ServeConfigClient", lambda runtime: engine
+    )
     monkeypatch.setenv("RSS_PORT", str(port))
     monkeypatch.setenv("RSS_TAILSCALE", "1")
     return runtime, engine
+
+
+@pytest.mark.parametrize("funnel", [False, True])
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("machine_state", ["running", "stopped"])
+def test_foreground_443_conflict_refused_before_application_changes(
+    private_runtime, funnel, installed, machine_state
+):
+    runtime, engine = private_runtime
+    engine.installed = installed
+    engine.machine["State"] = machine_state
+    engine.app["State"]["Running"] = machine_state == "running"
+    engine.config["Foreground"] = {
+        "other-session": {
+            "TCP": {"443": {"HTTPS": True}},
+            "Web": {
+                "reader.example.ts.net:443": {
+                    "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
+                }
+            },
+            "AllowFunnel": {"reader.example.ts.net:443": funnel},
+        }
+    }
+    before = copy.deepcopy(engine.config)
+    app_before = copy.deepcopy(engine.app)
+    with pytest.raises(RuntimeFailure, match="project-owned"):
+        runtime.run("start")
+    assert engine.config == before
+    assert engine.machine["State"] == machine_state
+    assert engine.app == app_before
+    assert not engine.reconfigured
+    assert not engine.probes
+    assert not engine.published
+    assert not (runtime.state_dir / "serve.json").exists()
+
+
+def test_private_start_preserves_unrelated_foreground_and_virtual_services(
+    private_runtime,
+):
+    runtime, engine = private_runtime
+    engine.config["Foreground"] = {
+        "other-session": {
+            "TCP": {"8443": {"HTTPS": True}},
+            "Web": {
+                "reader.example.ts.net:8443": {"Handlers": {"/": {"Text": "other"}}}
+            },
+            "Services": {
+                "svc:other": {
+                    "TCP": {"443": {"HTTPS": True}},
+                    "Web": {
+                        "other.example.ts.net:443": {
+                            "Handlers": {"/": {"Text": "service"}}
+                        }
+                    },
+                }
+            },
+        }
+    }
+    engine.config["Services"] = copy.deepcopy(
+        engine.config["Foreground"]["other-session"]["Services"]
+    )
+    before = copy.deepcopy(engine.config)
+    runtime.run("start")
+    engine.volumes.clear()
+    runtime.run("stop")
+    assert engine.config == before
 
 
 def test_private_start_effectively_enables_api_and_disables_anonymous_access(
@@ -347,7 +444,9 @@ def test_failed_private_start_does_not_expose_application(private_runtime, failu
     assert not engine.probes
 
 
-@pytest.mark.parametrize("conflict", ["handler", "target", "funnel", "owner"])
+@pytest.mark.parametrize(
+    "conflict", ["handler", "target", "funnel", "owner", "foreground"]
+)
 def test_stop_refuses_changed_ownership_without_removing_routes(
     private_runtime, conflict
 ):
@@ -363,6 +462,10 @@ def test_stop_refuses_changed_ownership_without_removing_routes(
         )
     elif conflict == "funnel":
         engine.config["AllowFunnel"] = {"reader.example.ts.net:443": True}
+    elif conflict == "foreground":
+        engine.config["Foreground"] = {
+            "other-session": {"TCP": {"443": {"HTTPS": True}}}
+        }
     else:
         path = runtime.state_dir / "serve.json"
         record = json.loads(path.read_text())
@@ -373,6 +476,34 @@ def test_stop_refuses_changed_ownership_without_removing_routes(
         runtime.run("stop")
     assert engine.config == before
     assert engine.app["State"]["Running"]
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+@pytest.mark.parametrize("change", ["root", "unrelated"])
+def test_concurrent_serve_change_is_not_overwritten(private_runtime, operation, change):
+    runtime, engine = private_runtime
+    if operation == "stop":
+        runtime.run("start")
+    raced = []
+
+    def replace_configuration():
+        if change == "root":
+            engine.config.setdefault("TCP", {})["443"] = {"HTTPS": True}
+            engine.config.setdefault("Web", {})["reader.example.ts.net:443"] = {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+            }
+        else:
+            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
+                "Text": "concurrent replacement"
+            }
+        raced.append(copy.deepcopy(engine.config))
+
+    engine.before_mutation = replace_configuration
+    with pytest.raises(RuntimeFailure, match="concurrent"):
+        runtime.run(operation)
+    assert len(raced) == 1
+    assert engine.config == raced[0]
+    assert not any("reset" in call for call in engine.tailscale_calls)
 
 
 def test_backup_restores_private_forwarding_even_without_opt_in_environment(

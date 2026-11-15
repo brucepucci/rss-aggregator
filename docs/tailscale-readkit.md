@@ -13,8 +13,9 @@ passwords and private feed URLs do not belong here.
    The PHP security gates must pass before adding credentials.
 3. Check existing Serve listeners locally. This implementation requires exclusive
    project ownership of the node's HTTPS port 443; it deliberately refuses to share
-   a port with another project's root handler, subpath or Funnel listener. It leaves
-   other ports, virtual services, certificates and the Tailscale service alone.
+   a port with another project's root handler, subpath or Funnel listener, including
+   foreground-session listeners. These are refused before VM/application changes.
+   It leaves other ports, virtual services, certificates and Tailscale itself alone.
 4. An administrator must approve/enable MagicDNS and HTTPS certificates if absent.
    Certificate hostnames appear in public Certificate Transparency logs. Serve
    remains private; do not configure public DNS, router forwarding or Funnel.
@@ -22,8 +23,21 @@ passwords and private feed URLs do not belong here.
    their IPv4/IPv6 addresses as appropriate. Do not grant 8080: the backend stays
    on `127.0.0.1`. Preserve unrelated grants. Recheck access after device changes.
 
-Start checks `tailscale status --json`, `tailscale serve status --json` and the
-local effective `tailscale debug netmap` packet filter before creating forwarding.
+Start checks `tailscale status --json`, the local daemon's Serve configuration
+(including foreground sessions), and the effective `tailscale debug netmap` packet
+filter before creating forwarding. `tailscale debug local-creds` discovers only the
+existing daemon's loopback/Unix-socket transport; its sensitive output is never
+printed or shell-executed. Ownership validation uses the same configuration/ETag
+snapshot as the conditional LocalAPI write (`If-Match`). Concurrent changes refuse
+start/stop without unconditional retry or rollback; unrelated configuration is
+copied unchanged. Unsupported transport/ETag output or LocalAPI permissions fail
+closed, not back to a separate unguarded `tailscale serve` mutation. A write-time
+transport failure can have an unknown outcome: inspect local Serve status before
+retrying, without an automatic rollback. These diagnostic interfaces are
+version-dependent. Initial implementation verification combined a read-only GET
+against the existing daemon (with ETag, no mutations) with isolated conditional-write
+and lifecycle tests. That initial check alone is **not live-write/HTTPS evidence**;
+subsequent isolated-candidate live verification is recorded separately in PR #18.
 The netmap is a diagnostic interface, verified against the installed CLI version;
 unrecognized output fails rather than assuming authorization. A TCP 443 rule is
 only a coarse prerequisite, **not proof that both specific clients can connect**.
@@ -79,6 +93,73 @@ publication and still requires active owned forwarding. JSON explicitly reports
 loopback and is **not** an insecure TLS bypass or a substitute for HTTPS/client tests.
 There is no automatic HTTPS-to-HTTP fallback. Do not change grants or the Tailscale
 installation to work around an unproven cause.
+
+## Real-HTTPS checks — human-assisted
+
+Use the working Air/iPhone path, not the mini's failing self-HTTPS path. Loopback
+HTTP 401 and isolated redirect tests do not establish these real-HTTPS results.
+Do not weaken TLS, change policy or publish raw requests/responses.
+
+1. Begin a fresh ReadKit **FreshRSS** connection check with the existing HTTPS
+   origin/user and a deliberately wrong **API** password; cached synchronization
+   is not a new authentication check. Confirm authentication rejection, cancel the
+   extra setup, and confirm the existing valid account still synchronizes. Do not
+   change the server password or publish either password. Record only the outcome;
+   an HTTP status is optional if safely available.
+2. On the Air, replace `<HTTPS-ORIGIN>` locally and run these credential-free GETs:
+
+   ```sh
+   curl -q -sS --noproxy '*' --proto '=https' --max-redirs 0 \
+     -o /dev/null -w 'HTTP %{http_code}\nRedirect: %{redirect_url}\n' \
+     '<HTTPS-ORIGIN>/'
+   curl -q -sS --noproxy '*' --proto '=https' --max-redirs 0 \
+     -o /dev/null -w 'HTTP %{http_code}\nRedirect: %{redirect_url}\n' \
+     '<HTTPS-ORIGIN>/api/'
+   curl -q -sS --noproxy '*' --proto '=https' --max-redirs 0 \
+     --header 'Authorization: GoogleLogin auth=test/1' \
+     --write-out '\nHTTP %{http_code}\n' \
+     '<HTTPS-ORIGIN>/api/greader.php/check/compatibility'
+   ```
+
+   `-q` ignores curl configuration; `-sS` hides progress but shows errors;
+   `--noproxy '*'` bypasses ambient proxies; `--proto '=https'` permits HTTPS only.
+   TLS verification remains enabled. No `--location` is used and redirects are not
+   followed (`--max-redirs 0`). `-o /dev/null` discards page content; `-w` prints
+   only status and redirect destination. The compatibility request prints its
+   diagnostic body plus status; its header is **dummy diagnostic data**, not a real
+   credential. Expected compatibility output is `PASS`/HTTP 200. Plain browser
+   navigation omits this header and can report an Authorization-header failure;
+   the misspelled `/check/compatability` instead returns HTTP 400.
+   Curl exits nonzero for transport/TLS errors (for example code 35 with HTTP 000);
+   without `--fail`, HTTP error statuses do not themselves make curl exit nonzero,
+   so inspect the printed status/body. Do not substitute an insecure TLS flag.
+3. Inspect each 3xx destination locally: it must stay on the exact same HTTPS
+   origin, never HTTP, loopback, container names or another host. Repeat the first
+   command with that destination until reaching HTTP 200 with no redirect. Do not
+   follow an unexpected origin or submit credentials there. Open `/api/` in Safari
+   and confirm the displayed Google Reader API address uses the same HTTPS origin.
+4. Share only endpoint paths, status codes and same-origin HTTPS yes/no; no full
+   origins, request identifiers, authentication bodies, headers or network exports.
+
+### Observed remote results after the PR #18 review
+
+The user confirmed the Air's fresh wrong-API-password rejection and subsequent
+normal valid-account synchronization; no remote authentication HTTP status was
+captured. The Air's curl requests used trusted TLS, no proxy and no redirect
+following; the user supplied these sanitized results:
+
+| Check | Observed result |
+| --- | --- |
+| `/api/greader.php/check/compatibility` with dummy Authorization header | `PASS`, HTTP 200, no redirect |
+| `/` | HTTP 302 to the same HTTPS origin at `/i/?rid=<REQUEST-ID>` |
+| That exact `/i/` redirect destination | HTTP 200, no further redirect |
+| `/api/` | HTTP 200, no redirect |
+| Browser `/api/` diagnostics and displayed API addresses | Google Reader PASS; API links use the same HTTPS origin, including `/api/greader.php` |
+
+This closes the review's remote invalid-credential and redirect/origin evidence
+gap. It does not claim the mini's own HTTPS failure is fixed, prove rejection of a
+real injected cross-origin redirect, or repeat earlier stopped-client/read-star
+checks. Those earlier device observations remain historical evidence below.
 
 ## Actual ReadKit clients — human-assisted
 
@@ -137,8 +218,23 @@ feed fetching (startup plus UTC minutes 00/20/40, subject to caching/backoff).
    subscriptions/articles and the deliberate read/star state are retained.
 5. Repeat start/stop; no duplicate route, instance or subscriptions should appear.
 
+Explicit `backup` attempts to restore prior application/forwarding state after
+quiescing, even on snapshot failure and regardless of the current opt-in setting.
+A failed explicit backup is not proof remote access is closed. Shutdown export
+failure instead leaves writers/forwarding stopped and the VM running; preflight
+refusals may leave existing serving state untouched.
+
 ## Sanitized local checkpoint
 
+- **PR #18 local review fixes, after `62626a8`:** full default baseline passed
+  **329 tests in 81.61s**, six live deselected, Ruff lint/format clean. Foreground
+  conflicts, concurrent mutations and backup-state regressions passed; the new
+  LocalAPI adapter has wire-level conditional-write/redaction/failure coverage.
+  Read-only LocalAPI GET/ETag discovery passed on the existing daemon with no
+  mutations. Real conditional writes and live lifecycle checks were not run during
+  implementation. The user subsequently completed the remote invalid-credential
+  and redirect/origin checks above. The older device/runtime results below predate
+  these fixes and were not repeated.
 - `uv sync --locked` and `uv run --locked rss-dev check` pass: **190 default tests
   in 78.40s**, six live deselected, Ruff lint/format clean. See README's issue #3
   checkpoint for failure history and the verification scope.

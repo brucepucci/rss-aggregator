@@ -211,8 +211,23 @@ export RSS_TAILSCALE=1
 incoming TCP 443 policy before changing forwarding. It reserves the node's entire
 HTTPS port 443 exclusively for this project; an unowned listener (even one pointing
 to the same backend), another handler, or Funnel on that listener causes refusal.
-Other ports and Tailscale services are preserved. There is no reset/adoption/bypass
+This includes foreground-session listeners, checked before any VM/application changes.
+Other ports and Tailscale virtual services are preserved. There is no reset/adoption/bypass
 flag. This preflight does not prove each physical client's authorization.
+
+Forwarding mutations use the existing daemon's LocalAPI: read configuration and its
+ETag together, validate ownership, then conditionally write with that exact
+`If-Match`. A concurrent change causes refusal without an automatic retry or global
+rollback, protecting both start and stop. The CLI's `tailscale debug local-creds`
+provides a loopback port/credential or Unix socket; its output stays private in
+memory and is never executed as shell text. Requests stay local, bypass proxies
+and refuse redirects. Missing credentials/ETag, unsupported debug output or denied
+LocalAPI access cause failure; there is no unconditional CLI fallback. A transport
+failure during a write can have an unknown outcome. Inspect `tailscale serve status`
+locally before retrying and resolve ownership/availability first; never blindly roll
+back someone else's configuration.
+LocalAPI/debug compatibility and real HTTPS must be checked on the installed version;
+conditional-update regressions are isolated tests, not live-service evidence.
 
 After normal effective-PHP checks and probe removal, an installed instance is
 configured with the HTTPS base URL, API access, form login and no anonymous
@@ -252,7 +267,25 @@ validates the actual sole IPv4 loopback publication, and reports
 `transport: "loopback"`, `https_verified: false`. It never retries HTTPS credentials
 over HTTP implicitly and is **not** a certificate/remote-access test. Continue the
 actual Air/iPhone HTTPS and ReadKit checks; do not broaden policy, restart/upgrade
-Tailscale or disable TLS verification speculatively.
+Tailscale or disable TLS verification speculatively. The user has now verified
+**real-HTTPS invalid-credential rejection and redirect/origin behavior on the Air**:
+wrong API password rejected, valid account still synchronizes, compatibility
+`PASS`/HTTP 200, root HTTP 302 to same-origin HTTPS `/i/` then HTTP 200, `/api/`
+HTTP 200 without redirect, and displayed API links use the same HTTPS origin.
+See the [remote-device checklist and sanitized results](docs/tailscale-readkit.md#real-https-checks--human-assisted).
+Loopback rejection alone is not HTTPS evidence.
+
+Direct `/api/greader.php/check/compatibility` requests require the dummy diagnostic
+header `Authorization: GoogleLogin auth=test/1`; browser address-bar navigation
+omits it and can report an Authorization-header failure. The runbook's curl GETs
+use `-q` to ignore curl configuration, `-sS` for quiet output/errors,
+`--noproxy '*'` to bypass proxies, `--proto '=https'` to require HTTPS, and
+`--max-redirs 0` without `--location` to avoid following redirects. `-o /dev/null`
+discards pages, `-w`/`--write-out` prints HTTP status/redirect destination, and
+`--header` supplies only dummy diagnostic data for the compatibility check. TLS
+verification stays enabled; transport failures exit nonzero, while HTTP failures
+require inspecting the printed status (no `--fail`). Never use real credentials
+in these command arguments or publish private redirect URLs.
 
 On each device select ReadKit's **FreshRSS** account integration (Google
 Reader-compatible API), the **same FreshRSS user**, and its separate API password;
@@ -269,11 +302,15 @@ for these ReadKit accounts. See the [device runbook](docs/tailscale-readkit.md).
 Normal `stop` removes only matching project-owned forwarding, backs up, and stops
 the VM; repeating stop also removes a stale owned route when the VM is already
 stopped. Keep `RSS_TAILSCALE=1` for later `start`/`verify`/`replace`. An explicit
-`backup` temporarily removes forwarding while quiesced and restores a previously
-running private route even if this shell omitted the opt-in. Backup/shutdown failure
-can leave the application stopped and VM running; it does not leave forwarding
-intentionally active. Stopping the project or VM makes FreshRSS unavailable even
-while both devices remain connected to Tailscale. State persists in the data volume;
+`backup` temporarily removes forwarding while quiesced and attempts to restore the
+previous application/forwarding state **even if snapshot creation fails**, regardless
+of this shell's opt-in: a previously private service resumes privately and a
+loopback-only service stays loopback-only. A failed `backup` therefore does **not**
+confirm remote access is closed. Shutdown export failure instead leaves writers and
+forwarding stopped with the VM running. Preflight refusals may leave existing serving
+state untouched; failed resumption can leave the application stopped. Stopping the
+project or VM makes FreshRSS unavailable even while both devices remain connected
+to Tailscale. State persists in the data volume;
 ReadKit synchronization is not server feed fetching.
 
 To return deliberately to browser-only operation, set `RSS_TAILSCALE=0` and run
@@ -306,13 +343,18 @@ idle before exporting the selected volume. The project lock serializes managed
 commands; do not mount/write the volume through independent Podman commands or
 VM shell sessions during export. Unrelated running workloads cause refusal before
 any container is stopped. Explicit backup resumes a previously running application
-through the normal security gate, or temporarily starts/stops a previously stopped
-VM without starting the application. A resume failure is an error even if the
-archive was published; inspect private `last-backup.json` and `status` locally.
+through the normal security gate, restoring its observed forwarding mode regardless
+of `RSS_TAILSCALE`, even when snapshot creation fails. It can instead temporarily
+start/stop a previously stopped VM without starting the application. A forwarding
+query failure during that operation also attempts VM restoration. A resume failure
+is an error even if the archive was published; inspect private `last-backup.json`
+and `status` locally.
 
 Normal shutdown now requires a successful external backup before stopping the VM.
-If export/configuration/verification fails, the VM stays running, application
-writers stay stopped, and source data and prior archives remain. Fix the cause
+After quiescing, if backup destination/export/verification fails, the VM stays
+running, application writers and forwarding stay stopped, and source data and prior
+archives remain. A preflight refusal (such as foreign workloads or changed forwarding
+ownership) can leave the existing serving state untouched. Fix the cause
 and retry `stop`. An already-stopped VM is not restarted just to repeat shutdown.
 If no selected data volume exists, shutdown reports `backup.status: "no_data"`.
 No backups are pruned or uploaded automatically. Keep independent copies on durable
@@ -430,10 +472,13 @@ command is added here.
   (installed-version JSON) and `brew list --cask` (one raw name per line) locally;
   both must succeed, with valid matching records, before retrying setup. Do not
   remove or reinstall an unrelated application just to make project setup pass.
-- **Backup failure or missing `RSS_BACKUP_DIR`:** shutdown leaves writers stopped
-  and the VM running. Choose a private external directory, check free disk space
-  and engine availability, then retry `stop`. Previous good archives and the source
-  volume remain. Do not force VM deletion or remove data as a workaround.
+- **Backup failure or missing `RSS_BACKUP_DIR`:** explicit `backup` attempts to
+  restore prior serving/forwarding after a snapshot failure; do not assume remote
+  access is closed. Shutdown backup failure after quiescing leaves writers and
+  forwarding stopped and the VM running; preflight refusals may leave serving
+  untouched. Choose a private external directory, check free disk space and engine
+  availability, then retry `stop`. Previous good archives and the source volume
+  remain. Do not force VM deletion or remove data as a workaround.
 - **Restore compatibility/target refusal:** use the archive's exact reviewed image
   configuration and a fresh target name. A failed import target is retained and
   is not automatically selected. Do not overwrite it or the source to force retry.
@@ -485,8 +530,8 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | Setting | Purpose and default | How to change/apply |
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
-| `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` preserves an already-running private route. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
-| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted starts can be recovered. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes. An inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
+| `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` restores the observed prior forwarding mode, even after snapshot failure; it does not apply this shell's opt-in. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
+| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted starts can be recovered. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. An inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
@@ -622,7 +667,7 @@ invalid command usage exits 2. Capture stdout separately when consuming results.
 | `rss fetch` | Run feed actualization immediately. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed. |
 | `rss verify` | Restart/recheck the running application before reopening service; briefly interrupts service. | Start fields plus `verified: true`. |
 | `rss replace` | Recreate only the owned application container, preserving its named data volume. | Start fields plus `replaced: true`. |
-| `rss backup` | Create a quiesced external archive and restore the prior running state. | `archive`, `sha256`, `verified: true`, `manifest`. |
+| `rss backup` | Create a quiesced external archive; attempt to restore prior application/forwarding/VM state even on snapshot failure (exit 1). Preflight refusal may leave serving untouched; resume failure is also an error. | `archive`, `sha256`, `verified: true`, `manifest`. |
 | `rss restore ARCHIVE --volume NAME` | Validate and import into a fresh owned volume without activation. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
 | `rss select-volume NAME` | Select an owned volume while the application is stopped. | `volume`, `selected: true`, `next_step`. |
 | `rss stop` | Back up application state before stopping the owned VM. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `status: "already_stopped"` / `"no_data"`). |
@@ -930,6 +975,33 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **PR #18 local review fixes (after `62626a8`, `issue-3`):**
+  `uv run --locked rss-dev check` passed **329 default tests in 81.61s**, six live
+  deselected; Ruff lint and format checks passed. Regression tests reproduced the
+  foreground-listener preflight omission, concurrent Serve mutation race, and backup
+  restoration bugs before their fixes. Coverage now includes foreground Serve/Funnel
+  refusal before VM/application changes, unrelated foreground/virtual-service
+  preservation, conditional start/stop refusal on concurrent changes, both opt-in
+  mismatches with successful/failed backups, and stopped-VM forwarding-query failure.
+  Wire-level LocalAPI tests cover exact ETag/If-Match, null initial configuration,
+  local transport/authentication, redaction, and no retry/rollback on failures.
+  A **read-only** GET through the new adapter succeeded against the existing daemon
+  with an ETag; no configuration was written and no service was changed. Runtime
+  help and `git diff --check` passed; command/settings documentation was checked
+  against the changed implementation. No new CLI flags or settings were added.
+  **Not verified during implementation:** real conditional writes/start-stop
+  lifecycle with the new adapter and fresh live Podman checks. Publication evidence
+  is recorded separately in PR #18. The user subsequently completed the Air's
+  real-HTTPS invalid-credential and redirect/origin checks in the
+  [remote checklist](docs/tailscale-readkit.md#real-https-checks--human-assisted):
+  invalid API password rejected, valid account still synchronizes, compatibility
+  `PASS`/HTTP 200, root HTTP 302 to same-origin `/i/` then HTTP 200, `/api/` HTTP 200
+  without redirect, and displayed API links use the same HTTPS origin. Remote
+  invalid-authentication HTTP status was not captured; mini self-HTTPS remains
+  unresolved. Older device evidence below is historical, not a new state-matrix
+  rerun. No new CI, alternate-platform or typechecker result is claimed; this
+  implementation checkpoint alone is not merge approval.
 
 - **Publication verification correction (after `0167ac3`, on `issue-3`):**
   Fresh isolated verification of the prepared issue #3 tree passed 190 tests plus

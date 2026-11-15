@@ -1,5 +1,6 @@
 """Private HTTPS forwarding, scoped to the project's exclusive Serve listener."""
 
+import copy
 import json
 import os
 import re
@@ -8,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+from rss_aggregator.serve_config import ServeConfigClient
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -35,6 +38,13 @@ class PrivateAccess:
         self.runtime = runtime
         self.failure = RuntimeFailure
         self.path = runtime.state_dir / SERVE_RECORD
+        self._serve_config: ServeConfigClient | None = None
+
+    def _config_client(self) -> ServeConfigClient:
+        """Reuse one discovered local daemon transport for conditional configuration."""
+        if self._serve_config is None:
+            self._serve_config = ServeConfigClient(self.runtime)
+        return self._serve_config
 
     def enabled(self) -> bool:
         """Read the explicit opt-in without changing the existing Tailscale service."""
@@ -89,7 +99,7 @@ class PrivateAccess:
             raise self.failure(
                 "HTTPS certificates are not enabled for this device; obtain approval before changing tailnet DNS/HTTPS settings."
             )
-        config = self._query("serve", "status", "--json")
+        config, _etag = self._config_client().read()
         record = self._record(owner)
         self._validate(config, record)
         netmap = self._query("debug", "netmap")
@@ -133,6 +143,12 @@ class PrivateAccess:
     def _validate(self, config: dict[str, Any], record: dict[str, Any] | None) -> bool:
         """Accept an absent listener or exactly the recorded, non-Funnel route."""
         scope = self._scope(config)
+        for foreground in config.get("Foreground", {}).values():
+            listener = self._scope(foreground)
+            if listener["TCP"] or listener["Web"] or listener["Funnel"]:
+                raise self.failure(
+                    "Serve HTTPS port 443 is not exclusively project-owned; preserve the foreground listener and resolve its ownership locally."
+                )
         if not scope["TCP"] and not scope["Web"] and not scope["Funnel"]:
             return False
         if (
@@ -170,11 +186,17 @@ class PrivateAccess:
         record = self._record(owner)
         if record is None:
             return False
-        config = self._query("serve", "status", "--json")
+        config, etag = self._config_client().read()
         active = self._validate(config, record)
         if active:
-            self._mutate("--https=443", "--set-path=/", "off")
-            after = self._query("serve", "status", "--json")
+            replacement = copy.deepcopy(config)
+            replacement["TCP"].pop("443")
+            replacement["Web"].pop(record["host"] + ":443")
+            # False Funnel entries confer no access, but should not remain as a
+            # stale reference to a removed listener. Preserve all other ports.
+            replacement.get("AllowFunnel", {}).pop(record["host"] + ":443", None)
+            self._config_client().write(replacement, etag)
+            after, _etag = self._config_client().read()
             if self._validate(after, record):
                 raise self.failure(
                     "Project Serve forwarding did not stop; inspect it locally."
@@ -182,15 +204,6 @@ class PrivateAccess:
             self._preserved(config, after)
         self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
         return active
-
-    def _mutate(self, *args: str) -> None:
-        """Run scoped Serve commands without account-wide prompts or secret output."""
-        result = self.runtime._run("tailscale", "serve", *args, check=False, input="")
-        if result.returncode:
-            raise self.failure(
-                "Project Serve change failed; check certificate/HTTPS authorization, local permissions and port ownership. "
-                "Inspect tailscale serve status locally; no global reset or account changes were attempted."
-            )
 
     def _preserved(self, before: dict[str, Any], after: dict[str, Any]) -> None:
         """Verify configuration outside the reserved listener was not altered."""
@@ -298,7 +311,7 @@ class PrivateAccess:
     def start(self, owner: dict[str, Any], port: int, origin: str) -> dict[str, Any]:
         """Publish the security-verified application with a durable ownership intent."""
         self.prepare(owner, port)
-        before = self._query("serve", "status", "--json")
+        before, etag = self._config_client().read()
         self._validate(before, self._record(owner))
         record = {
             "owner": owner["token"],
@@ -307,8 +320,13 @@ class PrivateAccess:
             "phase": "pending",
         }
         self.runtime._save(SERVE_RECORD, record)
-        self._mutate("--bg", "--https=443", "--set-path=/", record["target"])
-        after = self._query("serve", "status", "--json")
+        replacement = copy.deepcopy(before)
+        replacement.setdefault("TCP", {})["443"] = {"HTTPS": True}
+        replacement.setdefault("Web", {})[record["host"] + ":443"] = {
+            "Handlers": {"/": {"Proxy": record["target"]}}
+        }
+        self._config_client().write(replacement, etag)
+        after, _etag = self._config_client().read()
         if not self._validate(after, record):
             raise self.failure(
                 "Project Serve route is missing; check certificate authorization locally."
