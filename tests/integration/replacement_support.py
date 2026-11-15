@@ -207,7 +207,12 @@ class ReplacementInstanceFixture(InstanceFixture):
             self.podman("rm", *(["--volumes"] if name == self.check else []), name)
         checked_volume(controller, owner, self.token, self.volume_record)
         self.podman("volume", "rm", self.volume)
-        for suffix in ("selection.json", "recovery.json", "last-backup.json"):
+        for suffix in (
+            "selection.json",
+            "recovery.json",
+            "last-backup.json",
+            "serve.json",
+        ):
             (controller.state_dir / ("test-" + self.token + "-" + suffix)).unlink(
                 missing_ok=True
             )

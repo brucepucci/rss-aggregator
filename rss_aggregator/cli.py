@@ -27,7 +27,7 @@ def _execute(operation: Operation, **options: Any) -> None:
 
 @click.group()
 def main() -> None:
-    """Manage the local-only FreshRSS instance with guarded lifecycle commands."""
+    """Manage FreshRSS and optional private HTTPS with guarded lifecycle commands."""
 
 
 @main.command()
@@ -70,6 +70,24 @@ def replace() -> None:
 def stop() -> None:
     """Back up stopped writers before stopping the project VM."""
     _execute("stop")
+
+
+@main.command("api-check")
+@click.option(
+    "--loopback",
+    is_flag=True,
+    help="Use only the owned 127.0.0.1 backend; does NOT verify HTTPS. Default: trusted HTTPS.",
+)
+def api_check(loopback: bool) -> None:
+    """Prompt locally for API credentials; emit only sanitized transport/API results."""
+    if loopback:
+        click.echo(
+            "Loopback authentication diagnostic only; HTTPS will NOT be verified.",
+            err=True,
+        )
+    username = click.prompt("FreshRSS user", err=True)
+    password = click.prompt("Separate API password", hide_input=True, err=True)
+    _execute("api-check", username=username, api_password=password, loopback=loopback)
 
 
 @main.command()

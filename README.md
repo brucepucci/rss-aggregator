@@ -11,14 +11,21 @@ local runtime for [#1](https://github.com/brucepucci/rss-aggregator/issues/1) an
 [#9's Python adoption](https://github.com/brucepucci/rss-aggregator/issues/9) on main.
 [PR #15](https://github.com/brucepucci/rss-aggregator/pull/15) integrated
 [#2's backup/recovery](https://github.com/brucepucci/rss-aggregator/issues/2).
-This branch fixes [#14's incomplete-cask inventory failure](https://github.com/brucepucci/rss-aggregator/issues/14);
+[PR #16](https://github.com/brucepucci/rss-aggregator/pull/16) integrated
+[#14's incomplete-cask inventory fix](https://github.com/brucepucci/rss-aggregator/issues/14).
+This branch implements [#3's private Tailscale/ReadKit path](https://github.com/brucepucci/rss-aggregator/issues/3);
 publication and review remain separate. See
 [verification and adoption status](#verification-and-adoption-status) for historical
 evidence and verification of the changes in this checkout.
 
 Portable backups and guarded restore are implemented locally; see the verification
-checkpoint below for their tested scope. Destructive removal, Tailscale, ReadKit
-and Linux deployment are **not yet implemented**. See [architecture decisions](docs/adr/).
+checkpoint below for their tested scope. Optional project-owned Tailscale Serve
+forwarding and sanitized API checks are implemented locally. The iPhone browser's
+HTTPS/API diagnostics pass, and ReadKit connects on the Air and iPhone using the
+instance origin. Human-assisted checks passed bidirectional read/star synchronization
+and normal stop/start persistence; the mini's own HTTPS diagnostic limitation is
+recorded below.
+Destructive removal and Linux deployment are not implemented. See [architecture decisions](docs/adr/).
 
 ## Getting Started
 
@@ -146,7 +153,8 @@ browser sessions; your account/password and reading state persist.
 | --- | --- |
 | `./scripts/rss setup` | Inventory/install missing CLI; initialize an absent owned machine; preserve an existing setup. |
 | `./scripts/rss start` | Start the VM if needed; stop/reuse or create the application, copy both new-user templates, re-run the security gate, check cron and immediately run feed actualization. |
-| `./scripts/rss status` | Report VM/application state, inspect installed cron and its live daemon, show last security-check time. Does not start anything. |
+| `./scripts/rss status` | Report VM/application and recorded Serve forwarding state, inspect cron and its live daemon, show last security-check time. Does not start anything. |
+| `./scripts/rss api-check [--loopback]` | Prompt locally for the FreshRSS user and hidden separate API password; check GReader diagnostics, authentication and sanitized counts. Default verifies trusted HTTPS. Explicit `--loopback` checks only the verified owned `127.0.0.1` publication and does **not** verify HTTPS. Requires an already security-checked private start and active owned forwarding. |
 | `./scripts/rss fetch` | Run feed actualization immediately, or explain that the installer is pending. |
 | `./scripts/rss verify` | Restart/recheck the running application, including effective Apache PHP, cron and immediate actualization. Brief service interruption. |
 | `./scripts/rss replace` | Stop/remove **only the owned application container**, then recreate it using the same named data volume and current checked-in configuration. |
@@ -182,12 +190,97 @@ Idle guest RAM is **not guaranteed to return to macOS** while the VM remains up.
 Stopping the VM releases its memory allocations and stops all serving/fetching.
 Nothing starts automatically after login or a Mac reboot; run `start` yourself.
 
-### ReadKit connection — deferred
+### ReadKit connection — private HTTPS
 
-Do not enable API access or configure ReadKit for this slice. The instance is
-browser-only and loopback-only. Private Tailscale HTTPS and the Google
-Reader-compatible API with a separate API password are planned in issue #3;
-ReadKit's macOS/iOS end-to-end connection is not yet verified.
+First finish the local installer above. Use the pre-existing Tailscale installation
+on the Mac and both reader devices; do not install another instance or enable
+Funnel. Obtain approval before any tailnet-wide DNS, HTTPS or policy change.
+MagicDNS and HTTPS certificates must already be enabled for this Mac. Certificate
+hostnames appear in public Certificate Transparency logs, but Serve is tailnet-only.
+The reader devices need a narrowly scoped TCP 443 grant to the Mac; **8080 stays
+loopback-only**. Existing SSH/SMB/other grants and Funnel permissions are preserved.
+
+```sh
+# Keep using the same private ownership directory and RSS_PORT as normal.
+export RSS_TAILSCALE=1
+./scripts/rss start
+./scripts/rss status
+```
+
+`start` checks the existing node's HTTPS support, Serve listeners and effective
+incoming TCP 443 policy before changing forwarding. It reserves the node's entire
+HTTPS port 443 exclusively for this project; an unowned listener (even one pointing
+to the same backend), another handler, or Funnel on that listener causes refusal.
+Other ports and Tailscale services are preserved. There is no reset/adoption/bypass
+flag. This preflight does not prove each physical client's authorization.
+
+After normal effective-PHP checks and probe removal, an installed instance is
+configured with the HTTPS base URL, API access, form login and no anonymous
+reading/refresh. Startup reads those effective settings back and refuses forwarding
+if an override or unsuccessful application leaves any required value wrong. FreshRSS natively honors Serve's `X-Forwarded-Proto`; `TRUSTED_PROXY=0`
+remains in place (it disables Apache forwarded-client-IP trust, not HTTPS URL
+handling). Serve is created only after scheduler and fetching checks complete.
+No broad bind, automatic Tailscale installation, service shutdown, certificate
+removal, or Funnel command is used.
+
+Use the private HTTPS `url` returned by `start` locally. Open it, sign in using
+the **web** password, and in **Profile** set a strong, separate **API password**.
+Enter it only locally; neither password belongs in Git, command arguments, chat,
+logs or screenshots. Visit `<HTTPS-ORIGIN>/api/` and confirm the Google Reader
+configuration check passes, then run:
+
+```sh
+./scripts/rss api-check
+```
+
+The command prompts on stderr and hides the API password. Success is JSON with
+`diagnostics: "PASS"`, `authenticated: true`, and subscription/sample-article
+counts only—never credentials, tokens, feed URLs or article content. Default mode
+uses trusted TLS; JSON includes `transport: "https"`, `https_verified: true`.
+Both modes use POST for credentials, no ambient HTTP proxy and no redirects. Try a
+wrong API password separately and confirm failure; never paste authentication responses.
+
+On this mini, requests to its own HTTPS origin currently fail during TLS even
+though the iPhone's HTTPS diagnostics pass. The approved, explicit local diagnostic is:
+
+```sh
+./scripts/rss api-check --loopback
+```
+
+It retains the owned/running/security-checked app and active-forwarding requirements,
+validates the actual sole IPv4 loopback publication, and reports
+`transport: "loopback"`, `https_verified: false`. It never retries HTTPS credentials
+over HTTP implicitly and is **not** a certificate/remote-access test. Continue the
+actual Air/iPhone HTTPS and ReadKit checks; do not broaden policy, restart/upgrade
+Tailscale or disable TLS verification speculatively.
+
+On each device select ReadKit's **FreshRSS** account integration (Google
+Reader-compatible API), the **same FreshRSS user**, and its separate API password;
+not Google credentials or Fever. **Verified account URL entry: `<HTTPS-ORIGIN>`
+unchanged, without `/api/greader.php`.** The user confirmed this form in ReadKit on
+the Air; ReadKit on the iPhone also connected using the same instructions. Both
+display the public feed. The user verified read/unread and star/unstar changes from
+each reader in the other reader and FreshRSS, with roughly **30 seconds** of observed
+propagation (not a guaranteed bound), no certificate-warning bypass, and saved state
+after normal stop/start. FreshRSS's
+`<HTTPS-ORIGIN>/api/greader.php` is the underlying API endpoint, not the entry used
+for these ReadKit accounts. See the [device runbook](docs/tailscale-readkit.md).
+
+Normal `stop` removes only matching project-owned forwarding, backs up, and stops
+the VM; repeating stop also removes a stale owned route when the VM is already
+stopped. Keep `RSS_TAILSCALE=1` for later `start`/`verify`/`replace`. An explicit
+`backup` temporarily removes forwarding while quiesced and restores a previously
+running private route even if this shell omitted the opt-in. Backup/shutdown failure
+can leave the application stopped and VM running; it does not leave forwarding
+intentionally active. Stopping the project or VM makes FreshRSS unavailable even
+while both devices remain connected to Tailscale. State persists in the data volume;
+ReadKit synchronization is not server feed fetching.
+
+To return deliberately to browser-only operation, set `RSS_TAILSCALE=0` and run
+`start`. Recorded project forwarding is removed and an installed instance's base
+URL returns to loopback; API enablement/API passwords are not erased. Keep using
+the existing ownership directory, including after stop. Never copy or fabricate
+`serve.json` to adopt somebody else's listener.
 
 ### Backup and restore
 
@@ -358,6 +451,23 @@ command is added here.
 - **Cron missing/dead:** `status` fails rather than claiming fetching is healthy.
   Use `start`/`verify` to restart and recheck. Cron is upstream's background daemon,
   not a separately supervised service.
+- **Private HTTPS prerequisite/policy failure:** connect the existing Tailscale
+  installation and inspect its local status. An administrator must approve DNS/HTTPS
+  changes and a narrow reader-device-to-Mac TCP 443 grant. The command's effective
+  netmap preflight is coarse; authorization from each actual device still needs testing.
+- **Serve ownership/443 conflict:** inspect `tailscale serve status` locally. Preserve
+  the other listener, handler or Funnel configuration and resolve ownership manually;
+  do not run `serve reset`, edit the ownership record or enable Funnel to bypass it.
+  Stop refuses a changed route rather than deleting it. Other applications' ports
+  and services are not project resources.
+- **Certificate/access failure:** check Tailscale on both devices, MagicDNS, HTTPS
+  authorization, device clocks and current trust stores. Never use a self-signed
+  certificate bypass or `curl -k`. Check macOS/iOS local-network permissions if
+  prompted; they do not replace tailnet authorization. A stopped VM cannot serve.
+- **API/ReadKit authentication failure:** use the separate per-user API password,
+  confirm API access under Authentication and inspect the GReader check at `/api/`.
+  `api-check` refuses redirects and untrusted TLS; a redirect often indicates a bad
+  external/base URL. Do not paste raw API responses or tokens into issues.
 - **Wrong port/image/configuration on an existing container:** check the intended
   settings, then use `replace`. Never remove the named data volume to fix a
   container configuration problem.
@@ -375,6 +485,8 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | Setting | Purpose and default | How to change/apply |
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
+| `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` preserves an already-running private route. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
+| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted starts can be recovered. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes. An inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
@@ -411,7 +523,9 @@ the container**, not on macOS. For a new installation, choose the port before
 
 All other behavior uses the pinned upstream defaults unless changed locally:
 form login is selected in the installer; anonymous reading/refresh, client API
-and public registrations are disabled by default; bundled extension enablement is
+and public registrations are disabled by default. Private HTTPS start explicitly
+enables the client API while enforcing form login and no anonymous reading/refresh;
+the separate per-user API password is set locally in Profile. Bundled extension enablement is
 empty; no full-page scraping is configured. Upstream display/read settings still
 apply (opening an article or its website may mark it read; scroll/focus marking is
 off by default). Per-feed/category policies can override user archiving settings,
@@ -459,7 +573,7 @@ Run from a synchronized checkout (`uv sync --locked` first):
 
 | Invocation | Purpose and accepted arguments/options |
 | --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the ten operations below. |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the eleven operations below. |
 | `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint. |
 | `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. |
 | `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
@@ -473,7 +587,12 @@ extra positional arguments and unsupported options also exit 2 with stderr
 usage/diagnostics, not operation JSON. There is no implicit operation.
 
 Lifecycle commands and `backup` have no positional arguments/options except
-`--help`. `restore ARCHIVE --volume NAME` requires a local archive file and fresh
+`--help`. `api-check [--loopback]` accepts no positional arguments; `--loopback` is
+an optional boolean flag, absent by default (trusted HTTPS), selecting only the owned
+`127.0.0.1` HTTP backend without HTTPS verification. It prompts on stderr for a
+FreshRSS username and hidden API password; there are no credential flags/environment
+variables or URL argument.
+Cancelled/EOF prompts fail nonzero without JSON. `restore ARCHIVE --volume NAME` requires a local archive file and fresh
 target name; `select-volume NAME` requires an owned volume name. In particular,
 `rss` has no `--project` option. Runtime configuration comes from
 the [settings above](#configuration). The launcher's `--project` is an internal
@@ -497,8 +616,9 @@ invalid command usage exits 2. Capture stdout separately when consuming results.
 | Command | Purpose | JSON result fields |
 | --- | --- | --- |
 | `rss setup` | Inventory/install missing Podman CLI and initialize the owned VM without starting services. | `machine: "rss-aggregator"`, `created: boolean`. |
-| `rss start` | Start/restart the owned application after security checks, verify scheduling and fetch feeds. | `machine: "running"`, `url`, `security`, `scheduler`, `fetch`. |
-| `rss status` | Inspect state without starting anything. | `machine`, `application`, selected `volume` when configured; when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
+| `rss start` | Start/restart after security checks, verify scheduling/fetching and optionally configure private HTTPS/API. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
+| `rss status` | Inspect state without starting anything. | `machine`, `application`, selected `volume` and `forwarding` when configured (`status: "unconfigured"`, `"running"` or `"stopped"`; a recorded route also includes private `url`); when available `http_ready`, `scheduler`, `security`. A stopped VM has application `unknown`, not a claim that its container disappeared. An unconfigured checkout reports machine/application `absent`. |
+| `rss api-check [--loopback]` | Prompt locally; check GReader diagnostics and authenticated read access. Default: trusted private HTTPS. Explicit `--loopback`: only the verified owned IPv4 loopback publication; no HTTPS verification. Requires an owned running app with its matching application security audit and active owned forwarding. Does not change reading state. | `diagnostics: "PASS"`, `authenticated: true`, integer `subscriptions` and `sample_articles` (at most one requested article, not a total), `transport: "https"` / `"loopback"`, `https_verified: true` / `false`. Invalid credentials, TLS/connectivity, invalid loopback publication, stopped service, redirects, incompatible API or oversized/malformed responses fail with sanitized stderr and no result JSON. |
 | `rss fetch` | Run feed actualization immediately. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed. |
 | `rss verify` | Restart/recheck the running application before reopening service; briefly interrupts service. | Start fields plus `verified: true`. |
 | `rss replace` | Recreate only the owned application container, preserving its named data volume. | Start fields plus `replaced: true`. |
@@ -599,7 +719,12 @@ import-time singleton. `run` serializes callable callers as well as CLI callers;
 errors raise `RuntimeFailure` or configuration/OS exceptions for the caller to
 handle. `run("backup")`, `run("restore", archive=Path(...), volume="fresh-name")`
 and `run("select-volume", volume="owned-name")` share the same lock and safeguards.
-There are ten operations, not a public command for every helper.
+`run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")`
+uses the same lock and returns only sanitized diagnostics/counts/transport metadata.
+Optional `loopback=True` selects only the verified owned local backend and returns
+`https_verified: false`; omitted/false retains HTTPS. Supply real values
+only in local process memory, never source files or shell arguments. There are eleven
+operations, not a public command for every helper.
 
 ## Development verification
 
@@ -701,7 +826,7 @@ The recovery drill backs up a running and a stopped synthetic-user instance,
 removes its entire leased source container/volume, restores into a fresh volume,
 explicitly selects it, and verifies login, subscription, content, both read/unread
 states and a star through HTTP. It redirects only reserved resource, selection,
-provenance and backup-locator names, retaining production Click behavior, the real
+provenance, backup-locator and Serve-record names, retaining production Click behavior, the real
 ownership checks and lock. Fixture backups use `test-<token>-last-backup.json`,
 removed during fixture cleanup; the user's `last-backup.json` bytes (or absence)
 are preserved by this drill. The separate VM-restart tests still exercise normal
@@ -711,7 +836,8 @@ isolated recovery drill, not a second physical Mac demonstration.
 Cleanup removes only those fixtures. The installed-state replacement test invokes
 unchanged production Click `replace` in a subprocess with application, data volume,
 preflight-container, selection and provenance names redirected to reserved test
-names. It retains
+names. Both fixture runners force loopback mode and use reserved Serve-record names
+so they cannot remove/reconfigure the real application's private forwarding. It retains
 the real VM/connection ownership checks and command lock, uses the existing owner
 record (never a fabricated copy), and verifies subscription, article content and
 read/star state through authenticated HTTP after replacement. Cleanup is anchored
@@ -752,7 +878,8 @@ standard reached main separately through PR #10 (`d991e39`).
 [PR #11](https://github.com/brucepucci/rss-aggregator/pull/11) integrated #9 into
 #1's branch (`f88ea85`), not main. PR #13 subsequently delivered **both #1 and #9**
 to main as squash commit `22ea43e`, separate from #8. PR #15 delivered issue #2
-as `3cb1aed`. This branch fixes issue #14; publication, review and merge remain
+as `3cb1aed`, and PR #16 delivered issue #14 as `cb5ed36`. This branch implements
+issue #3; publication, review and merge remain
 separately authorized. Hooks are activated
 per checkout only by explicit setup (and shared by linked worktrees).
 
@@ -792,6 +919,66 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **Issue #3 local verification (`issue-3`, based on `cb5ed36`):**
+  `uv sync --locked` succeeded. Final `uv run --locked rss-dev check` passed **190
+  default tests in 78.40s**, six live deselected, with Ruff lint/format clean.
+  Thirty-six new command/runtime checks cover scoped forwarding, repetition,
+  ownership/handler/target/Funnel conflicts, certificate/policy/disconnection errors,
+  effective authentication/API/base-URL gates, installer/security refusal, backup
+  resume, reserved fixture records, hidden prompts, sanitized API results and
+  explicit loopback diagnostics/refusal before transmitting credentials to unverified
+  publications. Invalid opt-in on `replace` is refused before any service mutation;
+  malformed HTTP status lines are sanitized rather than leaking upstream content.
+  Tracer regressions failed before fixes. An earlier baseline passed 166 tests but
+  failed lint/format; explicit corrections and full reruns passed. `rss --help` and
+  `rss api-check --help` were checked against the command reference; `git diff --check`
+  passed. No separate typechecker is configured.
+
+  With the existing ownership directory, `RSS_TAILSCALE=1`, a private external
+  `RSS_BACKUP_DIR` and normal fixture-file permissions,
+  `uv run --locked pytest -p no:cacheprovider -m live -q --tb=short` passed **six
+  tests in 66.79s** (189 default deselected). This retained suite exercises real
+  security failure/recovery, synthetic-user HTTP state/persistence, replacement and
+  source-absent recovery. A real private `start` afterward restored forwarding and
+  the application security audit. Both effective Apache PHP gates (PHP 8.4.27,
+  upload progress disabled, probes removed), cron, immediate fetching and installed
+  HTTPS/API authentication settings passed. Loopback-only publication is unchanged.
+  After that live run, an API protocol-error redaction guard was added and the full
+  default baseline rerun; the six-test live suite was not repeated for that
+  diagnostic-only guard (its failure is covered by the isolated HTTP boundary).
+
+  Human-assisted acceptance: the user completed the installer and set web/API
+  credentials locally; both actual ReadKit clients (macOS on the Air and iPhone)
+  accept the instance origin unchanged, without `/api/greader.php`, and display the
+  public feed. The user confirmed all four read/unread and star/unstar cross-client
+  checks with FreshRSS web corroboration, no certificate-warning bypass, and roughly
+  **30 seconds** of observed propagation (not an SLA). Normal stop created a verified
+  external backup, removed the owned route, closed loopback HTTP and stopped only
+  the VM while Tailscale remained connected; the user confirmed both clients could
+  not sync. After normal private start, both clients synchronized and the deliberately
+  read/starred article retained both markings. Repeated starts/stops and isolated
+  unrelated-route preservation checks pass; the real pre-existing Serve config was
+  empty. See the [sanitized device checkpoint](docs/tailscale-readkit.md).
+
+  Diagnostics/failures: the iPhone initially exposed HTTP 503 because split optional
+  boolean flags stopped PHP getopt parsing, leaving the API off and anonymous reading
+  on. Serving was stopped with a verified backup; `--option=value` and effective
+  read-back gates fixed it. iPhone HTTPS and loopback GReader diagnostics now PASS.
+  The user's real `api-check --loopback` returned authenticated true, one subscription
+  and one sampled article; deliberately invalid local credentials returned HTTP 401.
+  The mini's own HTTPS-origin requests still fail during TLS, despite successful
+  remote clients and certificate-only retrieval. Default HTTPS `api-check` remains
+  unverified on this host; the explicitly approved loopback mode truthfully reports
+  `https_verified: false`, never an implicit TLS bypass. A certificate probe using
+  `/dev/null` as a key destination exited 1; certificate-only retrieval then exited 0,
+  with no private key saved by the probe. CLI 1.104.7 and daemon 1.104.2 differ; no
+  upgrade, restart or speculative policy broadening was performed. Real certificate/
+  policy failure injection and exact reader app/OS versions were not recorded; isolated
+  failures are not live infrastructure evidence. No new CI, Python 3.10 or Linux/x86
+  result is claimed. Temporary private verification backups are retained outside Git,
+  **not durable user backup configuration**. The application is left running privately;
+  publication, review and merge remain separate user choices.
 
 - **Issue #14 local checkpoint (`fix/issue-14-cask-inventory`, based on `3cb1aed`):**
   `uv sync --locked` succeeded. Before changes, `uv run --locked rss-dev check`
@@ -914,8 +1101,11 @@ observer removal, not the changed test suite.
   and Linux/Mac integration responsibilities. Extend the existing entrypoint and
   workflow rather than introducing a competing baseline. Feature issues retain
   their own acceptance tests; passing mocks is not real-service evidence.
-- ReadKit/device/tailnet access, private-feed authorization and destructive cleanup
-  remain unimplemented/unverified. Backup/restore verification is separately scoped
+- Issue #3's local checkpoint records actual HTTPS/ReadKit authentication,
+  bidirectional state and restart persistence on the Air and iPhone. The mini's
+  own HTTPS diagnostic path remains unresolved; explicit loopback diagnostics do
+  not prove HTTPS. Private-feed authorization and destructive cleanup remain
+  unimplemented/unverified. Backup/restore verification is separately scoped
   in the issue #2 checkpoint. The volume is not a
   backup. No baseline pass or historical run establishes complete acceptance,
   production security or permission to merge.
@@ -927,4 +1117,5 @@ observer removal, not the changed test suite.
 - [Private Tailscale access and shared reading state](docs/adr/0003-private-tailscale-access-and-shared-reading-state.md)
 
 These decisions describe accepted architecture. The local runtime above implements
-#1's local runtime plus #2's backup/recovery slice; remaining features are deferred.
+#1's local runtime, #2's backup/recovery and #3's optional private forwarding/API
+commands; physical-device acceptance remains separately recorded, not implied by implementation.

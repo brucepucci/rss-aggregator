@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rss_aggregator.archives import create_archive, validate_archive
+from rss_aggregator.private_access import PrivateAccess
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -113,6 +114,7 @@ class Recovery:
         if not stop and containers:
             raise self.failure("Writers are still running; snapshot refused.")
         if stop:
+            PrivateAccess(runtime).stop(owner)
             for name in (self.app, self.check):
                 if runtime._exists("container", name):
                     item = runtime._check_label("container", name, owner)
@@ -251,6 +253,7 @@ class Recovery:
         directory = self._directory()
         owner, was_stopped = self._ensure_vm()
         was_running = False
+        was_private = PrivateAccess(runtime).status(owner)["status"] == "running"
         quiesced = False
         try:
             runtime._check_label("volume", runtime.volume, owner)
@@ -264,7 +267,10 @@ class Recovery:
             return self.snapshot(owner, directory)
         finally:
             if was_running and quiesced:
-                runtime._start()
+                if was_private:
+                    runtime._start(private_https=True)
+                else:
+                    runtime._start()
             elif was_stopped:
                 self._engines_idle(owner, stop=False)
                 runtime._run("podman", "machine", "stop", self.machine)
@@ -274,6 +280,7 @@ class Recovery:
         runtime = self.runtime
         owner, machine = runtime._owned()
         if machine["State"] == "stopped":
+            PrivateAccess(runtime).stop(owner)
             return {
                 "machine": "stopped",
                 "already_stopped": True,
