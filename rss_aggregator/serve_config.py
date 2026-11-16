@@ -79,9 +79,10 @@ class ServeConfigClient:
 
     def __init__(self, runtime: Runtime) -> None:
         """Discover a supported endpoint without exposing credential diagnostics."""
-        from rss_aggregator.runtime import RuntimeFailure
+        from rss_aggregator.runtime import RuntimeFailure, ServeConfigRejected
 
         self._failure = RuntimeFailure
+        self._rejected = ServeConfigRejected
         self._port: int | None = None
         self._socket_path: str | None = None
         self._headers = {"Host": _HOST}
@@ -152,21 +153,24 @@ class ServeConfigClient:
 
         Raises
         ------
+        ServeConfigRejected
+            On invalid input before a request or concurrent modification (HTTP
+            412), when this operation is known not to have applied a change.
         RuntimeFailure
-            On invalid input, concurrent modification (HTTP 412), or request
-            failure. An uncertain write is never retried or rolled back here.
+            On other request failures. An uncertain write is never retried or
+            rolled back here.
         """
         try:
             if not isinstance(config, dict) or not _valid_etag(etag):
                 raise ValueError("Invalid conditional write")
             body = json.dumps(config, allow_nan=False).encode("utf-8")
         except Exception:
-            raise self._failure(
+            raise self._rejected(
                 "Invalid conditional Tailscale Serve configuration."
             ) from None
         status, _, _ = self._request("POST", body, etag)
         if status == 412:
-            raise self._failure(
+            raise self._rejected(
                 "Tailscale Serve configuration changed concurrently; "
                 "inspect local Serve status before retrying."
             )

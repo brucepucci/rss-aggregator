@@ -212,13 +212,24 @@ incoming TCP 443 policy before changing forwarding. It reserves the node's entir
 HTTPS port 443 exclusively for this project; an unowned listener (even one pointing
 to the same backend), another handler, or Funnel on that listener causes refusal.
 This includes foreground-session listeners, checked before any VM/application changes.
-Other ports and Tailscale virtual services are preserved. There is no reset/adoption/bypass
-flag. This preflight does not prove each physical client's authorization.
+Private-start preflight also checks enabled Funnel targets across all ports and
+foreground/virtual-service configurations: a public HTTP proxy (including subpaths)
+or TCP forward to this FreshRSS loopback backend causes refusal without changing
+the foreign route. Endpoint matching normalizes IP literals, including IPv4-mapped
+IPv6, and treats local unspecified IPv4 destinations as conflicts too. Genuinely
+unrelated ports/services and private forwarding on
+other ports are preserved. There is no reset/adoption/bypass flag. This preflight
+does not prove each physical client's authorization.
 
 Forwarding mutations use the existing daemon's LocalAPI: read configuration and its
 ETag together, validate ownership, then conditionally write with that exact
 `If-Match`. A concurrent change causes refusal without an automatic retry or global
-rollback, protecting both start and stop. The CLI's `tailscale debug local-creds`
+rollback, protecting both start and stop. A definitively rejected start (HTTP 412
+or invalid input before sending) restores the preceding local ownership record,
+or removes only the newly created local intent when none existed. It does not
+roll back remote configuration or authorize a later stop to adopt a competing
+client's identical route. Uncertain writes retain pending intent for recovery.
+The CLI's `tailscale debug local-creds`
 provides a loopback port/credential or Unix socket; its output stays private in
 memory and is never executed as shell text. Requests stay local, bypass proxies
 and refuse redirects. Missing credentials/ETag, unsupported debug output or denied
@@ -500,7 +511,8 @@ command is added here.
   installation and inspect its local status. An administrator must approve DNS/HTTPS
   changes and a narrow reader-device-to-Mac TCP 443 grant. The command's effective
   netmap preflight is coarse; authorization from each actual device still needs testing.
-- **Serve ownership/443 conflict:** inspect `tailscale serve status` locally. Preserve
+- **Serve ownership/443 or public-backend conflict:** inspect `tailscale serve status`
+  locally, including Funnel targets on other ports. Preserve
   the other listener, handler or Funnel configuration and resolve ownership manually;
   do not run `serve reset`, edit the ownership record or enable Funnel to bypass it.
   Stop refuses a changed route rather than deleting it. Other applications' ports
@@ -531,7 +543,7 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` restores the observed prior forwarding mode, even after snapshot failure; it does not apply this shell's opt-in. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
-| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted starts can be recovered. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. An inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
+| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted/uncertain starts can be recovered; a definitively rejected write restores the preceding local record or removes the new intent. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. A rejected start grants no new ownership; an inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |

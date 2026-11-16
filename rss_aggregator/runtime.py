@@ -45,6 +45,10 @@ class RuntimeFailure(Exception):
     """Report a lifecycle guard or external command failure without CLI coupling."""
 
 
+class ServeConfigRejected(RuntimeFailure):
+    """Report a conditional Serve write known not to have applied any change."""
+
+
 class Runtime:
     """Manage one checkout's resources using its independently resolved state.
 

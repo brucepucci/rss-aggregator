@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from rss_aggregator.runtime import RuntimeFailure
+from rss_aggregator.runtime import RuntimeFailure, ServeConfigRejected
 from rss_aggregator.serve_config import ServeConfigClient
 
 TCP_CREDS = "curl -u:fixture-token http://localhost:41112/localapi/v0/status\n"
@@ -317,7 +317,7 @@ def test_rejects_malformed_config_or_etag(runtime, transport, body, headers):
     ],
 )
 def test_invalid_etag_cannot_cause_unconditional_post(runtime, transport, etag):
-    with pytest.raises(RuntimeFailure) as error:
+    with pytest.raises(ServeConfigRejected) as error:
         ServeConfigClient(runtime).write({}, etag)
     assert_sanitized(error)
     transport.factory.assert_not_called()
@@ -325,7 +325,7 @@ def test_invalid_etag_cannot_cause_unconditional_post(runtime, transport, etag):
 
 @pytest.mark.parametrize("config", [None, [], {"bad": float("nan")}, {"bad": object()}])
 def test_invalid_write_config_fails_before_connect(runtime, transport, config):
-    with pytest.raises(RuntimeFailure) as error:
+    with pytest.raises(ServeConfigRejected) as error:
         ServeConfigClient(runtime).write(config, TAG)
     assert_sanitized(error)
     transport.factory.assert_not_called()
@@ -334,7 +334,7 @@ def test_invalid_write_config_fails_before_connect(runtime, transport, config):
 def test_cyclic_config_fails_before_connect(runtime, transport):
     config = {}
     config["cycle"] = config
-    with pytest.raises(RuntimeFailure) as error:
+    with pytest.raises(ServeConfigRejected) as error:
         ServeConfigClient(runtime).write(config, TAG)
     assert_sanitized(error)
     transport.factory.assert_not_called()
@@ -345,7 +345,7 @@ def test_412_is_concurrent_sanitized_and_never_retried(
 ):
     sock = queue(transport, reply(SECRET.encode(), status=412))
     client = ServeConfigClient(runtime)
-    with pytest.raises(RuntimeFailure, match="concurrent") as error:
+    with pytest.raises(ServeConfigRejected, match="concurrent") as error:
         client.write({}, TAG)
     assert_sanitized(error)
     assert transport.factory.call_count == 1
@@ -399,6 +399,7 @@ def test_transport_failures_are_sanitized_and_not_retried(
         client.read() if method == "read" else client.write({}, TAG)
     assert_sanitized(error)
     if method == "write":
+        assert not isinstance(error.value, ServeConfigRejected)
         assert "outcome may be unknown" in str(error.value)
         assert "Inspect local Serve status before retrying" in str(error.value)
     else:

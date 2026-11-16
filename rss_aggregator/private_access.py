@@ -5,9 +5,10 @@ import json
 import os
 import re
 from http.client import HTTPException
+from ipaddress import IPv6Address, ip_address
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from rss_aggregator.serve_config import ServeConfigClient
@@ -33,10 +34,11 @@ class PrivateAccess:
 
     def __init__(self, runtime: "Runtime") -> None:
         """Use the runtime's serialized external-command and private-state boundary."""
-        from rss_aggregator.runtime import RuntimeFailure
+        from rss_aggregator.runtime import RuntimeFailure, ServeConfigRejected
 
         self.runtime = runtime
         self.failure = RuntimeFailure
+        self.rejected = ServeConfigRejected
         self.path = runtime.state_dir / SERVE_RECORD
         self._serve_config: ServeConfigClient | None = None
 
@@ -102,6 +104,7 @@ class PrivateAccess:
         config, _etag = self._config_client().read()
         record = self._record(owner)
         self._validate(config, record)
+        self._check_public_backend(config, port)
         netmap = self._query("debug", "netmap")
         rules = netmap.get("PacketFilter")
         if not isinstance(rules, list):
@@ -123,6 +126,52 @@ class PrivateAccess:
                 "Effective Tailscale policy has no incoming TCP 443 grant; obtain approval for a narrowly scoped reader-device rule. No policy was changed."
             )
         return "https://" + host
+
+    def _check_public_backend(self, config: dict[str, Any], port: int) -> None:
+        """Refuse any enabled Funnel reaching this backend, regardless of port.
+
+        Inspect node, foreground and virtual-service configurations without
+        claiming ownership of them. Match loopback proxy/TCP targets by endpoint,
+        not handler path or external listener port; unrelated services stay intact.
+        """
+
+        def reaches_backend(target: str) -> bool:
+            """Normalize local IP targets without DNS or network requests."""
+            try:
+                endpoint = urlsplit(target if "://" in target else "http://" + target)
+                if endpoint.port != port:
+                    return False
+                if endpoint.hostname == "localhost":
+                    return True
+                address = ip_address(endpoint.hostname)
+                if isinstance(address, IPv6Address):
+                    address = address.ipv4_mapped or address
+                # Connecting to IPv4's unspecified address can also reach the
+                # local loopback listener; it is not a separate safe backend.
+                return str(address) in ("127.0.0.1", "0.0.0.0", "::1")
+            except ValueError:
+                return False
+
+        scopes = [config]
+        while scopes:
+            scope = scopes.pop()
+            scopes.extend(scope.get("Foreground", {}).values())
+            scopes.extend(scope.get("Services", {}).values())
+            for address, enabled in scope.get("AllowFunnel", {}).items():
+                if not enabled:
+                    continue
+                handlers = scope.get("Web", {}).get(address, {}).get("Handlers", {})
+                targets = [handler.get("Proxy", "") for handler in handlers.values()]
+                external_port = address.rsplit(":", 1)[-1]
+                targets.append(
+                    scope.get("TCP", {}).get(external_port, {}).get("TCPForward", "")
+                )
+                if any(reaches_backend(target) for target in targets):
+                    raise self.failure(
+                        "Existing Funnel reaches this FreshRSS backend; preserve the "
+                        "foreign route and resolve public exposure locally before "
+                        "private start. No forwarding was changed."
+                    )
 
     def _scope(self, config: dict[str, Any]) -> dict[str, Any]:
         """Select only the node's port 443, leaving service listeners untouched."""
@@ -312,7 +361,9 @@ class PrivateAccess:
         """Publish the security-verified application with a durable ownership intent."""
         self.prepare(owner, port)
         before, etag = self._config_client().read()
-        self._validate(before, self._record(owner))
+        previous = self._record(owner)
+        self._validate(before, previous)
+        self._check_public_backend(before, port)
         record = {
             "owner": owner["token"],
             "host": origin.removeprefix("https://"),
@@ -325,7 +376,16 @@ class PrivateAccess:
         replacement.setdefault("Web", {})[record["host"] + ":443"] = {
             "Handlers": {"/": {"Proxy": record["target"]}}
         }
-        self._config_client().write(replacement, etag)
+        try:
+            self._config_client().write(replacement, etag)
+        except self.rejected:
+            # A definitive refusal grants no new authority over a matching route
+            # installed by another client. Restore only local intent, never Serve.
+            if previous is None:
+                self.path.unlink()
+            else:
+                self.runtime._save(SERVE_RECORD, previous)
+            raise
         after, _etag = self._config_client().read()
         if not self._validate(after, record):
             raise self.failure(

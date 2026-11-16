@@ -15,7 +15,11 @@ passwords and private feed URLs do not belong here.
    project ownership of the node's HTTPS port 443; it deliberately refuses to share
    a port with another project's root handler, subpath or Funnel listener, including
    foreground-session listeners. These are refused before VM/application changes.
-   It leaves other ports, virtual services, certificates and Tailscale itself alone.
+   Enabled Funnel routes on any port that proxy/forward to this FreshRSS loopback
+   backend also cause refusal before backend changes, including subpath proxies
+   and foreground/virtual-service configurations. The foreign route is not changed.
+   Genuinely unrelated ports/services, private other-port forwarding, certificates
+   and Tailscale itself are preserved.
 4. An administrator must approve/enable MagicDNS and HTTPS certificates if absent.
    Certificate hostnames appear in public Certificate Transparency logs. Serve
    remains private; do not configure public DNS, router forwarding or Funnel.
@@ -30,7 +34,12 @@ existing daemon's loopback/Unix-socket transport; its sensitive output is never
 printed or shell-executed. Ownership validation uses the same configuration/ETag
 snapshot as the conditional LocalAPI write (`If-Match`). Concurrent changes refuse
 start/stop without unconditional retry or rollback; unrelated configuration is
-copied unchanged. Unsupported transport/ETag output or LocalAPI permissions fail
+copied unchanged. A rejected start (HTTP 412 or invalid input before sending)
+restores the preceding local ownership record, or removes the newly created local
+intent if there was none; it does not touch remote configuration. A competing
+client's identical route is not thereby adopted by a later status/stop. Unknown
+write outcomes retain pending intent for recovery. Unsupported transport/ETag
+output or LocalAPI permissions fail
 closed, not back to a separate unguarded `tailscale serve` mutation. A write-time
 transport failure can have an unknown outcome: inspect local Serve status before
 retrying, without an automatic rollback. These diagnostic interfaces are

@@ -18,7 +18,8 @@ from test_commands import CommandFixture
 from test_runtime_recovery import ROOT, Engine
 
 from rss_aggregator.cli import main
-from rss_aggregator.runtime import Runtime, RuntimeFailure
+from rss_aggregator.runtime import Runtime, RuntimeFailure, ServeConfigRejected
+from rss_aggregator.serve_config import ServeConfigClient
 
 
 @pytest.fixture
@@ -120,7 +121,7 @@ class PrivateEngine(Engine):
         if self.before_mutation:
             self.before_mutation()
         if etag != json.dumps(self.config, sort_keys=True):
-            raise RuntimeFailure(
+            raise ServeConfigRejected(
                 "Serve configuration changed concurrently; no change applied."
             )
         assert self.published and not self.probes
@@ -164,6 +165,15 @@ class PrivateEngine(Engine):
             return subprocess.CompletedProcess(
                 args, 0, json.dumps([self.connection]), ""
             )
+        if args == (
+            "podman",
+            "machine",
+            "start",
+            "--update-connection=false",
+            "rss-aggregator",
+        ):
+            self.machine["State"] = "running"
+            return subprocess.CompletedProcess(args, 0, "", "")
         if args == ("podman", "machine", "stop", "rss-aggregator"):
             self.machine["State"] = "stopped"
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -283,6 +293,219 @@ def test_foreground_443_conflict_refused_before_application_changes(
     assert not engine.probes
     assert not engine.published
     assert not (runtime.state_dir / "serve.json").exists()
+
+
+@pytest.mark.parametrize("foreground", [False, True])
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("machine_state", ["running", "stopped"])
+def test_non443_funnel_to_backend_refused_before_application_changes(
+    private_runtime, foreground, installed, machine_state
+):
+    runtime, engine = private_runtime
+    engine.installed = installed
+    engine.machine["State"] = machine_state
+    engine.app["State"]["Running"] = machine_state == "running"
+    public = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {
+            "reader.example.ts.net:8443": {
+                "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
+            }
+        },
+        "AllowFunnel": {"reader.example.ts.net:8443": True},
+    }
+    if foreground:
+        engine.config["Foreground"] = {"other-session": public}
+    else:
+        engine.config.update(public)
+    before = copy.deepcopy(engine.config)
+    app_before = copy.deepcopy(engine.app)
+    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
+        runtime.run("start")
+    assert engine.config == before
+    assert engine.machine["State"] == machine_state
+    assert engine.app == app_before
+    assert not engine.reconfigured
+    assert not engine.probes
+    assert not engine.published
+    assert not (runtime.state_dir / "serve.json").exists()
+
+
+@pytest.mark.parametrize(
+    "tcp,target",
+    [
+        (False, "http://127.0.0.1:{port}/subpath"),
+        (False, "http://localhost:{port}"),
+        (False, "127.0.0.1:{port}"),
+        (False, "https+insecure://[::1]:{port}/subpath"),
+        (False, "http://[::ffff:127.0.0.1]:{port}"),
+        (False, "http://[::ffff:7f00:1]:{port}/subpath"),
+        (False, "http://0.0.0.0:{port}"),
+        (True, "127.0.0.1:{port}"),
+        (True, "[::1]:{port}"),
+        (True, "[::ffff:127.0.0.1]:{port}"),
+        (True, "[::ffff:7f00:1]:{port}"),
+        (True, "0.0.0.0:{port}"),
+    ],
+)
+def test_public_backend_detection_checks_endpoint_not_handler_path(
+    private_runtime, target, tcp
+):
+    runtime, engine = private_runtime
+    target = target.format(port=engine.port)
+    engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
+    if tcp:
+        engine.config["TCP"]["8443"] = {"TCPForward": target}
+    else:
+        engine.config["Web"]["other.example.ts.net:8443"]["Handlers"] = {
+            "/nested": {"Proxy": target}
+        }
+    before = copy.deepcopy(engine.config)
+    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
+        runtime.run("start")
+    assert engine.config == before
+    assert not engine.published
+    assert not engine.reconfigured
+
+
+@pytest.mark.parametrize("foreground", [False, True])
+@pytest.mark.parametrize("funnel", [False, True])
+def test_private_start_preserves_unrelated_funnel_or_private_backend_route(
+    private_runtime, foreground, funnel
+):
+    runtime, engine = private_runtime
+    # Enabled public forwarding points elsewhere; forwarding to this backend
+    # on a different port is acceptable only when it remains private.
+    port = (1024 if engine.port != 1024 else 1025) if funnel else engine.port
+    other = {
+        "TCP": {"8443": {"HTTPS": True}},
+        "Web": {
+            "other.example.ts.net:8443": {
+                "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{port}"}}
+            }
+        },
+        "AllowFunnel": {"other.example.ts.net:8443": funnel},
+    }
+    if foreground:
+        engine.config["Foreground"] = {"other-session": other}
+    else:
+        engine.config.update(other)
+    before = copy.deepcopy(engine.config)
+    runtime.run("start")
+    engine.volumes.clear()
+    runtime.run("stop")
+    assert engine.config == before
+
+
+def test_funnel_added_before_final_snapshot_is_also_refused(
+    private_runtime, monkeypatch
+):
+    runtime, engine = private_runtime
+    original_read = engine.read
+    snapshots = []
+
+    def read():
+        if len(snapshots) == 2:
+            engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
+            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
+                "Proxy": f"http://127.0.0.1:{engine.port}"
+            }
+        snapshot = original_read()
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(engine, "read", read)
+    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
+        runtime.run("start")
+    assert len(snapshots) == 3
+    assert engine.config == snapshots[-1][0]
+    assert "443" not in engine.config["TCP"]
+    assert not (runtime.state_dir / "serve.json").exists()
+
+
+@pytest.mark.parametrize("prior_phase", [None, "inactive"])
+def test_rejected_start_does_not_authorize_identical_foreign_route(
+    private_runtime, monkeypatch, prior_phase
+):
+    runtime, engine = private_runtime
+    record_path = runtime.state_dir / "serve.json"
+    previous = {
+        "owner": "test-owner",
+        "host": "reader.example.ts.net",
+        "target": f"http://127.0.0.1:{engine.port}",
+        "phase": prior_phase,
+    }
+    if prior_phase:
+        record_path.write_text(json.dumps(previous))
+    discovery = MagicMock()
+    discovery._run.return_value = subprocess.CompletedProcess(
+        [], 0, "curl -u:fixture http://localhost:1234/localapi/v0/status\n", ""
+    )
+    client = ServeConfigClient(discovery)
+    statuses = []
+    competing = []
+
+    def respond(method, body=None, etag=None):
+        assert method == "POST"
+        if not statuses:
+            # A different client wins with the exact route this start wanted.
+            engine.config = json.loads(body)
+            competing.append(copy.deepcopy(engine.config))
+            statuses.append(412)
+            return 412, [], b""
+        engine.config = json.loads(body)
+        statuses.append(200)
+        return 200, [], b""
+
+    monkeypatch.setattr(client, "_request", respond)
+    monkeypatch.setattr(
+        engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
+    )
+    monkeypatch.setattr(engine, "write", client.write)
+    with pytest.raises(RuntimeFailure, match="concurrent"):
+        runtime.run("start")
+    after_rejection = (
+        json.loads(record_path.read_text()) if record_path.exists() else None
+    )
+    try:
+        forwarding = runtime.run("status")["forwarding"]["status"]
+    except RuntimeFailure:
+        forwarding = "refused"
+    engine.volumes.clear()
+    try:
+        runtime.run("stop")
+    except RuntimeFailure as error:
+        assert "project-owned" in str(error)
+    assert statuses == [412]
+    assert engine.config == competing[0]
+    assert forwarding != "running"
+    assert after_rejection == (previous if prior_phase else None)
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_uncertain_start_retains_pending_recovery_intent(
+    private_runtime, monkeypatch, applied
+):
+    runtime, engine = private_runtime
+    original_write = engine.write
+
+    def uncertain_write(config, etag):
+        if applied:
+            original_write(config, etag)
+        raise RuntimeFailure("Write outcome may be unknown; inspect locally.")
+
+    monkeypatch.setattr(engine, "write", uncertain_write)
+    with pytest.raises(RuntimeFailure, match="unknown"):
+        runtime.run("start")
+    record = json.loads((runtime.state_dir / "serve.json").read_text())
+    assert record["phase"] == "pending"
+    assert runtime.run("status")["forwarding"]["status"] == (
+        "running" if applied else "stopped"
+    )
+    monkeypatch.setattr(engine, "write", original_write)
+    engine.volumes.clear()
+    runtime.run("stop")
+    assert engine.config == engine.original
 
 
 def test_private_start_preserves_unrelated_foreground_and_virtual_services(
