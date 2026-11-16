@@ -89,7 +89,9 @@ installer until you choose SQLite and authenticated web login locally.
 stopped application or restarts/rechecks a running one. `replace` removes only
 the owned application container and recreates it with the same selected named
 volume and current configuration. Use it for reviewed container/image/port changes;
-it is not data deletion. Browser sessions can expire after replacement; sign in
+it is not data deletion. For port changes, first follow the
+[verified-backup, job removal and recapture procedure](configuration.md#changing-the-loopback-port);
+installed jobs retain the old port unless explicitly reconfigured. Browser sessions can expire after replacement; sign in
 again and verify subscriptions, articles and reading state. For a restored volume,
 [matching first activation](backup-restore.md#format-version-1) is required before
 an intentional image update.
@@ -407,7 +409,7 @@ This is source verification, not a new live session; see
   do not delete, relabel or edit JSON to force adoption. Recovery is a deliberate
   decision, not a reason to rerun setup with a new identity.
 - **Port occupied / wrong container configuration:** choose an unused `RSS_PORT`
-  consistently and follow [port changes](configuration.md). Apply reviewed container
+  consistently and follow [port changes](configuration.md#changing-the-loopback-port). Apply reviewed container
   changes with `replace`; do not terminate foreign listeners or remove the data volume.
 - **Homebrew upgrade approval required:** inspect private `install-preview.json`.
   This invocation has not installed anything; resolve the dependency plan explicitly.

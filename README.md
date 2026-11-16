@@ -150,7 +150,7 @@ new shells. The CLI does not load a `.env` file automatically.
 | Setting | Default and ordinary use |
 | --- | --- |
 | `RSS_BACKUP_DIR` | **No default; required for backups and shutdown with data.** Absolute private directory outside Git. Permissions are not encryption; keep durable independent copies. |
-| `RSS_PORT` | Optional, `8080`. Choose an unused port in `1024–65535` consistently; an existing container requires `replace` and an installed instance needs the correct base URL. |
+| `RSS_PORT` | Optional, `8080`. Choose an unused port in `1024–65535` consistently. For installed instances, follow the [guarded port-change procedure](docs/configuration.md#changing-the-loopback-port): verified backup and captured-job removal/disablement must precede base-URL/replacement changes. |
 | `RSS_TAILSCALE` | Optional, `0` (local browser only). Set `1` for private HTTPS after the [ReadKit prerequisites](docs/tailscale-readkit.md#prerequisites-and-ownership). |
 | `RSS_STATE_DIR` | Optional, `<checkout>/.local`. Private ownership records, **not the database**. Keep one controlling checkout; another worktree must explicitly use the original directory, not copy/fabricate it. |
 

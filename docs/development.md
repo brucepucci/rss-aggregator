@@ -319,6 +319,17 @@ The application-failure fixture substitutes only the socket port-bind boundary
 because its disposable HTTP server stands in for Podman's listener; separate
 command tests cover actual port-conflict refusal.
 
+`tests/test_supervision_forwarding.py` starts a synthetic previously private
+instance through the public Runtime boundary, returns it to loopback and retains
+the inactive forwarding record. It compares shared/separate Tailscale executable
+directories, removes the interactive PATH after registration, and checks healthy
+observation plus guarded recovery. Only Podman stays in-process: Tailscale/launchctl
+are disposable executables, and production LocalAPI discovery/client code reaches
+a disposable loopback HTTP server while preserving unrelated routes. Missing
+Tailscale before capture or afterward must refuse without changing app/ownership
+state; a never-private instance still does not require Tailscale. These fixtures
+do not demonstrate native daemon/launchd compatibility or trusted HTTPS.
+
 The registration subprocess imports the CLI and standard library under its native
 platform **before** selecting the mocked Mac operation policy. Selecting Darwin
 before import makes Linux `urllib.request` request the unavailable macOS-only
@@ -352,7 +363,8 @@ both feature suites. A focused iteration command is:
 ```sh
 uv run --locked pytest tests/test_supervised_backups.py \
   tests/test_vm_start_lock.py tests/test_runtime_cold_start.py \
-  tests/test_fixture_namespaces.py tests/test_supervision.py tests/test_backup_schedule.py \
+  tests/test_fixture_namespaces.py tests/test_supervision.py \
+  tests/test_supervision_forwarding.py tests/test_backup_schedule.py \
   tests/test_backups.py tests/test_backup_forwarding_state.py
 # Always follow focused checks with the complete check-only baseline:
 uv run --locked rss-dev check

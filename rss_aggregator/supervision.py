@@ -500,11 +500,10 @@ class Supervision:
                 "Set valid RSS_PORT (1024–65535) and RSS_TAILSCALE (0 or 1)."
             )
         dependencies = {}
-        for name in (
-            "launchctl",
-            "podman",
-            *(("tailscale",) if private == "1" else ()),
-        ):
+        names = ["launchctl", "podman"]
+        if private == "1" or PrivateAccess(self.runtime).path.exists():
+            names.append("tailscale")
+        for name in names:
             executable = shutil.which(name)
             if not executable:
                 raise ValueError(

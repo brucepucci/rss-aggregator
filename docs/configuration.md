@@ -32,7 +32,7 @@ The named data volume is not a backup, and `.local/` is not a disposable tool ca
 
 | Setting | Required/default and purpose | Change and apply |
 | --- | --- | --- |
-| `RSS_PORT` | Optional; `8080`. Mac IPv4 loopback TCP port, integer `1024–65535`. No LAN/IPv6/all-interface publication. | Export consistently for operational commands, e.g. `export RSS_PORT=8081`. Existing containers need `replace`; installed loopback instances also need the base URL changed as below. Invalid values refuse startup. |
+| `RSS_PORT` | Optional; `8080`. Mac IPv4 loopback TCP port, integer `1024–65535`. No LAN/IPv6/all-interface publication. | Use consistently for operational commands. For an installed instance, take a verified backup with the existing selectors and successfully remove supervision/disable daily backups **before** changing the base URL or port; both jobs retain the captured old port. Follow [Changing the loopback port](#changing-the-loopback-port) for guarded replacement, verification and explicit optional job recapture. Invalid values refuse startup. |
 | `RSS_TAILSCALE` | Optional; `0` (loopback-only). Exactly `1` enables private Serve HTTPS on fixed node port 443; any other value fails. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and incoming TCP 443 authorization. | Keep set for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value. Explicit `backup` restores the observed prior forwarding mode, even after snapshot failure, rather than applying this shell's opt-in. For local-only use, remove owned supervision **before** changing mode: its captured `1` can reopen forwarding despite this shell's `0`. Preserve the stable checkout, existing `RSS_STATE_DIR` and `RSS_PORT`, then set `0` and run guarded `start`/`verify` to remove the owned route and return the installed instance's base URL to loopback; API enablement/passwords remain. Follow the [return-to-local-only procedure](tailscale-readkit.md#stop-resume-and-return-to-local-only-use); optional supervision reinstallation must explicitly capture the intended settings as [documented below](#captured-mac-supervision-configuration). |
 | `RSS_BACKUP_DIR` | Required for explicit/daily backup and shutdown with data; **no default**. Absolute host directory outside this and every other Git checkout. New directory mode `0700`, archives `0600`; an existing directory must be owned by you with no group/other permissions. Destination filesystem must support hard links for atomic non-overwriting publication. | Export before `backup`/`stop`/`backup-enable`, as below. The owner's approved deployment value is explicitly `$HOME/FreshRSS-Backups`, not an implicit default. Daily jobs capture the resolved value: disable/re-enable to change it. Changing it for manual commands chooses a new destination; existing archives are not moved, pruned or uploaded. Not required to validate/restore an archive, or to repeat shutdown of an already-stopped VM. |
 | `RSS_STATE_DIR` | Optional; `<source-checkout>/.local`. Ownership, inventory, lock, recovery-selection and security records; **not** the FreshRSS database location. | Prefer an absolute private path, never tracked by Git; choose any custom location outside Git. Set before setup and use consistently. The implementation expands `~` and resolves relative values against the process working directory; absolute paths avoid ambiguity. Changing it does not adopt or migrate an existing machine. |
@@ -66,8 +66,12 @@ and real power-recovery behavior are limitations, not settings changed by this a
 
 Installation captures absolute checkout, ownership directory, checkout-local
 `.venv/bin/python`, image-configuration SHA-256 and executable locations for
-`launchctl`, `podman` and (with private HTTPS) `tailscale`. Child `PATH` comprises
-those executable directories plus `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`;
+`launchctl`, `podman` and `tailscale` when private HTTPS is enabled **or a retained
+`serve.json` exists**, including inactive forwarding after a return to loopback.
+Previously private health inspection still queries Tailscale, and guarded startup
+uses its LocalAPI for ownership-checked cleanup. Loopback mode does not remove
+that dependency or authorize deleting forwarding ownership evidence. Child `PATH`
+comprises those executable directories plus `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`;
 `HOME`, resolved `RSS_STATE_DIR`, effective `RSS_PORT` and `RSS_TAILSCALE` are
 explicitly captured. `RSS_BACKUP_DIR` is captured only if explicitly set, expanded
 and absolute; it still has **no implicit default**. This deployment's owner-selected
@@ -81,7 +85,9 @@ image configuration, missing executable/dependency lookup and changed owned jobs
 instead of choosing another installation. Keep `.venv` synchronized in the stable
 checkout. For deliberate settings/pin/path changes, take a verified backup, remove
 supervision, apply/verify the change, then explicitly reinstall with the intended
-settings. No package installation or image update is performed by registration.
+settings. Updating code does not rewrite an existing job's captured dependencies;
+use explicit removal/reinstallation to recapture them. No package installation or
+image update is performed by registration.
 
 The supervision service definition is
 `~/Library/LaunchAgents/io.rss-aggregator.supervision.plist` (new file `0600`),
@@ -202,29 +208,122 @@ not permission to uninstall packages that other projects may later use.
 
 ## Changing the loopback port
 
-For an **already installed, running** loopback instance, move to port 8081:
+For an **already installed, running** loopback instance, the example below moves
+to port 8081. Coordinate with the owner: both installed jobs retain their captured
+`RSS_PORT`. Changing only the shell/container can make a later daily backup publish
+a valid archive but fail resumption, leaving a maintenance hold and the app stopped.
+Remove/disable the jobs before any base-URL or port mutation, then recapture only
+those explicitly wanted. See the [supervision safeguards](operations.md#enable-or-remove-supervision)
+and [daily-backup safeguards](backup-restore.md#opt-in-daily-mac-backups).
 
-```sh
-export RSS_PORT=8081
-podman --connection rss-aggregator exec --user www-data rss-aggregator-freshrss \
-  php cli/reconfigure.php --base-url http://127.0.0.1:8081
-./scripts/rss replace
-```
+1. Use the same synchronized **stable controlling checkout**, existing
+   `RSS_STATE_DIR`, old `RSS_PORT`, `RSS_TAILSCALE=0` and explicitly chosen private
+   `RSS_BACKUP_DIR` throughout preparation. From another worktree, export the
+   original ownership directory; never copy or fabricate records. Preserve these
+   paths and old settings privately for diagnosis/recovery. Before removal, record
+   whether each job was enabled, its captured settings/destination and the intended
+   daily **UTC** hour/minute. Inspect the existing private `backup-schedule.json`
+   (`hour`, `minute`, `timezone`) or retained enable result; status does not expose
+   the hour/minute policy directly. If later re-enabling, set shell variables
+   `SAVED_UTC_HOUR` and `SAVED_UTC_MINUTE` to those recorded numeric values, not
+   automatically to the 03:00 default. Do not edit the record or enable a job merely
+   to inspect it.
 
-`podman --connection rss-aggregator` explicitly selects the owned rootless engine;
-`exec --user www-data rss-aggregator-freshrss` runs the following command inside
-that container as the application user. `php cli/reconfigure.php --base-url URL`
-changes the installed FreshRSS origin; it does not install/run host PHP or change
-port publication itself. This upstream command uses its own text output/exit status,
-not project JSON, and fails nonzero for an unavailable container/engine or rejected
-reconfiguration. Do not continue to replacement after a reconfiguration error.
-`replace` then applies the new publication and returns its normal JSON/result contract.
+   With the **old** selectors still exported:
 
-Keep `RSS_PORT` set consistently afterward. A new installation can choose the port
-before first `start`; the browser installer records the origin. Private HTTPS
-startup manages the HTTPS base URL itself; keep `RSS_TAILSCALE` consistent and use
-its [runbook](tailscale-readkit.md) rather than substituting loopback for a private
-origin. No image/container configuration problem justifies deleting the data volume.
+   ```sh
+   ./scripts/rss status && ./scripts/rss supervision-status &&
+     ./scripts/rss backup-status && ./scripts/rss backup &&
+     ./scripts/rss status && ./scripts/rss backup-status
+   ```
+
+   Continue only after successful inspection and backup with `verified: true`;
+   retain the private archive/checksum. Confirm the app resumed normally before
+   proceeding. A fresh manual archive is a recovery point, **not** proof of daily
+   protection or independent host-loss protection. Plain `backup-status` can exit 0
+   while unhealthy; inspect its JSON, including resumption and maintenance.
+2. Still with those old selectors, remove both owned jobs (safe no-ops if absent):
+
+   ```sh
+   ./scripts/rss supervision-remove && ./scripts/rss backup-disable &&
+     ./scripts/rss supervision-status && ./scripts/rss backup-status
+   ```
+
+   Require successful removal: supervision returns `enabled: false`,
+   `state: "disabled"`; backup disable returns `enabled: false`. Confirm status
+   still shows supervision disabled and backup `enabled: false`, `registered: false`.
+   These operations preserve app, VM, intent, data, archives and backup evidence;
+   they remove the owned registrations, not the instance. **Stop on any error**,
+   contention, changed/unowned job or uncertain removal; if only one removal
+   succeeds, leave it removed and resolve the other before continuing. Never
+   hand-edit/delete jobs, ownership records, locks or maintenance holds to bypass
+   refusal. Do not change the base URL or export the new port until both removals
+   succeed.
+3. Keep checkout/state/destination/mode unchanged; choose an unused loopback port
+   (do not terminate a foreign listener). Only now apply the new origin/publication:
+
+   ```sh
+   export RSS_PORT=8081
+   podman --connection rss-aggregator exec --user www-data rss-aggregator-freshrss \
+     php cli/reconfigure.php --base-url http://127.0.0.1:8081 &&
+     ./scripts/rss replace && ./scripts/rss verify && ./scripts/rss status
+   ```
+
+   `podman --connection rss-aggregator` selects the owned rootless engine;
+   `exec --user www-data rss-aggregator-freshrss` runs PHP inside that container,
+   not on the host. Upstream `php cli/reconfigure.php --base-url URL` changes the
+   installed origin, not the listener; it emits text and fails nonzero on engine,
+   container or reconfiguration errors. The `&&` chain stops on failure.
+   `replace` recreates only the owned application container on the same selected
+   named volume; `verify` restarts/rechecks it through the security/readiness/cron/
+   fetching gates. Neither changes persisted operator intent.
+
+   Require `replaced: true` and `verified: true` with
+   `url: "http://127.0.0.1:8081"`; status must report the application running,
+   `http_ready: true` and `forwarding.status: "stopped"` (or `"unconfigured"`).
+   Guarded startup checks the sole IPv4 loopback publication. Open the returned URL,
+   confirm sign-in, loopback links/redirects on the new port, subscriptions, articles
+   and read/star state; sessions may expire. Do not reinstall jobs after a failure.
+   Base-URL mutation and replacement are not atomic: an error may leave the old
+   listener with the new origin, or an app stopped/running for diagnosis. Preserve
+   old settings, source data and the backup; inspect locally before correcting or
+   retrying, rather than assuming rollback or deleting the volume.
+4. Manual operation can leave both jobs disabled. **Only if explicitly wanted**,
+   reinstall supervision and/or re-enable daily backups separately, after successful
+   new-port verification. Do not implicitly activate either previously disabled job.
+   Use the same stable checkout/state, `RSS_PORT=8081`, `RSS_TAILSCALE=0` and the
+   explicitly chosen private `RSS_BACKUP_DIR` (normally the preserved destination;
+   a deliberate new destination does not move old archives). Review all intended
+   captured settings under [supervision configuration](#captured-mac-supervision-configuration)
+   and [daily backup configuration](#daily-backup-configuration).
+
+   ```sh
+   # Optional, explicitly authorized supervision only:
+   ./scripts/rss supervision-install && ./scripts/rss supervision-status
+   # Optional, explicitly authorized daily backups only; use the saved UTC policy:
+   ./scripts/rss backup-enable --hour "$SAVED_UTC_HOUR" --minute "$SAVED_UTC_MINUTE" &&
+     ./scripts/rss backup-status --check
+   ```
+
+   Require healthy supervision observation if installed. Backup enable returns the
+   captured `daily_utc`; compare it with the saved intended UTC schedule. On partial
+   activation/error, stop and inspect retained registration; do not overwrite it or
+   claim success. `backup-status --check` emits JSON then exits 1 until `protected`
+   is true. Disabling pauses daily protection without invalidating the retained
+   archive; recapturing a changed port requires new eligible daily success, not
+   merely a fresh manual backup or registration. Inspect archive age/availability,
+   daily evidence, resumption and maintenance using the
+   [daily failure response](backup-restore.md#daily-check-and-failure-response).
+   Installation/manual checks are not evidence of an actual unattended run.
+
+Keep `RSS_PORT` set consistently afterward. On any backup/resumption failure,
+preserve published archives and holds; follow
+[interruption recovery](backup-restore.md#interrupted-maintenance-and-reconciliation)
+before guarded restart, never delete records to force it. A new installation can
+choose the port before first `start`; the browser installer records the origin.
+Private HTTPS startup manages its HTTPS base URL itself; keep `RSS_TAILSCALE`
+consistent and use its [runbook](tailscale-readkit.md) rather than substituting a
+loopback origin.
 
 ## Persisted FreshRSS preferences and logs
 

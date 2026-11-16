@@ -44,7 +44,10 @@ owned per-user LaunchAgent/ledger. No shell, automatic `.env`, privileged servic
 package installation or host security/power change is involved. The GUI-session
 job requests a tick at load and every 60 seconds; normal-session availability is
 required. Missing/moved code/dependencies and foreign/changed jobs fail without
-falling back to another checkout or adopting resources.
+falling back to another checkout or adopting resources. Tailscale remains a captured
+dependency while forwarding ownership state exists, including inactive intent in
+loopback mode: health inspection and guarded LocalAPI cleanup still need it.
+Inactive intent is preserved, not removed to avoid dependency capture.
 
 Under the existing nonblocking `command.lock`, a tick first respects intent and
 any crash-persistent `maintenance.json`, then checks owned runtime readiness and

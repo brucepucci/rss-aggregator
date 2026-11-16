@@ -163,6 +163,10 @@ changing this shell alone can let the next recovery tick reopen forwarding.
 
    Follow the [captured-configuration instructions](configuration.md#captured-mac-supervision-configuration)
    and [installation safeguards](operations.md#enable-or-remove-supervision).
+   Keep Tailscale available: the retained inactive `serve.json` still makes health
+   inspection and guarded cleanup depend on its CLI/LocalAPI. Reinstallation captures
+   its executable directory even in loopback mode; never delete ownership evidence
+   to avoid that dependency. Require healthy observation after installation.
    Reinstallation captures the intended settings; it is not a live recovery test.
 
 ## Troubleshooting
