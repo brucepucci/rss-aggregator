@@ -135,7 +135,7 @@ def test_backup_forwarding_query_failure_does_not_leave_stopped_vm_running(
     assert engine.machine["State"] == "stopped"
     before = copy.deepcopy(engine.config)
 
-    def run(*args, check=True, input=None):
+    def run(*args, check=True, input=None, inherit_lock=True):
         if args == (
             "podman",
             "machine",

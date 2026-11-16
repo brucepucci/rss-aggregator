@@ -225,6 +225,44 @@ def test_fixture_cli_preserves_real_intent_and_backup_evidence(
     assert not (project.state_dir / "maintenance.json").exists()
 
 
+def test_supervision_runner_accepts_owner_label_after_guarded_fixture_replacement(
+    fixture_project,
+):
+    project = fixture_project
+    state = project.engine()
+    app = state["containers"][replacement_names(TOKEN)[0]]
+    del app["Config"]["Labels"]["io.rss-aggregator.test"]
+    app["State"]["Running"] = True
+    project.update(**state)
+    before = snapshot(project)
+    result = invoke(project, "supervision", "start")
+    assert result.returncode != 0
+    assert "controlled fixture preflight refusal" in result.stderr
+    assert snapshot(project) == before
+
+
+@pytest.mark.parametrize("lease", [None, "another-fixture"])
+def test_supervision_runner_requires_test_volume_lease_without_container_test_label(
+    fixture_project, lease
+):
+    project = fixture_project
+    state = project.engine()
+    app_name, volume, _check = replacement_names(TOKEN)
+    del state["containers"][app_name]["Config"]["Labels"]["io.rss-aggregator.test"]
+    labels = state["volumes"][volume]["Labels"]
+    if lease is None:
+        del labels["io.rss-aggregator.test"]
+    else:
+        labels["io.rss-aggregator.test"] = lease
+    project.update(**state)
+    before = snapshot(project)
+    result = invoke(project, "supervision", "start")
+    assert result.returncode != 0
+    assert "test ownership mismatch" in result.stderr
+    assert not (project.state_dir / (PREFIX + "operator-intent.json")).exists()
+    assert snapshot(project) == before
+
+
 @pytest.mark.parametrize("fixture_intent", ["running", "stopped"])
 def test_fixture_backup_resumption_uses_fixture_intent_and_retains_shared_hold(
     fixture_project, fixture_intent

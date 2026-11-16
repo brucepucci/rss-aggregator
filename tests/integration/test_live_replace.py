@@ -158,6 +158,14 @@ def test_supervision_recovers_only_disposable_application_and_preserves_reading_
     replacement_instance,
 ):
     fixture = replacement_instance
+    # Prepare the installed fixture through the production guarded CLI so its
+    # container satisfies Runtime.start's listener and security requirements.
+    replaced = fixture.replace()
+    expect(
+        replaced.returncode == 0,
+        "Could not prepare production-gated fixture: " + replaced.stderr,
+    )
+    fixture.login()
     fixture.podman(
         "exec", "--user", "www-data", fixture.name, "php", "app/actualize_script.php"
     )

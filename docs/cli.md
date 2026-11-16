@@ -56,7 +56,7 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | Command | Purpose and prerequisites | JSON result fields |
 | --- | --- | --- |
 | `rss setup` | Inventory/install the missing Podman CLI and initialize the owned rootless VM. Does not start or stop services. Existing unowned resource names and installation plans upgrading/reinstalling existing packages are refused; there is no bypass. | `machine: "rss-aggregator"`, `created: boolean`. |
-| `rss start` | After the maintenance guard passes, persist running intent (even if subsequent startup fails), reset recovery attempts, then start the VM if necessary, restart/reuse or create the application, copy both new-user templates while stopped, pass security/readiness/scheduler/fetching gates, and optionally configure private HTTPS/API. Repeated starts interrupt the application, not create duplicate data/users/subscriptions. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
+| `rss start` | After the maintenance guard passes, persist running intent (even if subsequent startup fails), reset recovery attempts, then start the VM if necessary, restart/reuse or create the application (including guarded cold recreation described below), copy both new-user templates while stopped, pass security/readiness/scheduler/fetching gates, and optionally configure private HTTPS/API. Repeated starts interrupt the application, not create duplicate data/users/subscriptions. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
 | `rss status` | Inspect without starting services. Checks scheduler and HTTP readiness when the app runs; unhealthy cron/readiness, ownership or forwarding checks fail rather than return a healthy result. | `machine`, `application`, selected `volume`, `forwarding`; when available `http_ready`, `scheduler`, `security`. An unconfigured checkout returns only machine/application `"absent"`. With a stopped VM, application is `"unknown"`, not a claim its container disappeared. |
 | `rss api-check [--loopback]` | Prompt locally; check GReader diagnostics and authenticated read access without changing reading state. Requires an owned running app, a matching application security audit and active owned forwarding in **both** modes. | `diagnostics: "PASS"`, `authenticated: true`, integer `subscriptions`, integer `sample_articles` (at most one requested article, not a total), `transport: "https"` / `"loopback"`, `https_verified: true` / `false`. |
 | `rss fetch` | Run feed actualization immediately; requires the owned VM/application to be running. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed; upstream cache/TTL/backoff still apply. |
@@ -71,6 +71,26 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | `rss restore ARCHIVE --volume NAME` | Validate locally, then import into a fresh owned volume. May start only the owned VM; leaves it running. Does not activate the imported data, overwrite an existing volume, or require `RSS_BACKUP_DIR`. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
 | `rss select-volume NAME` | Select an owned volume while the VM runs and the application is stopped/absent. Refuses incomplete imports or recorded-image mismatch. Does not start the app or delete the original volume. | `volume`, `selected: true`, `next_step`. |
 | `rss stop` | After acquiring the project lock, persist stopped intent before maintenance refusal or shutdown (even if already stopped or shutdown fails). Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
+
+### Start and cold recreation
+
+`start` takes no options except `--help`. If this call starts a stopped owned VM,
+a matching stopped application container is removed without force or volume
+deletion and recreated through the pinned-image path on the **same selected named
+volume**. Ownership/port/image/effective-PHP preflight and all existing application
+image/binding/entrypoint/default-command/internal-`LISTEN`/selected-volume checks
+must pass first. A final owned inspection must be unchanged and still stopped;
+foreign, mismatching, changed or running containers do not qualify. Refusal retains
+the container rather than forcing replacement. A running app follows the normal
+restart path. Warm starts (VM already running) retain reuse, including retrying
+both template copies after partial failure.
+
+Cold recreation discards container-layer diagnostics/customizations and may expire
+web sessions, not persisted subscriptions, articles or reading state. Take a
+verified backup before significant live changes. This is not an error-triggered
+fallback: security/readiness failures do not authorize automatic replacement, and
+all post-create security/probe-cleanup/readiness/authentication/forwarding gates
+still apply. See [startup safeguards](operations.md#start-verify-and-replace).
 
 ### Mac supervision commands
 
@@ -187,9 +207,13 @@ changed destination or time requires new eligible success. No pre-target backfil
 See [daily procedures and interruption recovery](backup-restore.md#opt-in-daily-mac-backups).
 
 Commands share one nonblocking `command.lock`: concurrent callers fail rather than
-queue (except read-only busy `backup-status`). Native subprocesses inherit the lock
-so an abruptly killed parent cannot authorize writers during a surviving export.
-It does not serialize independent Podman/Tailscale clients or other external writers.
+queue (except read-only busy `backup-status`). Short-lived native subprocesses
+inherit the lock so an abruptly killed parent cannot authorize writers during a
+surviving export. Only `podman machine start`, in both startup and recovery, omits
+inheritance to prevent long-lived VM helpers retaining the lease; the Python
+parent still holds the lock through the launcher. This is private behavior, not
+a CLI flag. Export/import inheritance and durable maintenance are unchanged.
+The lock does not serialize independent Podman/Tailscale clients or other external writers.
 Durable maintenance blocks writer operations until explicit reconciliation.
 Resources are normally retained for diagnosis, not automatically rolled back or
 deleted. A failed startup can leave the VM running; first-run loopback readiness

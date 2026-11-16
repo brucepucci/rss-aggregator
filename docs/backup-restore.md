@@ -137,8 +137,10 @@ Registration, fake clocks or a manually invoked job are not that evidence.
 ### Interrupted maintenance and reconciliation
 
 A durable hold precedes backup VM/writer mutations and remains through capture
-and resumption. Native subprocesses inherit the project lock: killing a parent
-cannot let supervision restart writers while its export survives. Any
+and resumption. Short-lived native subprocesses inherit the project lock: killing
+a parent cannot let supervision restart writers while its export survives.
+Only `podman machine start` omits inheritance to long-lived VM helpers; the parent
+still holds the lock through startup. Exports/imports retain inheritance. Any
 `maintenance.json` presence, including malformed data or dangling links, blocks
 managed writer operations and supervision.
 Temporary maintenance never changes persisted operator intent; resumption refuses
@@ -235,10 +237,14 @@ update. The marker is managed state, not a user-configurable override.
 ## Consistency and failure behavior
 
 The normal project lock covers backup, restore and explicit volume selection as
-well as lifecycle/supervision commands. Native subprocesses inherit the held lock,
-so an orphaned export retains serialization after its Python parent is killed.
-Supervision also refuses a durable maintenance hold; never delete one to bypass a
-consistency window. See [session recovery response](operations.md#daily-check-and-failure-response).
+well as lifecycle/supervision commands. Short-lived native subprocesses, including
+exports/imports, inherit the held lock, so an orphaned export retains serialization
+after its Python parent is killed. Only the VM launcher (`podman machine start`)
+in startup and Recovery omits inheritance to long-lived helpers; its Python parent
+retains the lock throughout the launcher call. This does not exempt capture or
+import work from serialization. Supervision also refuses a durable maintenance
+hold; never delete one to bypass a consistency window. See
+[session recovery response](operations.md#daily-check-and-failure-response).
 Both rootless and rootful engine states are inspected
 through the verified machine/connection before stopping anything. Foreign running
 workloads cause refusal. All owned application and preflight containers stop, exit

@@ -132,6 +132,13 @@ to stderr and failures return nonzero. `./scripts/rss` is an equivalent launcher
 | `uv run --locked rss api-check` | Prompt for separate API credentials and check private HTTPS/API access. |
 | `uv run --locked rss --help` | Show commands; append `--help` to any subcommand for its syntax. |
 
+When `start` itself starts a stopped owned VM, it can recreate a matching stopped
+application on the same named data volume after all preflight checks. Container-layer
+diagnostics/customizations are discarded and web sessions may expire; persisted
+subscriptions, articles and reading state remain. Warm starts retain reuse. See
+[startup safeguards](docs/operations.md#start-verify-and-replace); a verified backup
+is still required before significant live changes.
+
 For restore, volume selection, replacement and all arguments, flags, defaults,
 outputs and failures, use the [complete CLI reference](docs/cli.md).
 

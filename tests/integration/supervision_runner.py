@@ -25,7 +25,9 @@ def run():
     app, _volume, check = replacement_names(token)
     controller, owner = owned_runtime()
     checked_volume(controller, owner, token, request["volume"])
-    checked_application(controller, owner, token, port, require_test_label=True)
+    # Guarded replacement creates a production-owned container without the test
+    # label. The separately validated test-volume lease anchors its identity.
+    checked_application(controller, owner, token, port)
     expect(
         not controller._exists("container", check), "Fixture preflight name occupied"
     )

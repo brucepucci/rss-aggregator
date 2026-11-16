@@ -49,12 +49,36 @@ Changing the directory is not migration. A new host needs fresh ownership and an
 ## Start, verify and replace
 
 `start` explicitly targets the owned rootless `rss-aggregator` connection. It starts
-the VM if needed, stops/reuses or creates the application container, copies both
-checked-in new-user templates while stopped, checks effective Apache PHP security,
-then verifies HTTP readiness, cron and immediate feed fetching. Repeated starts
+the VM if needed, reuses/restarts or creates the application container (with the
+cold-start exception below), copies both checked-in new-user templates while
+stopped, checks effective Apache PHP security, then verifies HTTP readiness, cron
+and immediate feed fetching. Repeated starts
 briefly interrupt service but do not duplicate the VM, users, subscriptions or
 volume. Existing users' settings/subscriptions are not rewritten by the templates.
 A failed template copy stops startup; retry repeats both copies.
+
+**Cold startup:** only when this start call starts a stopped owned VM, a matching
+stopped application container is removed and recreated on the **same selected
+named data volume**. Ownership, port, pinned image and disposable effective-PHP
+preflight must pass, followed by all existing application image, binding,
+entrypoint, default-command, internal-`LISTEN` and selected-volume checks. A final
+owned inspection must confirm no state/configuration change and that it is still
+stopped. Removal uses neither force nor volume deletion. Foreign, mismatching,
+changed or running containers never qualify; a running app follows the existing
+restart path. Do not use cold startup to migrate a volume or bypass a configuration
+refusal: inspect locally and use explicit `replace` only after reviewing the change.
+Warm starts (VM already running) retain reuse and partial-copy retry behavior.
+
+Recreation discards container-layer diagnostics/customizations and may expire web
+sessions. It preserves subscriptions, articles and read/star state in the named
+data volume; sign in again and verify them. Preserve needed diagnostics before a
+planned cold start and obtain a verified instance backup before significant live
+changes. A fresh container layer avoids carrying disposable runtime files through
+VM shutdown, but the precise failure mechanism is not established. There is no
+automatic replacement fallback after arbitrary security/readiness failures; every
+post-create security, probe-cleanup, readiness, authentication and forwarding gate
+still applies. Real-Podman cold-start acceptance remains an
+[explicit live check](development.md#combined-supervision-and-backup-verification).
 
 The security gate checks the effective web runtime, not just PHP CLI. See
 [the gate design](architecture.md#startup-security-gate). Only enter real
@@ -180,9 +204,14 @@ fetching/forwarding gates remain mandatory.
 
 The nonblocking project lock spans each entire check/recovery/backup/lifecycle
 operation; contention fails visibly and is retried on a later tick, not queued.
-Native children inherit the lock so orphaned work keeps serialization after a
-Python process dies. Backup quiescing does not change intent, and a backup never
-resumes an intentionally stopped application. Independent external writers are
+Short-lived native children inherit the lock so orphaned exports/imports keep
+serialization after a Python process dies. Only the VM launcher (`podman machine
+start`) omits inheritance, in both start and recovery, so long-lived gvproxy/krunkit
+helpers cannot retain the lease indefinitely. The Python parent holds the lock
+through the launcher; durable maintenance remains mandatory. Never unlink a busy
+lock or kill real helpers to make a check pass: inspect locally with the owner.
+Backup quiescing does not change intent, and a backup never resumes an intentionally
+stopped application. Independent external writers are
 not serialized by this lock.
 
 ### Owner-assisted Mac acceptance (not automated evidence)
@@ -398,6 +427,11 @@ This is source verification, not a new live session; see
   protection, or force supervision/start through a hold.
 - **Restore target/image refusal:** use a fresh target and exact reviewed matching
   image configuration. Failed imports stay unselected; choose another fresh name.
+- **Cold-start failure:** guarded recreation applies only when `start` itself
+  starts a stopped owned VM and the existing app is matching, unchanged and stopped.
+  A warm retry does not force recreation or bypass security/readiness errors.
+  Preserve diagnostics and follow [startup safeguards](#start-verify-and-replace);
+  never delete the selected volume or lock as a workaround.
 - **Registry, virtualization or network failure:** restore prerequisites and retry.
   Startup failure need not stop the VM. Other machines are not stopped for you.
 - **PHP/image/security mismatch:** do not enter credentials or bypass the gate.

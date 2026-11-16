@@ -205,12 +205,19 @@ class Runtime:
         print(message, file=sys.stderr)
 
     def _run(
-        self, *args: str, check: bool = True, input: str | None = None
+        self,
+        *args: str,
+        check: bool = True,
+        input: str | None = None,
+        inherit_lock: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Capture an external command with Homebrew mutation safeguards.
 
         Captured stdout remains available for parsing; callers explicitly send
         informational output to diagnostics rather than the JSON result stream.
+        Short-lived native work inherits the lease by default. VM launchers must
+        disable inheritance so their long-lived helpers cannot retain it; the
+        Python caller still holds the lock throughout VM startup.
         """
         env = dict(
             os.environ,
@@ -229,7 +236,7 @@ class Runtime:
                 check=False,
                 # Native work retains serialization if its Python parent dies.
                 pass_fds=(self._command_lock_fd,)
-                if self._command_lock_fd is not None
+                if inherit_lock and self._command_lock_fd is not None
                 else (),
             )
         except OSError as error:
@@ -518,6 +525,7 @@ class Runtime:
     def _start(self, *, private_https: bool | None = None) -> dict[str, Any]:
         """Start serving only after ownership, image, and effective PHP gates."""
         owner, machine = self._owned()
+        cold_start = machine["State"] == "stopped"
         if machine["State"] not in ("stopped", "running"):
             raise RuntimeFailure(
                 "Project VM is "
@@ -551,9 +559,15 @@ class Runtime:
                 )
             self._diagnostic(
                 self._run(
-                    "podman", "machine", "start", "--update-connection=false", MACHINE
+                    "podman",
+                    "machine",
+                    "start",
+                    "--update-connection=false",
+                    MACHINE,
+                    inherit_lock=False,
                 ).stdout
             )
+            self._owned()
         # Collisions must be checked before touching the image or application.
         app = (
             self._check_label("container", APP, owner)
@@ -596,9 +610,20 @@ class Runtime:
                 raise RuntimeFailure(
                     "Existing application image/port/entrypoint differs; use replace after checking configuration."
                 )
-            if app["State"]["Running"]:
+            if cold_start and not app["State"]["Running"]:
+                # A stopped VM can leave stale Apache PID/runtime files in the
+                # container layer. Recreate only after all configuration gates;
+                # the named data volume is never removed or implicitly migrated.
+                current = self._check_label("container", APP, owner)
+                if current != app or current["State"]["Running"]:
+                    raise RuntimeFailure(
+                        "Application changed during cold-start inspection; preserve it and inspect locally."
+                    )
+                self._podman("rm", APP)
+                app = None
+            elif app["State"]["Running"]:
                 self._podman("stop", "--time", "60", APP)
-        else:
+        if app is None:
             image = self._image()
             self._podman(
                 "create",

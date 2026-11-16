@@ -76,7 +76,12 @@ class Recovery:
                     "Another machine is running; it has not been changed."
                 )
             runtime._run(
-                "podman", "machine", "start", "--update-connection=false", self.machine
+                "podman",
+                "machine",
+                "start",
+                "--update-connection=false",
+                self.machine,
+                inherit_lock=False,
             )
             runtime._owned()
         return owner, was_stopped

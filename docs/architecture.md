@@ -53,8 +53,14 @@ normal start path with all security/readiness/authentication/forwarding guards;
 three consecutive attempts use minimum 60s/300s backoff, persisted before mutation.
 Healthy ticks/explicit start reset attempts while retaining ten secret-free recent
 outcomes. Raw external command errors are not retained or copied into jobs/logs.
-Native child processes inherit the lock descriptor so killing the Python parent
-does not let recovery contend with its still-running external work. Independent
+Short-lived native child processes inherit the lock descriptor so killing the
+Python parent does not let recovery contend with its still-running external work.
+The sole exception is `podman machine start`: both explicit startup and Recovery's
+VM-start path call the private `Runtime._run(..., inherit_lock=False)` (default
+`True`). The Python parent holds `command.lock` throughout the launcher call, but
+long-lived gvproxy/krunkit helpers must not inherit and indefinitely retain that
+lease. Exports/imports and all other short-lived native work retain inheritance;
+durable maintenance still blocks writer recovery after interruption. Independent
 Podman/Tailscale clients remain outside this lock.
 
 Status distinguishes registration, session, intent, unknown/unhealthy availability,
@@ -74,6 +80,27 @@ published container port 80. Only after the check passes and cleanup removes all
 project probes (`.project-security-<32 lowercase hex digits>.php`), including stale
 ones, and verifies none remain does Apache open port 80. Cleanup/query failure
 keeps serving closed. The official entrypoint and default command are retained.
+
+When `_start` itself starts a stopped owned VM, a matching **stopped** existing
+application is recreated on the same selected named volume. Ownership, port,
+pinned-image and disposable effective-PHP preflight precede this decision, as do
+all existing application image, binding, entrypoint, default command, internal
+`LISTEN` and selected-volume checks. Immediately before removal, another owned
+container inspection must equal the original and still be stopped. Removal uses
+neither force nor volume deletion; creation follows the existing pinned path.
+Foreign, mismatching, changed or running applications never qualify for this cold
+recreation. A running application follows the existing restart path instead.
+
+This discards disposable container-layer runtime state across a VM shutdown. The
+pinned official entrypoint execs the default Apache command without removing a
+stale Apache PID file; this is rationale for a fresh layer, not proof of the
+precise failure/corruption mechanism. A warm start (VM already running) retains
+container reuse, including partial-template-copy retries. Recreation is not a
+fallback after arbitrary security/readiness errors and does not weaken any
+post-create PHP/probe-cleanup/readiness/authentication/forwarding gate. Container
+layer diagnostics/customizations are discarded and web sessions can expire;
+subscriptions, articles and reading state remain in the selected data volume.
+A verified backup is still required before significant live changes.
 
 Both checked-in new-user templates are copied while the application is stopped
 on every start, including container reuse. Copy failure stops startup; retry copies
@@ -208,10 +235,12 @@ The UTC daily policy and bounded retries are detailed in the
 
 Temporary maintenance and persisted operator intent are deliberately separate.
 A durable, owner-tagged hold precedes quiescing, covers export/publication and
-prior-mode resumption, and survives process death. Runtime subprocesses inherit
-the locked descriptor: an orphaned export retains serialization even after its
-parent is SIGKILLed. Public writer operations and supervision refuse
-any `maintenance.json` presence, including malformed data or dangling links, rather
+prior-mode resumption, and survives process death. Short-lived Runtime subprocesses
+inherit the locked descriptor: an orphaned export retains serialization even after
+its parent is SIGKILLed. Only VM startup disables descriptor inheritance to its
+long-lived helpers; the parent retains the lock through that launcher call. Public
+writer operations and supervision refuse any `maintenance.json` presence, including
+malformed data or dangling links, rather
 than infer that a stopped container is an application failure. Backups
 never write intent, and never resume persisted stopped intent. A failed/uncertain
 capture cannot authorize automatic writer recovery.

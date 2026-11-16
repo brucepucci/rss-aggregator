@@ -225,8 +225,12 @@ The retained live tests cover:
 
 - **Disposable application supervision recovery:** the selected test
   `tests/integration/test_live_replace.py::test_supervision_recovers_only_disposable_application_and_preserves_reading_state`
-  uses the existing synthetic-user fixture, real Runtime start/health/recovery and
-  real HTTP state assertions. It redirects only reserved app/volume/preflight and
+  first prepares the synthetic-user fixture through production `fixture.replace()`
+  and logs in again before real Runtime start/health/recovery and HTTP state
+  assertions. Production replacement creates an owner-labelled application without
+  the test label; the runner validates its identity against the separately retained
+  test-labelled-volume lease, rather than requiring a test label on that app.
+  It redirects only reserved app/volume/preflight and
   audit/intent/registration names, retaining real machine ownership and command
   lock. A synthetic launchctl and scratch HOME job definition mean **no real host
   service activation**; a Podman wrapper preserves the actual caller's HOME/PATH
@@ -339,6 +343,7 @@ both feature suites. A focused iteration command is:
 
 ```sh
 uv run --locked pytest tests/test_supervised_backups.py \
+  tests/test_vm_start_lock.py tests/test_runtime_cold_start.py \
   tests/test_fixture_namespaces.py tests/test_supervision.py tests/test_backup_schedule.py \
   tests/test_backups.py tests/test_backup_forwarding_state.py
 # Always follow focused checks with the complete check-only baseline:
@@ -356,9 +361,24 @@ Maintain cross-feature assertions at the public command/callable boundary:
   bypassed by lifecycle dispatch. Backups never write intent, and manual/daily
   resumption never reopens an intentionally stopped app.
 - Any maintenance presence, including malformed data or dangling links, blocks
-  writer commands and supervisor recovery. One inherited nonblocking `command.lock`
+  writer commands and supervisor recovery. One nonblocking `command.lock`
   serializes both features; contention is not queued or reported as backup success.
   Busy backup-status remains an atomic read-only inspection.
+- `tests/test_vm_start_lock.py` models a VM launcher with a surviving daemon that
+  retains every inherited descriptor. Cover both explicit start and Recovery's
+  stopped-VM backup path: the daemon stays alive but a subsequent command can
+  acquire the lock. Only `podman machine start` opts out of the private `_run`
+  inheritance default; the parent must retain its lease through the launcher.
+  Keep orphan-export interruption regressions too: exports/imports and other
+  short-lived native work must continue to inherit and serialize after parent death.
+- `tests/test_runtime_cold_start.py` exercises the public Runtime boundary with a
+  controlled engine. Assert that only this call starting a stopped owned VM can
+  recreate an unchanged matching stopped app, without force/volume deletion, on
+  the same selected volume. Preserve warm reuse and partial-template-copy retries;
+  retain refusal checks for foreign/mismatching/changed resources and failed
+  preflight/security gates. Recreation must not become a general error fallback,
+  and all post-create gates/cleanup must remain. Synthetic stale-PID behavior tests
+  the chosen policy, not the precise real-world corruption mechanism.
 - Exercise capture/publication/resumption failures and real disposable parent
   interruption while an export survives: the child retains the lock and the hold
   prevents supervisor recovery. Preserve source data and prior good archives;
@@ -371,18 +391,29 @@ Maintain cross-feature assertions at the public command/callable boundary:
   namespaced intent/backup evidence without redirecting the real command lock or
   maintenance guard, including a hold arriving after initial owner inspection.
   Fixture interruption must not bypass shared safety or overwrite real records.
+  Retain the deterministic supervision-runner regression accepting an owner-labelled
+  production replacement without an app test label only under the validated
+  test-labelled-volume lease; removing that lease or changing ownership/volume must
+  still refuse. This is a guard regression, not a live recovery pass.
 - Preserve both opt-in job identities/captured settings and their independent
   disable/remove behavior. No registration, manual archive or manual `backup-due`
   invocation is proof of unattended daily work or healthy remote availability.
 
 These checks exercise controlled command/process/filesystem boundaries, not real
-launchd compatibility or live Podman descriptor behavior. Separately selected
-Mac integration requires owner coordination and a verified pre-change backup;
+launchd compatibility or live Podman descriptor behavior. Real-Podman validation
+of the VM-launcher descriptor exception and guarded cold recreation remains
+outstanding; earlier manual failures are not superseded by controlled regressions
+or fixture preparation changes. Separately selected Mac integration requires
+owner coordination and a verified pre-change backup;
 actual registration/removal, reboot/login, intentional-stop persistence across
 reboot, sleep/power behavior, natural unattended daily timing, trusted reader
 availability, Time Machine retrieval and host-loss recovery remain separate live
-acceptance limits. Do not infer them from the default suite or simulate them
-against production merely to fill evidence gaps.
+acceptance limits. For an approved Mac cold-start check, verify subsequent managed
+commands acquire the lock while VM helpers remain alive, and confirm the same
+selected volume, authenticated subscriptions/articles/read/star state and all
+startup gates. Do not kill helpers or remove the lock to obtain a pass. Do not
+infer live acceptance from the default suite or simulate it against production
+merely to fill evidence gaps.
 
 ## Verification and adoption status
 
@@ -443,13 +474,14 @@ Remaining limits:
   production schedule, create the real owner destination or change host settings
   without that coordination.
 - Supervision and backup orchestration share operator-intent version 1, any
-  maintenance presence and one inherited command lock. Follow the
+  maintenance presence and one command lock. Follow the
   [combined deterministic verification guidance](#combined-supervision-and-backup-verification)
-  for changes to either feature. Native daemonizing Podman helpers must close
-  unrelated inherited descriptors; controlled orphan tests are not evidence for
-  their real descriptor behavior. A stuck inherited lock requires inspection,
-  never unlinking the lock/hold. Live descriptor behavior remains an explicit Mac
-  check, not a guarantee from fixture passes.
+  for changes to either feature. Short-lived native work inherits the lease;
+  only VM launchers omit inheritance so their daemonizing helpers cannot retain
+  it indefinitely. Controlled daemon/orphan regressions are not evidence for
+  real Podman descriptor behavior or cold-recreation recovery. These remain
+  explicit owner-coordinated Mac checks, not guarantees from fixture passes.
+  A stuck lock requires inspection, never unlinking the lock/hold.
 
 - Python 3.10 (declared minimum), other Mac providers/versions, alternate image
   architectures and native Linux rootless-Podman integration remain unverified.

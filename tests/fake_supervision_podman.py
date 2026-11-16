@@ -54,7 +54,7 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         print(
             json.dumps(
                 [{"Names": ["rss-aggregator-freshrss"]}]
-                if app["State"]["Running"]
+                if app and app["State"]["Running"]
                 else []
             )
         )
@@ -70,6 +70,17 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
             else 1
         )
     elif args[:2] == ["container", "inspect"]:
+        if args[2] == "rss-aggregator-freshrss" and state.get("changed_on_recheck"):
+            state["app_inspections"] = state.get("app_inspections", 0) + 1
+            if state["app_inspections"] == 2:
+                changed = state["changed_on_recheck"]
+                if changed == "owner":
+                    app["Config"]["Labels"]["io.rss-aggregator.owner"] = "foreign-owner"
+                elif changed == "running":
+                    app["State"] = {"Running": True, "Status": "running"}
+                else:
+                    app["Config"]["Cmd"] = ["changed-command"]
+            save()
         print(
             json.dumps(
                 [
@@ -92,22 +103,57 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         if app["State"]["Running"] or state.get("fail_export"):
             fail()
         shutil.copyfile(state["payload"], args[args.index("--output") + 1])
+    elif args[0] == "create":
+        mount = dict(
+            part.split("=", 1) for part in args[args.index("--mount") + 1].split(",")
+        )
+        host, port, _container_port = args[args.index("--publish") + 1].split(":")
+        state["app_generation"] = state.get("app_generation", 0) + 1
+        state["app"] = {
+            "Id": "fixture-created-" + str(state["app_generation"]),
+            "Image": state["image"]["Id"],
+            "Config": {
+                **state["image"]["Config"],
+                "Labels": dict(
+                    args[i + 1].split("=", 1)
+                    for i, arg in enumerate(args)
+                    if arg == "--label"
+                ),
+                "Env": [args[i + 1] for i, arg in enumerate(args) if arg == "--env"],
+            },
+            "HostConfig": {
+                "PortBindings": {"80/tcp": [{"HostIp": host, "HostPort": port}]}
+            },
+            "Mounts": [{"Name": mount["source"], "Destination": mount["destination"]}],
+            "State": {"Status": "created", "Running": False},
+        }
+        state.pop("stale_pid", None)
+        save()
     elif args[0] == "run":
         state["checks"][args[args.index("--name") + 1]] = {
             "Config": {"Labels": {"io.rss-aggregator.owner": "fixture-owner"}}
         }
         save()
     elif args[0] == "rm":
-        state["checks"].pop(args[-1], None)
+        if args[-1] == "rss-aggregator-freshrss":
+            state["app"] = None
+        else:
+            state["checks"].pop(args[-1], None)
         save()
     elif args[0] == "stop":
         app["State"] = {"Status": "exited", "Running": False}
         save()
     elif args[0] == "start":
-        app["State"] = {"Status": "running", "Running": True}
+        app["State"] = (
+            {"Status": "exited", "Running": False, "ExitCode": 1}
+            if state.get("stale_pid")
+            else {"Status": "running", "Running": True}
+        )
         save()
     elif args[0] == "cp":
-        pass
+        if Path(args[1]).name == state.get("fail_copy_once"):
+            state.pop("fail_copy_once")
+            fail()
     elif args[0] == "exec":
         if not app["State"]["Running"] and "rss-aggregator-freshrss" in args:
             fail()
@@ -118,6 +164,8 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         elif args[-1] == "echo PHP_VERSION;":
             print("8.4.27")
         elif 'echo file_get_contents("http:' in args[-1]:
+            if args[1] == "rss-aggregator-freshrss" and state.get("fail_app_probe"):
+                fail()
             print(
                 json.dumps(
                     {"php": "8.4.27", "sapi": "apache2handler", "upload_progress": "0"}
