@@ -319,6 +319,14 @@ The application-failure fixture substitutes only the socket port-bind boundary
 because its disposable HTTP server stands in for Podman's listener; separate
 command tests cover actual port-conflict refusal.
 
+The registration subprocess imports the CLI and standard library under its native
+platform **before** selecting the mocked Mac operation policy. Selecting Darwin
+before import makes Linux `urllib.request` request the unavailable macOS-only
+`_scproxy` extension. Keep the subprocess import-guard regression: it models a
+Linux bootstrap without that extension, then exercises owned registration/removal.
+Do not add native-module stubs or relax production platform checks. A Mac pass of
+this guard is not a substitute for running the actual Linux baseline.
+
 Do not run live tests to fill evidence gaps without owner coordination and a
 verified backup. The disposable integration above is separately selected, not
 baseline coverage. Actual normal-user launchd registration/removal, reboot/login,
@@ -358,8 +366,10 @@ Maintain cross-feature assertions at the public command/callable boundary:
   running intent even when a later startup gate fails.
 - A normal stop retains the `BackupSchedule.shutdown` wrapper around recovery:
   attempt/publication/resumption evidence and maintenance handling must not be
-  bypassed by lifecycle dispatch. Backups never write intent, and manual/daily
-  resumption never reopens an intentionally stopped app.
+  bypassed by lifecycle dispatch. Repeated already-stopped shutdown preserves
+  prior effective capture evidence, including failures, without new publication
+  or freshness credit. Backups never write intent, and manual/daily resumption
+  never reopens an intentionally stopped app.
 - Any maintenance presence, including malformed data or dangling links, blocks
   writer commands and supervisor recovery. One nonblocking `command.lock`
   serializes both features; contention is not queued or reported as backup success.
@@ -396,7 +406,12 @@ Maintain cross-feature assertions at the public command/callable boundary:
   test-labelled-volume lease; removing that lease or changing ownership/volume must
   still refuse. This is a guard regression, not a live recovery pass.
 - Preserve both opt-in job identities/captured settings and their independent
-  disable/remove behavior. No registration, manual archive or manual `backup-due`
+  disable/remove behavior. Changed/missing/unsafe definitions and changed/missing
+  loaded path/program/arguments/environment must block `backup-due` before daily
+  reservation, evidence overwrite or engine mutation. Unexpected launchd inspection
+  failures must refuse enable, disable and work while retaining registration;
+  confirmed missing domain/service remains distinct. Use controlled executable
+  exit faults, never native launchd fault injection. No registration, manual archive or manual `backup-due`
   invocation is proof of unattended daily work or healthy remote availability.
 
 These checks exercise controlled command/process/filesystem boundaries, not real

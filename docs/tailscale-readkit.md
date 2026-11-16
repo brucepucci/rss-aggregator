@@ -116,10 +116,54 @@ forwarding stopped with the VM running. Preflight refusal can leave existing
 serving state untouched; failed resumption can leave the application stopped.
 See [backup failure behavior](backup-restore.md#consistency-and-failure-behavior).
 
-To deliberately return to browser-only operation, set `RSS_TAILSCALE=0` and run
-`start`. Recorded owned forwarding is removed and an installed instance's base URL
-returns to loopback; API enablement and API passwords are not erased. Preserve the
-same ownership directory, including after stop.
+To deliberately return to local-only browser operation, **remove owned supervision
+before changing mode**. An installed job retains its captured `RSS_TAILSCALE=1`;
+changing this shell alone can let the next recovery tick reopen forwarding.
+
+1. Coordinate the change with the owner and obtain a verified private instance
+   backup, following the [supervision safeguards](operations.md#enable-or-remove-supervision).
+   Use the same synchronized stable controlling checkout, existing `RSS_STATE_DIR`
+   and `RSS_PORT` throughout, including after stop. From another worktree, explicitly
+   export the original ownership directory; never copy or fabricate its records.
+   With the existing mode still selected:
+
+   ```sh
+   ./scripts/rss supervision-status
+   ./scripts/rss supervision-remove
+   ```
+
+   Continue only after removal succeeds with `enabled: false`, `state: "disabled"`.
+   Removal is repeatable if absent and does not stop FreshRSS or Tailscale, erase
+   intent or delete data/backups. On contention or changed/unowned-job refusal,
+   resolve it locally before continuing; never hand-edit or delete managed records/jobs.
+2. Keep those checkout/ownership/port selectors unchanged, then apply the new mode
+   through the guarded startup and verification path:
+
+   ```sh
+   export RSS_TAILSCALE=0
+   ./scripts/rss start && ./scripts/rss verify && ./scripts/rss status
+   ```
+
+   Require successful results: `start`/`verify` return
+   `url: "http://127.0.0.1:<RSS_PORT>"`, and `status` reports the application running,
+   `http_ready: true` and `forwarding.status: "stopped"` (or `"unconfigured"` if never recorded).
+   Inspect `tailscale serve status` locally to confirm the owned 443 route is gone,
+   preserving unrelated routes. Open the returned loopback URL and confirm sign-in
+   and loopback links/redirects. Recorded owned forwarding is removed and the
+   installed instance's base URL returns to loopback; API enablement and API
+   passwords are not erased. A failed command is not proof access is closed;
+   inspect locally using the [failure safeguards](#troubleshooting) before retrying.
+3. Leave supervision removed for manual operation. If automatic recovery is still
+   wanted, explicitly reinstall only after successful loopback verification, from
+   the same stable checkout with `RSS_TAILSCALE=0` and all intended settings exported:
+
+   ```sh
+   ./scripts/rss supervision-install && ./scripts/rss supervision-status
+   ```
+
+   Follow the [captured-configuration instructions](configuration.md#captured-mac-supervision-configuration)
+   and [installation safeguards](operations.md#enable-or-remove-supervision).
+   Reinstallation captures the intended settings; it is not a live recovery test.
 
 ## Troubleshooting
 

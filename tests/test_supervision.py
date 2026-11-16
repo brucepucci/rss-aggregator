@@ -58,12 +58,14 @@ else: raise SystemExit('unexpected launchctl call')
 
 
 def invoke(command, *args):
+    # Import under the native platform before selecting the mocked Mac policy.
+    # Otherwise Linux urllib tries to load macOS-only _scproxy during bootstrap.
     # The launchctl/Podman executables and HOME are disposable even on Linux CI.
     result = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import sys; sys.platform='darwin'; from rss_aggregator.cli import main; main()",
+            "import sys; from rss_aggregator.cli import main; sys.platform='darwin'; main()",
             *args,
         ],
         env=command.env,
@@ -72,6 +74,33 @@ def invoke(command, *args):
         check=False,
     )
     return result
+
+
+def test_registration_fixture_imports_before_selecting_mocked_mac_platform(tmp_path):
+    command = registration(tmp_path)
+    startup = tmp_path / "python-startup"
+    startup.mkdir()
+    (startup / "sitecustomize.py").write_text(
+        """import sys
+sys.platform = 'linux'
+if sys.argv[1:2] == ['supervision-install']:
+    with open(__file__ + '.checked', 'w') as output:
+        output.write(sys.platform)
+class LinuxImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == '_scproxy':
+            raise ModuleNotFoundError("No module named '_scproxy'")
+sys.meta_path.insert(0, LinuxImports())
+"""
+    )
+    command.env["PYTHONPATH"] = str(startup)
+    installed = invoke(command, "supervision-install")
+    assert (startup / "sitecustomize.py.checked").read_text() == "linux"
+    assert installed.returncode == 0, installed.stderr
+    assert json.loads(installed.stdout)["enabled"] is True
+    removed = invoke(command, "supervision-remove")
+    assert removed.returncode == 0, removed.stderr
+    assert json.loads(removed.stdout)["enabled"] is False
 
 
 def test_opt_in_registration_is_repeatable_and_removal_preserves_other_jobs(tmp_path):

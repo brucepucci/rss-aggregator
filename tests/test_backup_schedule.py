@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from rss_aggregator import Runtime, RuntimeFailure
-from tests.test_backups import ROOT, BackupProject
+from tests.test_backups import APP, ROOT, BackupProject
 
 
 @pytest.fixture
@@ -42,6 +42,10 @@ state = Path(os.environ["BACKUP_TEST_LAUNCH"])
 record = json.loads(state.read_text())
 args = sys.argv[1:]
 if args[0] == "print":
+    failure = int(os.environ.get("BACKUP_TEST_PRINT_FAILURE", "0"))
+    if failure:
+        print("synthetic private launchd diagnostic", file=sys.stderr)
+        sys.exit(failure)
     if not record: sys.exit(113)
     print("path = " + record["path"])
     print("program = " + record["program"])
@@ -197,9 +201,13 @@ def test_contention_is_persisted_as_deferred_not_success(scheduled):
     "changed",
     [
         "definition",
+        "definition-missing",
+        "definition-permissions",
+        "definition-symlink",
         "loaded",
         "loaded-arguments",
         "loaded-environment",
+        "loaded-missing",
         "dependency",
         "python",
     ],
@@ -213,6 +221,16 @@ def test_changed_or_unavailable_scheduler_cannot_appear_protected(scheduled, cha
     original = job.read_bytes()
     if changed == "definition":
         job.write_bytes(b"foreign definition")
+    elif changed == "definition-missing":
+        job.unlink()
+    elif changed == "definition-permissions":
+        job.chmod(0o644)
+    elif changed == "definition-symlink":
+        target = job.with_suffix(".foreign")
+        job.rename(target)
+        job.symlink_to(target)
+    elif changed == "loaded-missing":
+        launch.write_text("{}")
     elif changed == "loaded":
         launch.write_text(
             json.dumps({"path": "/foreign/job.plist", "program": "/foreign/python"})
@@ -233,15 +251,120 @@ def test_changed_or_unavailable_scheduler_cannot_appear_protected(scheduled, cha
         config = json.loads(config_path.read_text())
         config["python"] = "/unavailable/private-checkout/.venv/bin/python"
         config_path.write_text(json.dumps(config))
+    if changed in {"definition", "loaded"}:
+        containers = project.engine()["containers"]
+        containers[APP]["State"] = {"Running": True, "Status": "running"}
+        project.update(containers=containers)
     status = runtime.run("backup-status", now=now)
     assert status["protected"] is False
     assert status["scheduler_problem"]
+    archives = {path: path.read_bytes() for path in project.backups.glob("*.zip")}
+    evidence = {path: path.read_bytes() for path in project.state_dir.glob("*.json")}
+    engine = project.engine()
+    loaded = launch.read_bytes()
+    with pytest.raises(RuntimeFailure):
+        runtime.run("backup-due", now=now + timedelta(days=1))
+    assert project.engine() == engine
+    assert launch.read_bytes() == loaded
+    assert {
+        path: path.read_bytes() for path in project.backups.glob("*.zip")
+    } == archives
+    if changed not in {"dependency", "python"}:
+        assert {
+            path: path.read_bytes() for path in project.state_dir.glob("*.json")
+        } == evidence
     if changed in {"definition", "loaded", "loaded-arguments", "loaded-environment"}:
         with pytest.raises(RuntimeFailure):
             runtime.run("backup-disable")
         assert job.read_bytes() == (
             b"foreign definition" if changed == "definition" else original
         )
+
+
+@pytest.mark.parametrize("code", [1, 5, 127])
+@pytest.mark.parametrize(
+    "operation,existing",
+    [
+        ("backup-enable", False),
+        ("backup-enable", True),
+        ("backup-disable", True),
+        ("backup-due", True),
+    ],
+)
+def test_failed_launchd_inspection_preserves_registration(
+    scheduled, monkeypatch, capsys, operation, existing, code
+):
+    runtime, project, launch = scheduled
+    now = datetime(2026, 11, 16, 3, tzinfo=timezone.utc)
+    job = Path.home() / "Library/LaunchAgents/io.rss-aggregator.backup.plist"
+    config = project.state_dir / "backup-schedule.json"
+    if existing:
+        runtime.run("backup-enable", now=now)
+    definition = job.read_bytes() if job.exists() else None
+    ledger = config.read_bytes() if config.exists() else None
+    loaded = launch.read_bytes()
+    monkeypatch.setenv("BACKUP_TEST_PRINT_FAILURE", str(code))
+    with pytest.raises(
+        RuntimeFailure, match="Cannot inspect backup launchd registration"
+    ) as failure:
+        runtime.run(operation, now=now)
+    assert (job.read_bytes() if job.exists() else None) == definition
+    assert (config.read_bytes() if config.exists() else None) == ledger
+    assert launch.read_bytes() == loaded
+    assert not list(project.backups.glob("*.zip"))
+    assert not (project.state_dir / "backup-daily.json").exists()
+    assert not (project.state_dir / "backup-attempt.json").exists()
+    assert (
+        "synthetic private launchd diagnostic"
+        not in str(failure.value) + capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("code", [3, 113])
+def test_confirmed_absent_launchd_job_can_be_safely_removed(
+    scheduled, monkeypatch, code
+):
+    runtime, project, launch = scheduled
+    job = Path(runtime.run("backup-enable")["job"])
+    launch.write_text("{}")
+    monkeypatch.setenv("BACKUP_TEST_PRINT_FAILURE", str(code))
+    assert runtime.run("backup-disable")["enabled"] is False
+    assert not job.exists()
+    assert not (project.state_dir / "backup-schedule.json").exists()
+    assert launch.read_text() == "{}"
+
+
+@pytest.mark.parametrize("prior_failure", [False, True])
+def test_repeated_stop_preserves_effective_backup_outcome(scheduled, prior_failure):
+    runtime, project, _launch = scheduled
+    now = datetime(2026, 11, 16, 3, tzinfo=timezone.utc)
+    runtime.run("backup-enable", now=now)
+    runtime.run("backup-due", now=now)
+    assert runtime.run("stop", now=now)["already_stopped"] is False
+    assert runtime.run("backup-status", now=now)["protected"] is True
+    if prior_failure:
+        project.update(fail_export=True)
+        with pytest.raises(RuntimeFailure):
+            runtime.run("backup", now=now + timedelta(seconds=1))
+        assert project.engine()["machine"]["State"] == "stopped"
+    before = runtime.run("backup-status", now=now + timedelta(seconds=2))
+    archives = {path: path.read_bytes() for path in project.backups.glob("*.zip")}
+    for second in (3, 4):
+        result = runtime.run("stop", now=now + timedelta(seconds=second))
+        assert result["already_stopped"] is True
+        assert result["backup"] == {"status": "already_stopped"}
+        after = runtime.run("backup-status", now=now + timedelta(seconds=second))
+        assert after["protected"] is (not prior_failure)
+        assert after["latest_attempt"] == before["latest_attempt"]
+        assert after["latest_success"] == before["latest_success"]
+        assert after["daily_attempt"] == before["daily_attempt"]
+        assert after["maintenance_required"] is False
+    assert {
+        path: path.read_bytes() for path in project.backups.glob("*.zip")
+    } == archives
+    archive = Path(after["latest_success"]["archive"])
+    archive.unlink()
+    assert runtime.run("backup-status", now=now)["protected"] is False
 
 
 def test_ordinary_backup_does_not_enable_daily_protection(project):

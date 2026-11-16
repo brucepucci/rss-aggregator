@@ -71,8 +71,12 @@ path, destination, port, forwarding setting and a dependency-only executable PAT
 The job uses no interactive shell, uv, `.env`, aliases or package installation.
 Keep the selected checkout/environment available. Identical enable is repeatable;
 settings changes require disable then enable. Changed policies/destinations require
-new daily evidence; old successes cannot suppress their first eligible capture. Conflicting/unowned/changed job
-files or loaded paths/programs are refused, never replaced or adopted.
+new daily evidence; old successes cannot suppress their first eligible capture.
+The worker validates the exact owned definition and loaded path/program/arguments/
+captured environment before reserving a daily attempt or touching runtime resources.
+Missing, conflicting, unowned or changed registration is refused, never adopted.
+Unexpected launchd inspection errors fail closed during enable, disable and work:
+registration is retained for inspection/retry, not treated as confirmed absence.
 
 Policy is **03:00 UTC daily** by default, adjustable with `--hour`/`--minute`, not
 local daylight-saving time. launchd wakes every **15 minutes** and at load. Actual
@@ -105,7 +109,10 @@ protection). A target with no attempt more than 15 minutes after due is `missed`
 `protected` requires a recent successful eligible daily operation, an available
 verified archive for the selected volume, registration/dependencies and no due,
 maintenance or latest-attempt failure condition. Manual/stop-time backups cannot
-substitute for daily evidence. Status does not rehash archives on every check.
+substitute for daily evidence. Repeating an already-stopped shutdown creates no
+new capture and preserves the prior effective attempt, including a failure; it
+neither invalidates otherwise valid protection nor repairs failed protection or
+refreshes archive age. Status does not rehash archives on every check.
 Manual `backup-due` can exercise eligibility but **does not prove an actual
 unattended launchd run**.
 

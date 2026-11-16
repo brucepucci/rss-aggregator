@@ -62,7 +62,8 @@ class BackupSchedule:
     def _attempt(
         self, operation: Callable[[], dict[str, Any]], kind: str
     ) -> dict[str, Any]:
-        """Keep attempt evidence distinct from archive publication and resumption."""
+        """Keep effective capture evidence; an idempotent stop is not a new capture."""
+        previous = self._read(ATTEMPT) if kind == "stop" else None
         attempt = {
             "started_at": self.now.isoformat(),
             "outcome": "running",
@@ -88,6 +89,14 @@ class BackupSchedule:
             )
             raise
         archive = result if kind == "backup" else result["backup"]
+        if (
+            kind == "stop"
+            and archive.get("status") == "already_stopped"
+            and previous is not None
+        ):
+            # Retain failures too: a no-op cannot repair a failed capture/resumption.
+            self.runtime._save(ATTEMPT, previous)
+            return result
         if archive.get("verified"):
             completed = (
                 self.now if self.controlled_clock else datetime.now(timezone.utc)
@@ -133,7 +142,12 @@ class BackupSchedule:
 
         result = self._launch("print", f"gui/{os.getuid()}/{LABEL}")
         if result.returncode:
-            return False
+            # Match supervision: only missing domain/service establishes absence.
+            if result.returncode in (3, 113):
+                return False
+            raise RuntimeFailure(
+                "Cannot inspect backup launchd registration; inspect the normal user session and captured launchctl permissions. Registration retained."
+            )
         fields = {line.strip() for line in result.stdout.splitlines()}
         arguments = re.search(r"(?ms)^\s*arguments = \{\n(.*?)^\s*\}", result.stdout)
         environment = re.search(
@@ -476,6 +490,10 @@ class BackupSchedule:
         config = self._config()
         if not config or not config["active"]:
             return {"outcome": "disabled"}
+        if not self._job_matches(config) or not self._loaded(config):
+            raise RuntimeFailure(
+                "Backup job is missing, changed or not registered; nothing started. Inspect backup-status and the owned schedule locally."
+            )
         if any(
             os.environ.get(key, default) != value
             for key, value in config["environment"].items()
