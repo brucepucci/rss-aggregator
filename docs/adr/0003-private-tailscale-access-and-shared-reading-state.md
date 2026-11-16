@@ -1,8 +1,8 @@
 # Use private Tailscale HTTPS access to shared FreshRSS reading state
 
-Status: Accepted; private forwarding/API commands implemented locally in issue #3.
+Status: Accepted; private forwarding/API commands delivered by issue #3.
 Human-assisted HTTPS/ReadKit state and restart checks passed on macOS and iOS;
-see the [operational checkpoint](../tailscale-readkit.md) for evidence and limits,
+see the [device evidence](../tailscale-readkit.md#historical-device-evidence-and-limits) for evidence and limits,
 including the mini's unresolved self-HTTPS diagnostic failure.
 
 ReadKit on macOS and iOS must share one FreshRSS user's subscriptions and reading state, and all devices already use Tailscale. Keep the application listener on Mac loopback and use Tailscale Serve for private HTTPS access rather than a public endpoint or direct LAN exposure. Use ReadKit's FreshRSS integration through the Google Reader-compatible API, with a separate API password rather than Google credentials or Fever by default.

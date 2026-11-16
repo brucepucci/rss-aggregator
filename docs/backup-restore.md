@@ -1,9 +1,12 @@
 # Instance backup and recovery
 
-Issue #2 implements [ADR 0002](adr/0002-portable-state-with-consistent-external-backups.md).
-See [README](../README.md#backup-and-restore) for commands, configuration and actual
-verification evidence. This document describes format version 1, not a promise of
-native Linux or cross-architecture recovery support.
+Canonical procedure for complete instance backup, restore and host migration,
+implementing [ADR 0002](adr/0002-portable-state-with-consistent-external-backups.md).
+See the [CLI reference](cli.md) for exact arguments/results,
+[configuration](configuration.md) for settings, and
+[verification limits](development.md#verification-and-adoption-status) for tested scope.
+The supported destination is a compatible Apple Silicon Mac; native Linux,
+cross-architecture and physical second-host recovery are not verified.
 
 ## Scope and trust
 
@@ -17,6 +20,28 @@ transport/store them as credentials. Permissions are not encryption. Integrity
 checks are not signatures: restore only archives you trust. Neither OPML nor the
 VM-native volume itself is an instance backup. The project does not prune archives,
 upload to a cloud service, or delete a VM/volume.
+
+## Create a backup
+
+Choose an absolute private directory outside **every Git checkout**. New backup
+directories are created with mode `0700`; existing directories must already be
+private and owned by you. Archives use `0600`. The destination filesystem must
+support hard links for atomic non-overwriting publication. Permissions are not
+encryption; keep independent copies on durable storage. A copy on the same Mac
+cannot protect against losing that Mac.
+
+```sh
+export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
+uv run --locked rss backup
+# Or back up as part of normal shutdown:
+uv run --locked rss stop
+```
+
+Success returns the archive path, whole-ZIP SHA-256 and verified manifest as JSON.
+Inspect `status` and private `last-backup.json` if resumption fails after publication.
+Do not treat an interrupted unpublished file as a completed archive. Nothing
+prunes, overwrites or uploads prior backups. See [failure behavior](#consistency-and-failure-behavior)
+before assuming a failed operation left the service stopped.
 
 ## Format version 1
 
@@ -100,34 +125,67 @@ and retry. Preflight refusals can leave existing serving state untouched. This
 replaces issue #1's former deferral. A repeat stop of an already-stopped VM does
 not start it or create another archive. There is no bypass to delete data.
 
-## Non-overwriting recovery drill
+## Recovery on this or a clean host
 
-1. Retain an external trusted archive and its reported checksum. Prepare a fresh
-   supported Mac with the reviewed project checkout/configuration, Homebrew, uv,
-   virtualization and network access. The source VM need not exist or be reachable.
-2. Run `uv sync --locked` and `rss setup`. Use a fresh local ownership directory;
-   never fabricate/copy ownership records to adopt another VM.
-3. Run `rss restore /absolute/private/backup.zip --volume rss-recovered`. Validation
-   happens locally first. The command may start the owned VM, but not the app. A
-   fresh target receives the local owner label and imported numeric ownership.
-   Every existing target is refused, even if apparently empty. The currently
-   selected name is also refused even if absent, preventing implicit activation.
-   An incomplete target after import failure is retained unselected and cannot be
-   selected; choose a new name for retry.
-4. If an existing app is running, first stop it using normal `rss stop` with a
-   configured external backup directory before restoring. For an already-restored
-   target after later shutdown, confirm ownership with `rss status` and start only
-   the VM with `podman machine start --update-connection=false rss-aggregator`.
-   Then explicitly run `rss select-volume rss-recovered`.
-   Selection requires a running VM and stopped/absent app. `rss start` creates an
-   absent app; `rss replace` replaces an old stopped app without deleting its
-   original named volume. Restore itself never switches a working instance.
-5. Verify the effective PHP gate, authenticated login, subscription, exact article
-   content, unread/read states and starred state through the restored web instance.
-   Reconfigure a changed base URL inside the restored container as documented in
-   README. An expired PHP browser session is not lost user data; authenticate again.
-6. Configure `RSS_BACKUP_DIR` for the new host before normal shutdown. Keep independent
-   durable copies; no cleanup/pruning command is provided.
+1. Retain a **trusted** external archive and its reported checksum. Prepare a
+   compatible Apple Silicon Mac with Homebrew, uv, virtualization, network access
+   and the reviewed project checkout/configuration matching the archive's exact
+   `image` configuration. The source VM is not required. Check current advisories;
+   an old archive does not authorize bypassing the security gate. Treat the archive
+   as a credential when transferring it.
+2. On a new host use fresh local ownership records; never copy/fabricate
+   `owner.json` from the source. On the existing host retain the original ownership
+   directory and record the selected volume from `status`. If the application is
+   running, **first** run normal `stop` with a working external backup directory.
+   That keeps the original instance recoverable.
+3. Install locked tools and initialize/preserve the owned VM, then restore into a
+   fresh target. Restore validates the complete archive locally **before** VM start
+   or volume creation; it may start the owned VM but never the application.
+
+   ```sh
+   uv sync --locked
+   uv run --locked rss setup
+   uv run --locked rss restore /absolute/private/path/backup.zip --volume rss-recovered
+   uv run --locked rss select-volume rss-recovered
+   # If there is no application container:
+   uv run --locked rss start
+   # If an old stopped application container exists, use replace INSTEAD of start:
+   # uv run --locked rss replace
+   ```
+
+   Every existing target is refused, even an empty owned volume. The currently
+   selected name is refused even when absent, preventing implicit activation.
+   Failed imports retain incomplete targets unselected; `select-volume` refuses
+   them. Choose a different fresh name for retry, not overwrite/delete. Links,
+   unsafe paths, special/sparse files and unsupported versions are rejected;
+   [format limits](#format-version-1) apply to both backup and restore.
+4. Selection requires a running VM and stopped/absent application. Restore leaves
+   the volume unselected. If selecting a previously restored volume after a later
+   VM shutdown, confirm ownership with `uv run --locked rss status`, then start
+   **only** the VM with:
+
+   ```sh
+   podman machine start --update-connection=false rss-aggregator
+   ```
+
+   This upstream command prints text, not project JSON; errors return nonzero.
+   `--update-connection=false` preserves the default connection. It starts the
+   named VM, not the application. Then select the volume and use `replace` (or
+   `start` if no container exists). The original named volume is preserved. To
+   switch back, stop safely and explicitly select that recorded original name;
+   never edit ownership JSON to force selection.
+5. Complete first activation with the exact recorded pin, then verify authenticated
+   login, subscriptions, article content, unread/read and starred state. A pin
+   change after selection is still refused before template writes/startup or
+   replacement of an old container. Only successful activation through all gates
+   releases this compatibility guard; backup alone does not. An expired PHP
+   session is not lost data; authenticate again.
+6. For a changed port/host, apply the [base-URL configuration](configuration.md#changing-the-loopback-port)
+   locally. Recheck [private HTTPS and reader access](tailscale-readkit.md) for a
+   moved host; Tailscale configuration and ownership records are not migrated by
+   the data archive. Do not print archived settings/secrets as evidence.
+7. Set a durable private `RSS_BACKUP_DIR` on the new host before normal shutdown.
+   Keep independent copies and retain the original data until recovery is verified.
 
 ## Image updates and rollback
 
@@ -135,7 +193,9 @@ First complete the initial recovery activation with its recorded matching pin.
 After that, deliberate image updates remain supported. Create a verified pre-update
 backup. Review the replacement official image's current
 advisories, digest, platform and actual PHP configuration, update the pin explicitly,
-then replace and verify application behavior and reading state. No unattended image
+then run `uv run --locked rss replace` and verify security, login, fetching and
+persisted reading state. See [image configuration](configuration.md) and the
+[security policy](architecture.md#image-and-php-security-policy). No unattended image
 update is supported. If rollback is required after a database migration, restore
 the pre-update archive into a fresh volume with the matching image/configuration;
 never point an older release at an arbitrarily newer database.

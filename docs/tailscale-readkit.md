@@ -1,97 +1,39 @@
-# Private Tailscale HTTPS and ReadKit checkpoint
+# Private Tailscale HTTPS and ReadKit
 
-This is the operational runbook for [issue #3](https://github.com/brucepucci/rss-aggregator/issues/3).
-Command syntax, settings, JSON and failure contracts are in [README](../README.md#readkit-connection--private-https).
-Use placeholders in shared evidence; hostnames, device addresses, usernames, tokens,
-passwords and private feed URLs do not belong here.
+Operator runbook for connecting devices to the Mac instance. Start with the
+[local installation](../README.md#getting-started). Exact syntax/results are in
+[CLI reference](cli.md), settings in [configuration](configuration.md), and
+forwarding ownership internals in [architecture](architecture.md#private-https-and-authentication).
+Hostnames, addresses, usernames, passwords, tokens and private feed URLs must stay
+local; use placeholders in shared evidence.
 
 ## Prerequisites and ownership
 
-1. Use the existing Tailscale installation/session on the server Mac, reader Mac
-   and iOS device. Do not replace it or stop it with the application.
-2. Finish the loopback FreshRSS installer with SQLite and form authentication.
-   The PHP security gates must pass before adding credentials.
-3. Check existing Serve listeners locally. This implementation requires exclusive
-   project ownership of the node's HTTPS port 443; it deliberately refuses to share
-   a port with another project's root handler, subpath or Funnel listener, including
-   foreground-session listeners. These are refused before VM/application changes.
-   Enabled Funnel routes on any port that proxy/forward to this FreshRSS loopback
-   backend also cause refusal before backend changes, including subpath proxies
-   and foreground/virtual-service configurations. Authorization and handlers may
-   span node/foreground scopes; handler lookup prefers foreground matches. Virtual
-   services stay in separate routing namespaces. Numeric HTTP proxy targets expand
-   to IPv4 loopback; local empty-host/unspecified/mapped-IP targets are checked too.
-   Numeric TCP forwarding targets are not HTTP proxy shorthand. The foreign route
-   is not changed. Genuinely unrelated ports/services, private other-port forwarding,
-   certificates and Tailscale itself are preserved.
-4. An administrator must approve/enable MagicDNS and HTTPS certificates if absent.
-   Certificate hostnames appear in public Certificate Transparency logs. Serve
-   remains private; do not configure public DNS, router forwarding or Funnel.
-5. Grant only the intended reader devices TCP 443 to the server Mac, including
-   their IPv4/IPv6 addresses as appropriate. Do not grant 8080: the backend stays
-   on `127.0.0.1`. Preserve unrelated grants. Recheck access after device changes.
+1. Use the existing Tailscale installation/session on the server Mac and readers.
+   Do not install another copy or stop Tailscale with the application.
+2. Complete the loopback FreshRSS installer with SQLite and form authentication.
+   PHP security gates must pass before entering credentials.
+3. Inspect `tailscale serve status` locally. The project requires exclusive
+   ownership of the node's HTTPS port 443; an unowned route, another handler/subpath,
+   foreground listener or Funnel causes refusal, even with an identical target.
+   Public Funnel routes reaching this backend on other ports are also refused.
+   Foreign routes are preserved; there is no reset/adoption/bypass flag.
+4. MagicDNS and HTTPS certificates must already be enabled. Obtain approval for any
+   tailnet-wide DNS/HTTPS/policy changes. Certificate hostnames appear in public
+   Certificate Transparency logs even though Serve is private. Do not enable Funnel,
+   public DNS or router forwarding.
+5. Grant only intended reader devices TCP 443 to the server Mac, including IPv4/IPv6
+   as appropriate. Preserve unrelated SSH/SMB/other grants and existing Funnel
+   permissions; do not grant 8080, which remains loopback-only. Recheck after device
+   changes. The command's policy preflight does not prove each device can connect.
 
-Start checks `tailscale status --json`, the local daemon's Serve configuration
-(including foreground sessions), and the effective `tailscale debug netmap` packet
-filter before creating forwarding. `tailscale debug local-creds` discovers only the
-existing daemon's loopback/Unix-socket transport; its sensitive output is never
-printed or shell-executed. Ownership validation uses the same configuration/ETag
-snapshot as the conditional LocalAPI write (`If-Match`). Concurrent changes refuse
-start/stop without unconditional retry or rollback; unrelated configuration is
-copied unchanged. A definitively rejected start (HTTP 401/403 authentication or
-permission refusal, HTTP 412, invalid input, or connection failure before
-transmission) removes the new intent before restoring any preceding record; it
-does not touch remote configuration. If restoration fails (such as full storage
-writing `serve.tmp`), no new authority remains. The command fails with local
-storage/ownership guidance: inspect and resolve ownership before retrying; never
-recreate or hand-edit records to adopt a listener. A competing
-client's identical route is not thereby adopted by a later status/stop. Unknown
-start-write outcomes retain pending intent for recovery. Before a removal request,
-stop persists inactive intent; a persistence error prevents the request. A definite
-refusal restores preceding intent. Confirmed or uncertain removal keeps the retained
-record inactive, even if read-back verification fails: inspect/resolve ownership
-locally rather than automatically adopting/deleting a possibly recreated identical
-listener. Verification errors still fail; this is not proof overall application/VM
-shutdown completed.
-
-For a private or previously private instance, application startup and subsequent
-PHP-security, readiness, scheduler, fetching, authenticated-access
-configuration/read-back and forwarding gates share failure cleanup. On failure (including a late
-public-backend conflict), startup ownership-checks and stops the application,
-leaving data/VM and foreign Serve configuration intact. It does not roll back remote
-writes or discard uncertain-write recovery intent. If ownership/shutdown cannot be
-confirmed, the error warns the backend may remain exposed; inspect and close it
-locally before retrying. This cleanup needs no external-backup configuration and
-does not stop Tailscale. Access-gate cleanup also applies to loopback fallback of
-a previously private instance, so a preserved private other-port route cannot
-continue reaching a backend whose authentication gate failed. Initial preflight
-refusals remain nonmutating; arbitrary future changes by other clients and failures
-before application startup are not covered by this cleanup guarantee. First-run,
-unconfigured loopback behavior is unchanged.
-
-Unsupported transport/ETag output or LocalAPI permissions fail closed, not back to
-a separate unguarded `tailscale serve` mutation. TCP/Unix connection establishment
-is classified before transmission: a failed connect is a definite refusal, not an
-unknown write. Once sending begins, send/response failures remain uncertain
-regardless of exception type. A write-time
-transport failure can have an unknown outcome: inspect local Serve status before
-retrying, without an automatic rollback. These diagnostic interfaces are
-version-dependent. Initial implementation verification combined a read-only GET
-against the existing daemon (with ETag, no mutations) with isolated conditional-write
-and lifecycle tests. That initial check alone is **not live-write/HTTPS evidence**;
-subsequent isolated-candidate live verification is recorded separately in PR #18.
-The netmap is a diagnostic interface, verified against the installed CLI version;
-unrecognized output fails rather than assuming authorization. A TCP 443 rule is
-only a coarse prerequisite, **not proof that both specific clients can connect**.
-No command changes the central policy, enables tailnet-wide HTTPS or uses `--yes`.
-If certificate/access authorization fails, inspect it locally and obtain approval;
-there is no insecure bypass.
+Keep the same ownership directory and `RSS_PORT` for all operations. Another
+worktree must explicitly set `RSS_STATE_DIR` to the original private directory;
+never copy or fabricate `owner.json`/`serve.json` to adopt resources.
 
 ## Connect and verify the server
 
-Use the same `RSS_STATE_DIR`, `RSS_PORT` and private external `RSS_BACKUP_DIR` as
-normal operation. A different worktree must explicitly point at the original
-ownership directory; do not copy the ownership record.
+Keep a private external `RSS_BACKUP_DIR` configured for backup/shutdown.
 
 ```sh
 export RSS_TAILSCALE=1
@@ -99,56 +41,124 @@ export RSS_TAILSCALE=1
 ./scripts/rss status
 ```
 
-Use the HTTPS origin returned locally by `start`. Check the root/login page and
-`/api/` in a browser. Links, redirect destinations and the displayed GReader API
-address should use this same HTTPS origin, not HTTP, loopback or container names.
-FreshRSS recognizes Serve's forwarded protocol itself; Apache forwarded-client-IP
-trust stays disabled. Web login remains form-authenticated; Tailscale identity does
-not become a FreshRSS login.
+Use the private HTTPS `url` returned locally by `start`. Open it and sign in with
+the web password. In **Profile**, set a strong, separate **API password**. Enter
+both only locally, never in command arguments, Git, chat or screenshots. Private
+start enables API access and enforces form login/no anonymous reading or refresh;
+existing users, subscriptions and reading state are retained.
 
-In FreshRSS **Profile**, set a strong API password distinct from the web password.
-Private start enables API access and enforces form login/no anonymous reading or
-refresh. Existing users, subscriptions and reading state are retained.
+Open `<HTTPS-ORIGIN>/api/` and check Google Reader diagnostics. Links, redirects and
+API addresses must use that same HTTPS origin, not HTTP, loopback or container
+names. Tailscale identity does not replace FreshRSS authentication.
 
 ```sh
 ./scripts/rss api-check
 ```
 
-Enter the FreshRSS username and separate API password at the local prompts. JSON
-must report `diagnostics: "PASS"`, `authenticated: true`, subscriptions and a
-sample article. Try an intentionally incorrect password once: expect exit 1 and
-sanitized rejection without JSON. Then repeat with the valid password. Default mode
-POSTs over verified TLS and reports `transport: "https"`, `https_verified: true`;
-redirects are refused rather than forwarding tokens. Do not publish raw HTTP
-responses, HTML, authentication payloads or command tracing.
+Enter the FreshRSS username and API password at local stderr prompts; the password
+is hidden. Success is sanitized JSON: `diagnostics: "PASS"`, `authenticated: true`,
+subscription/sample-article counts, `transport: "https"`, `https_verified: true`.
+The sample requests at most one article, not a total article count. Try an
+intentionally incorrect API password separately: expect exit 1 and sanitized
+rejection without JSON. Then repeat with valid credentials.
 
-The mini's own HTTPS-origin requests currently fail during TLS despite successful
-iPhone diagnostics. The approved supplemental local authentication check is:
+The diagnostic uses POST for credentials, trusted TLS, no ambient HTTP proxy and
+no redirects; never publish raw responses, HTML, tokens or tracing. It requires
+an owned running app with its matching security audit and active owned forwarding.
+
+### Supplemental loopback diagnostic
+
+The historically tested server Mac (mini) cannot complete its own HTTPS-origin
+requests during TLS, despite successful remote clients. This limitation remains
+unresolved. The explicit supplemental authentication check is:
 
 ```sh
 ./scripts/rss api-check --loopback
 ```
 
-It checks only the running/security-verified owned app's actual sole `127.0.0.1`
-publication and still requires active owned forwarding. JSON explicitly reports
-`transport: "loopback"`, `https_verified: false`. This sends no credentials beyond
-loopback and is **not** an insecure TLS bypass or a substitute for HTTPS/client tests.
-There is no automatic HTTPS-to-HTTP fallback. Do not change grants or the Tailscale
-installation to work around an unproven cause.
+It verifies the actual sole owned IPv4 loopback publication and retains the running,
+security-checked app and active-forwarding requirements. It reports
+`transport: "loopback"`, `https_verified: false`. There is no implicit HTTPS-to-HTTP
+fallback. **This does not verify certificates or remote access.** Continue actual
+remote HTTPS/client checks; do not broaden policy, disable TLS verification or
+restart/upgrade Tailscale speculatively.
+
+## Connect ReadKit
+
+On both macOS and iOS, choose **FreshRSS** (Google Reader-compatible API), not Google
+credentials or Fever. Enter **`<HTTPS-ORIGIN>` unchanged, without `/api/greader.php`**,
+the same FreshRSS user and its separate API password. This URL form was verified
+in actual ReadKit on the reader Mac (Air) and iPhone; exact app/OS versions were
+not recorded. The underlying API endpoint is `/api/greader.php`, not the account
+URL used in those checks.
+
+Synchronize both clients and confirm the public feed and articles. Change one
+article's read/unread and star/unstar state in each client, synchronizing both and
+reloading FreshRSS web after each change. Confirm both destinations reflect it.
+No certificate-warning bypass should be needed. Other reader integrations are not
+verified here; consult [FreshRSS mobile access](https://freshrss.github.io/FreshRSS/en/users/06_Mobile_access.html)
+and the [ReadKit FAQ](https://readkit.app/faq).
+
+## Stop, resume and return to local-only use
+
+Normal `stop` removes only matching project-owned forwarding, creates a verified
+external backup and stops the VM. Repeated stop also removes a stale owned route
+when the VM is already stopped. Tailscale stays connected, but stopped FreshRSS
+cannot synchronize; cached articles in readers are not live service availability.
+Keep `RSS_TAILSCALE=1` for later `start`/`verify`/`replace`.
+
+Explicit `backup` temporarily removes forwarding and attempts to restore the
+observed prior application/forwarding state **even if snapshot creation fails**,
+regardless of this shell's opt-in. A previously private service resumes privately,
+and loopback-only remains loopback-only. Failure therefore does not prove access
+is closed. Shutdown export failure after quiescing instead leaves writers and
+forwarding stopped with the VM running. Preflight refusal can leave existing
+serving state untouched; failed resumption can leave the application stopped.
+See [backup failure behavior](backup-restore.md#consistency-and-failure-behavior).
+
+To deliberately return to browser-only operation, set `RSS_TAILSCALE=0` and run
+`start`. Recorded owned forwarding is removed and an installed instance's base URL
+returns to loopback; API enablement and API passwords are not erased. Preserve the
+same ownership directory, including after stop.
+
+## Troubleshooting
+
+- **Prerequisite/policy failure:** inspect the existing Tailscale session; have an
+  administrator approve DNS/HTTPS and a narrow incoming TCP 443 grant. The coarse
+  preflight is not proof of authorization from each actual device.
+- **Ownership/443/public-backend conflict:** inspect `tailscale serve status`
+  locally, including Funnel targets on other ports and foreground listeners.
+  Preserve foreign configuration; never run `serve reset`, hand-edit ownership
+  records or enable Funnel as a workaround. `stop` refuses changed routes.
+- **Concurrent or uncertain forwarding write:** conditional updates refuse races,
+  without automatic retry/rollback. Resolve ownership and availability before
+  retrying. Definitively rejected starts grant no new authority; inactive removal
+  records do not authorize adopting a possibly recreated identical listener.
+  A verification error after removal does not prove the whole shutdown completed.
+- **Late startup failure:** private/previously private post-start gate failures
+  attempt to stop the ownership-checked backend, preserving foreign routes/data/VM.
+  If the error warns cleanup could not be confirmed, the backend may still be
+  exposed; inspect and close it locally before retrying. No backup destination is
+  needed for this safety cleanup. [Failure boundaries](architecture.md#post-start-failure-cleanup).
+- **Certificate/access failure:** check Tailscale on both devices, MagicDNS, HTTPS
+  authorization, clocks/trust stores and local-network permissions if prompted.
+  No shared LAN is required. Never use self-signed-certificate bypasses or `curl -k`.
+- **API/authentication failure:** use the separate API password, confirm API access
+  under Authentication and check `/api/`. A redirect often means a wrong base URL.
+  Direct compatibility checks require the dummy header below; address-bar navigation
+  omits it and can report an Authorization-header failure.
 
 ## Real-HTTPS checks — human-assisted
 
-Use the working Air/iPhone path, not the mini's failing self-HTTPS path. Loopback
-HTTP 401 and isolated redirect tests do not establish these real-HTTPS results.
+These optional diagnostic checks use a working remote device, not the mini's
+failing self-HTTPS path. Loopback HTTP 401 and isolated tests are not HTTPS evidence.
 Do not weaken TLS, change policy or publish raw requests/responses.
 
-1. Begin a fresh ReadKit **FreshRSS** connection check with the existing HTTPS
-   origin/user and a deliberately wrong **API** password; cached synchronization
-   is not a new authentication check. Confirm authentication rejection, cancel the
-   extra setup, and confirm the existing valid account still synchronizes. Do not
-   change the server password or publish either password. Record only the outcome;
-   an HTTP status is optional if safely available.
-2. On the Air, replace `<HTTPS-ORIGIN>` locally and run these credential-free GETs:
+1. Begin a fresh ReadKit FreshRSS connection check with the existing origin/user
+   and an intentionally wrong API password. Cached synchronization is not a fresh
+   authentication check. Confirm rejection, cancel the extra setup and confirm
+   the existing valid account still synchronizes. Record only the outcome.
+2. On the reader Mac, replace `<HTTPS-ORIGIN>` locally and run credential-free GETs:
 
    ```sh
    curl -q -sS --noproxy '*' --proto '=https' --max-redirs 0 \
@@ -164,167 +174,44 @@ Do not weaken TLS, change policy or publish raw requests/responses.
    ```
 
    `-q` ignores curl configuration; `-sS` hides progress but shows errors;
-   `--noproxy '*'` bypasses ambient proxies; `--proto '=https'` permits HTTPS only.
-   TLS verification remains enabled. No `--location` is used and redirects are not
-   followed (`--max-redirs 0`). `-o /dev/null` discards page content; `-w` prints
-   only status and redirect destination. The compatibility request prints its
-   diagnostic body plus status; its header is **dummy diagnostic data**, not a real
-   credential. Expected compatibility output is `PASS`/HTTP 200. Plain browser
-   navigation omits this header and can report an Authorization-header failure;
-   the misspelled `/check/compatability` instead returns HTTP 400.
-   Curl exits nonzero for transport/TLS errors (for example code 35 with HTTP 000);
-   without `--fail`, HTTP error statuses do not themselves make curl exit nonzero,
-   so inspect the printed status/body. Do not substitute an insecure TLS flag.
-3. Inspect each 3xx destination locally: it must stay on the exact same HTTPS
-   origin, never HTTP, loopback, container names or another host. Repeat the first
-   command with that destination until reaching HTTP 200 with no redirect. Do not
-   follow an unexpected origin or submit credentials there. Open `/api/` in Safari
-   and confirm the displayed Google Reader API address uses the same HTTPS origin.
-4. Share only endpoint paths, status codes and same-origin HTTPS yes/no; no full
-   origins, request identifiers, authentication bodies, headers or network exports.
+   `--noproxy '*'` bypasses proxies; `--proto '=https'` permits HTTPS only.
+   TLS verification stays enabled. No `--location` is used; redirects are not
+   followed (`--max-redirs 0`). `-o /dev/null` discards page content; `-w`/`--write-out`
+   print status/redirect information. The compatibility check prints its diagnostic
+   body; its header is **dummy data**, not credentials. Expect `PASS`/HTTP 200.
+   Misspelled `/check/compatability` returns HTTP 400. Transport/TLS errors exit
+   nonzero (e.g. code 35/HTTP 000); without `--fail`, HTTP errors require inspecting
+   the printed status/body. Never substitute an insecure TLS flag.
+3. Inspect every 3xx destination locally: it must remain the same HTTPS origin.
+   Repeat the first command with that destination until HTTP 200/no redirect.
+   Do not follow an unexpected origin or submit credentials there. Open `/api/`
+   in Safari and check displayed Google Reader API addresses.
+4. Share only endpoint paths, status codes and same-origin HTTPS yes/no, not full
+   URLs, identifiers, credentials, headers or network exports.
 
-### Observed remote results after the PR #18 review
+### Historical device evidence and limits
 
-The user confirmed the Air's fresh wrong-API-password rejection and subsequent
-normal valid-account synchronization; no remote authentication HTTP status was
-captured. The Air's curl requests used trusted TLS, no proxy and no redirect
-following; the user supplied these sanitized results:
+Human-assisted issue #3 / [PR #18](https://github.com/brucepucci/rss-aggregator/pull/18)
+checks established the following, not a new run for this documentation change:
 
 | Check | Observed result |
 | --- | --- |
-| `/api/greader.php/check/compatibility` with dummy Authorization header | `PASS`, HTTP 200, no redirect |
-| `/` | HTTP 302 to the same HTTPS origin at `/i/?rid=<REQUEST-ID>` |
-| That exact `/i/` redirect destination | HTTP 200, no further redirect |
-| `/api/` | HTTP 200, no redirect |
-| Browser `/api/` diagnostics and displayed API addresses | Google Reader PASS; API links use the same HTTPS origin, including `/api/greader.php` |
+| Actual ReadKit on Air and iPhone | Origin-only account URL; public feed visible; no certificate bypass |
+| Air → iPhone and FreshRSS web | Read/unread and star/unstar changes passed |
+| iPhone → Air and FreshRSS web | Read/unread and star/unstar changes passed |
+| Normal stop/start | Both clients unable to sync while stopped; subscriptions/articles/read-star state retained after start; Tailscale stayed connected |
+| Air wrong API password | Rejected on fresh connection check; valid account still synchronized; HTTP status not captured |
+| Air `/api/greader.php/check/compatibility` with dummy header | `PASS`, HTTP 200, no redirect |
+| Air `/` | HTTP 302 to same HTTPS origin `/i/?rid=<REQUEST-ID>`, then HTTP 200/no further redirect |
+| Air `/api/` and browser diagnostics | HTTP 200/no redirect; Google Reader PASS; API links on same HTTPS origin |
+| Mini explicit loopback API check | PASS/authenticated with valid credentials; invalid credentials HTTP 401; not HTTPS evidence |
 
-This closes the review's remote invalid-credential and redirect/origin evidence
-gap. It does not claim the mini's own HTTPS failure is fixed, prove rejection of a
-real injected cross-origin redirect, or repeat earlier stopped-client/read-star
-checks. Those earlier device observations remain historical evidence below.
-
-## Actual ReadKit clients — human-assisted
-
-Upstream [FreshRSS documentation](https://freshrss.github.io/FreshRSS/en/users/06_Mobile_access.html)
-requires a per-user API password and links `/api/` diagnostics.
-The [Google Reader API reference](https://freshrss.github.io/FreshRSS/en/developers/06_GoogleReader_API.html)
-documents `<HTTPS-ORIGIN>/api/greader.php` as the API endpoint. The
-[ReadKit FAQ](https://readkit.app/faq) lists FreshRSS support but does not establish
-its account URL field's form. **The user has now verified the instance-origin
-entry `<HTTPS-ORIGIN>` unchanged, without `/api/greader.php`, in ReadKit on the Air.**
-ReadKit on the iPhone also connected using the same instructions. Both show the
-public feed. These actual-app checks, not generic endpoint documentation, establish
-the tested account URL form. Exact app/OS versions were not recorded.
-
-On **both** actual macOS and iOS apps:
-
-1. Record app/OS versions without device names or account identifiers.
-2. Choose the **FreshRSS** integration, not Google or Fever. Use the same FreshRSS
-   user and its separate API password on both devices.
-3. Observe the URL field/help and try the indicated form. Record only whether the
-   accepted form is `<HTTPS-ORIGIN>` or `<HTTPS-ORIGIN>/api/greader.php`, including
-   any trailing-slash requirement. Do not publish the actual origin or credentials.
-4. Synchronize and confirm the public FreshRSS releases feed and fetched articles.
-5. Confirm no certificate warning/bypass. If unreachable, check Tailscale on all
-   devices, current TCP 443 authorization, DNS, clock, certificate trust and any
-   relevant macOS/iOS local-network permission prompt. No shared LAN is required.
-
-### Reading-state matrix
-
-Use identifiable articles from the public test feed, not a private feed. After
-each action, explicitly synchronize both clients and reload FreshRSS's web page.
-Verify the result in **both** destinations; merely displaying articles is not enough.
-
-| Origin | Action | Other ReadKit client | FreshRSS web |
-| --- | --- | --- | --- |
-| macOS ReadKit | read, then unread | Pass (user observed) | Pass (user observed) |
-| iOS ReadKit | read, then unread | Pass (user observed) | Pass (user observed) |
-| macOS ReadKit | star, then unstar | Pass (user observed) | Pass (user observed) |
-| iOS ReadKit | star, then unstar | Pass (user observed) | Pass (user observed) |
-
-The user exercised a single article through iPhone read/star, Mac unread/unstar,
-Mac read/star, then iPhone unread/unstar, checking the other reader and web after
-each step. Propagation was reported as roughly **30 seconds**, not a guaranteed
-latency bound. Optional additional web-originated edits were not separately tested.
-Reading state is server-side; ReadKit synchronization is distinct from publisher
-feed fetching (startup plus UTC minutes 00/20/40, subject to caching/backoff).
-
-### Stop/start and preservation
-
-1. Leave one public article read and starred; record a sanitized baseline.
-2. Run normal `stop` with a private external backup destination. Confirm project
-   forwarding is absent, the VM stops, and **both** readers cannot reach FreshRSS.
-   Cached articles may remain readable; that is not live synchronization.
-3. Tailscale must remain connected and unrelated Serve/services unchanged.
-4. Keep `RSS_TAILSCALE=1` and run `start`, synchronize both clients, and verify
-   subscriptions/articles and the deliberate read/star state are retained.
-5. Repeat start/stop; no duplicate route, instance or subscriptions should appear.
-
-Explicit `backup` attempts to restore prior application/forwarding state after
-quiescing, even on snapshot failure and regardless of the current opt-in setting.
-A failed explicit backup is not proof remote access is closed. Shutdown export
-failure instead leaves writers/forwarding stopped and the VM running; preflight
-refusals may leave existing serving state untouched.
-
-## Sanitized local checkpoint
-
-- **PR #18 local review fixes, after `62626a8`:** full default baseline passed
-  **329 tests in 81.61s**, six live deselected, Ruff lint/format clean. Foreground
-  conflicts, concurrent mutations and backup-state regressions passed; the new
-  LocalAPI adapter has wire-level conditional-write/redaction/failure coverage.
-  Read-only LocalAPI GET/ETag discovery passed on the existing daemon with no
-  mutations. Real conditional writes and live lifecycle checks were not run during
-  implementation. The user subsequently completed the remote invalid-credential
-  and redirect/origin checks above. The older device/runtime results below predate
-  these fixes and were not repeated.
-- `uv sync --locked` and `uv run --locked rss-dev check` pass: **190 default tests
-  in 78.40s**, six live deselected, Ruff lint/format clean. See README's issue #3
-  checkpoint for failure history and the verification scope.
-- With the existing ownership directory, private external backup directory and
-  `RSS_TAILSCALE=1`, `uv run --locked pytest -p no:cacheprovider -m live -q --tb=short`
-  passed **six retained Mac/Podman checks in 66.79s**, 189 default deselected.
-  A final real private start restored serving and the application security audit.
-  A later API protocol-error redaction guard passed the full default baseline;
-  the retained live suite was not rerun for that diagnostic-only change.
-- Real runtime: the user completed the installer locally and reported public-feed
-  articles. Private starts pass both effective PHP gates, cron and fetching.
-- A real iPhone API HTTP 503 exposed incorrect optional-boolean CLI syntax. Serving
-  was stopped with a verified external backup; flags now use `--option=value`, and
-  effective configuration is verified before forwarding. Real loopback GReader
-  compatibility now returns PASS, with API enabled and anonymous access disabled.
-- Tailnet policy: the user approved and applied a narrow reader-device TCP 443 grant;
-  the effective incoming filter then contained TCP 443. No private identifiers recorded.
-- Certificate-only retrieval succeeded; private Serve is running. The user reported
-  iPhone browser reachability. The mini's own HTTPS-origin requests fail during TLS;
-  the user confirmed iPhone `/api/` diagnostics PASS after the fix. ReadKit on the
-  Air and iPhone authenticate and display the public feed. The user confirmed neither
-  device required a certificate-warning bypass. Do not claim default host-side HTTPS
-  `api-check` success. Explicit `--loopback` diagnostics
-  are approved as a supplemental authentication seam, not proof of HTTPS.
-- Local authentication: the user ran `api-check --loopback` with their real API
-  credentials and reported PASS, authenticated true, one subscription and one
-  sampled article; transport explicitly reported loopback and no HTTPS verification.
-  A separate deliberately invalid loopback credential probe returned HTTP 401.
-  Real HTTPS authentication is now demonstrated by the user connecting actual
-  ReadKit on the Air and iPhone using the FreshRSS integration.
-- ReadKit account URL form: instance origin unchanged, without `/api/greader.php`.
-  Air initially showed ten unread public-feed articles. After reading one on the
-  Air, the iPhone reflected that change. The user subsequently confirmed the full
-  matrix above, including FreshRSS web corroboration and ~30-second propagation.
-- Normal stop: verified backup, owned forwarding removed, loopback closed, project
-  VM stopped, Tailscale still connected. The user confirmed sync failed on **both**
-  clients while stopped (cached content may remain). After normal private start,
-  the user confirmed both synchronize and the deliberately read/starred article
-  retains both markings. The application is left running privately.
-- The actual pre-existing Serve configuration was empty. Isolated command tests
-  preserve unrelated listeners, refuse changed/unowned routes and cover repetitions;
-  no claim is made that mocks prove real unrelated infrastructure behavior.
-- Safe real certificate/policy-failure injection: **not performed**; isolated failure
-  checks do not prove these real infrastructure failure modes.
-
-Limitations: the mini self-HTTPS cause remains unresolved (CLI 1.104.7 versus
-1.104.2 daemon; no upgrade/restart performed). Exact ReadKit/OS versions and optional
-web-originated state edits were not recorded. No new CI, alternate Python/platform
-or typechecker result is claimed. Verification backups are temporary private files,
-not a durable backup configuration. Use placeholders rather than private identifiers
-in any handoff. Publication, review, issue closure and merge are separate user choices.
+State propagation was roughly 30 seconds, not a guarantee. Optional web-originated
+edits, exact app/OS versions, real certificate/policy-failure injection and real
+cross-origin-redirect injection were not recorded. The mini's self-HTTPS failure
+remains unresolved (historical CLI 1.104.7 versus daemon 1.104.2; no speculative
+upgrade/restart). The original Serve configuration was empty: isolated preservation
+checks are not proof about real unrelated routes. Verification backups were
+private temporary files, not durable backup configuration. No current running state
+is implied by these historical results. See [developer verification scope](development.md#verification-and-adoption-status)
+for automated versus live/platform coverage.

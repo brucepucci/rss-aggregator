@@ -1,7 +1,7 @@
 # Keep database storage native and make recovery portable
 
-Status: Accepted. Local backup/restore implementation: issue #2; see README's
-[verification checkpoint](../../README.md#verification-checkpoints-and-limits) and
+Status: Accepted. Local backup/restore implementation: issue #2; see
+[verification scope](../development.md#verification-and-adoption-status) and
 [format/recovery guide](../backup-restore.md) for tested scope and limitations.
 
 Portability means being able to deploy a fresh instance elsewhere and restore its complete reading state, not preserving a particular data location or VM. Use SQLite in a project-owned Podman named volume on the VM's native Linux filesystem, with explicit backup and restore commands exporting complete instance backups outside the VM and Git checkout. This avoids a separate database service and makes recovery independent of the VM's survival.

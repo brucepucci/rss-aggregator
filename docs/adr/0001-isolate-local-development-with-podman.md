@@ -1,6 +1,6 @@
 # Isolate local development in a dedicated Podman machine
 
-Status: Accepted. Initial local implementation: issue #1; see README's [verification and adoption status](../../README.md#verification-and-adoption-status) for historical evidence, current scope and acceptance limits.
+Status: Accepted. Initial local implementation: issue #1; see [developer verification and adoption status](../development.md#verification-and-adoption-status) for historical evidence, current scope and acceptance limits.
 
 We prefer development on the Mac but want to avoid installing FreshRSS's PHP runtime and database dependencies directly on it. Use the official FreshRSS container in a dedicated rootless Podman machine, accepting the Linux VM's resource cost in exchange for an isolated runtime and an explicit removal boundary. The repository owns reproducible configuration and lifecycle commands, not a fork of FreshRSS or a custom application image.
 
