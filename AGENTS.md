@@ -1,19 +1,22 @@
 ## Documentation
 
-Update `README.md` in the same change whenever setup, commands, configuration, or operational behavior changes. Maintain comprehensive sections:
+Update the appropriate canonical documentation in the same change as relevant implementation changes. Keep these audience boundaries:
 
-- **Getting Started**: prerequisites, installation, first-run verification, normal start/stop, ReadKit connection, backup/restore, safe cleanup, and common troubleshooting.
-- **Configuration**: supported settings, their purpose and defaults, required versus optional values, how to change and apply them, and safe local handling of secrets.
+- `README.md`: owner/operator introduction, table of contents (including each FAQ), deployed architecture overview, shortest verified getting-started path, routine commands, essential configuration, common troubleshooting and task-based FAQ. Keep detailed procedures behind links; update summaries and navigation when affected.
+- `docs/cli.md`: exhaustive project CLI reference. Cover every command, subcommand, argument and flag, including purpose, defaults, usage, output and failure behavior.
+- `docs/configuration.md`: full runtime settings reference, required versus optional values, defaults, application steps and safe secret handling.
+- `docs/operations.md`, `docs/backup-restore.md`, `docs/tailscale-readkit.md`: canonical operator procedures and safeguards; extend these rather than duplicating them in README.
+- `docs/development.md`: developer setup, commands/checks, Python adoption/exceptions, test prerequisites, verification guidance and remaining coverage limits. Extend the existing test entrypoint/workflow documentation as feature coverage grows.
+- `docs/architecture.md`, `docs/adr/`, `GLOSSARY.md`: implementation internals, architectural rationale and domain vocabulary respectively.
+- `docs/agents/`: agent-only procedures, discovered through the pointers below; keep them separate from user and developer instructions.
 
-Document every supported CLI command, subcommand, argument, and flag in `README.md` in the same change, including purpose, defaults, usage, output, and failure behavior. Reviewers must verify this reference against the implementation and `--help`, and report omissions or stale entries as standards violations.
+Verify CLI references against implementation and `--help`, settings against implementation, and links/anchors when moving content. Clearly distinguish working, planned, unsupported and unverified behavior. Use placeholders instead of credentials or private feed URLs. Keep safeguards accessible at the point of use. Record revision-specific verification in issue/PR handoffs; retain only useful enduring evidence and limitations in documentation, not stale branch/publication status.
 
-Verify documented commands and settings against the implementation before considering a change complete. Clearly distinguish planned or unverified behavior from working features; use placeholders rather than real credentials or private feed URLs.
-
-Reviewers must assess whether each change requires updates to the README or affected domain/architecture documentation, including when the diff contains no documentation files. Report missing or stale required documentation as standards violations and identify the sections needing updates.
+Reviewers must assess README, reference, procedure and domain/architecture documentation needs even when a diff contains no documentation files. Report missing/stale required documentation, broken references or CLI omissions as standards violations, identifying the canonical sections needing updates.
 
 ## Python development
 
-Before writing or reviewing Python, or changing Python tooling, read `docs/python-standards.md`. See `README.md` for repository-specific adoption status, verified commands, and exceptions.
+Before writing or reviewing Python, or changing Python tooling, read `docs/python-standards.md`. See `docs/development.md` for repository-specific adoption status, verified commands, and exceptions.
 
 ## Agent skills
 
