@@ -179,7 +179,7 @@ Historical live invocations also use
 pytest cache and shorten reports; `-s` optionally disables output capture. Their
 flags and exits are in the [CLI reference](cli.md#pytest-selection).
 
-The six retained live tests cover:
+The retained live tests cover:
 
 - **Effective Apache security failure/recovery:** temporarily add an Apache INI
   override to the real owned app, verify failed security keeps it inaccessible
@@ -208,8 +208,22 @@ The six retained live tests cover:
   locator bytes/absence preserved. Separate VM-restart tests still update the real
   locator with a real instance backup in `RSS_BACKUP_DIR`.
 
+- **Disposable application supervision recovery:** the selected test
+  `tests/integration/test_live_replace.py::test_supervision_recovers_only_disposable_application_and_preserves_reading_state`
+  uses the existing synthetic-user fixture, real Runtime start/health/recovery and
+  real HTTP state assertions. It redirects only reserved app/volume/preflight and
+  audit/intent/registration names, retaining real machine ownership and command
+  lock. A synthetic launchctl and scratch HOME job definition mean **no real host
+  service activation**; a Podman wrapper preserves the actual caller's HOME/PATH
+  for the existing owned VM. It checks healthy noninterruption, stopped-container
+  recovery, preserved article/read/star state and unchanged production intent.
+  This selected integration is not evidence of real launchd/reboot/login behavior
+  and must be run only with owner coordination and the live prerequisites above.
+
 Replacement/recovery fixture runners force loopback mode and reserved Serve-record
 names so they cannot remove/reconfigure the real application's private forwarding.
+They also namespace operator-intent/supervision records so public fixture starts
+cannot change the real instance's running/stopped intent.
 They use the existing real owner record, never a fabricated copy. Other tests can
 restart the real project through normal lifecycle commands. Do not publish HTML,
 authentication payloads, private URLs or `--showlocals` output as artifacts.
@@ -247,11 +261,12 @@ loopback=False)` returns the same JSON-compatible operation dictionaries and sen
 diagnostics to stderr. It serializes callable as well as CLI callers under the
 same nonblocking project lock. Unknown operations/ownership/lock failures raise
 `RuntimeFailure`; OS/configuration errors propagate for the caller to handle.
-There are eleven public operations, not a command for every helper.
+There are fifteen public operations, not a command for every helper.
 
 | Call | Required values and behavior |
 | --- | --- |
 | `run("setup")`, `run("start")`, `run("status")`, `run("fetch")`, `run("verify")`, `run("replace")`, `run("stop")`, `run("backup")` | Same guards, side effects, defaults and results as their [CLI commands](cli.md#runtime-commands-and-results). |
+| `run("supervision-install")`, `run("supervision-remove")`, `run("supervision-status")`, `run("supervision-tick")` | Same opt-in normal-user-session registration, captured environment, intent, health, bounded retry and maintenance semantics as the [CLI commands](cli.md#mac-supervision-commands). All share the existing nonblocking lock; none needs Click context. Installation is explicit; status does not start writers. |
 | `run("restore", archive=Path(...), volume="fresh-name")` | Requires archive path and fresh target name; missing values raise `ValueError`. Shares archive validation, ownership and no-activation safeguards. |
 | `run("select-volume", volume="owned-name")` | Requires volume name; omission raises `ValueError`. Same stopped-app/running-VM and provenance checks. |
 | `run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")` | No prompts; supply credentials only in local process memory, never source/shell arguments. Same owned/running/security-checked app and active-forwarding guards; only sanitized counts/diagnostics/transport returned. Optional `loopback=True` selects the verified owned HTTP publication and returns `https_verified: false`; omitted/false retains trusted HTTPS. |
@@ -263,6 +278,34 @@ and `fix(root=None)` in `rss_aggregator.development` require no Click context;
 return the developer result dictionaries rather than translating logical failures
 into process exits; callers must inspect `ok`. They preserve the same selected-
 checkout isolation, check-only/mutation and hook-refusal behavior as the CLI.
+
+## Supervision test seams and remaining live evidence
+
+The approved feature seam is existing CLI/`Runtime.run`, not supervisor private
+helpers. `tests/test_supervision.py` extends controlled-executable fixtures with
+scratch HOME/LaunchAgents/ownership state, actual subprocesses and disposable HTTP.
+The default suite uses synthetic launchctl/Podman, no host jobs or production data.
+It covers repeatable opt-in install/removal, partial/foreign registration,
+captured configuration/dependency/session failures, persistent stop/start intent,
+healthy no-op, guarded unexpected failure, bounded persisted retries with a
+controlled clock, synthetic-secret redaction, lock contention and malformed
+maintenance holds. A real SIGKILL of a **disposable** Runtime parent while its
+native child waits on FIFOs verifies inherited-lock refusal; it never kills a
+production process. Manual backup tests ensure stopped intent is never resumed.
+The application-failure fixture substitutes only the socket port-bind boundary
+because its disposable HTTP server stands in for Podman's listener; separate
+command tests cover actual port-conflict refusal.
+
+Do not run live tests to fill evidence gaps without owner coordination and a
+verified backup. The disposable integration above is separately selected, not
+baseline coverage. Actual normal-user launchd registration/removal, reboot/login,
+intentional-stop across reboot, sleep/power behavior and trusted HTTPS/device
+availability require the [owner-assisted runbook](operations.md#owner-assisted-mac-acceptance-not-automated-evidence).
+No pre-unlock service or unchanged real-host settings are inferred from fixture
+passes. Daily scheduling/interruption reconciliation belongs to the backup sibling;
+combined intent/maintenance/scheduler tests must be rerun when integrating both
+changes. Keep revision-specific command results and unrun checks in the issue
+handoff, not as an implied platform pass here.
 
 ## Verification and adoption status
 

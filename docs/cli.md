@@ -13,7 +13,7 @@ Run from a synchronized checkout (`uv sync --locked` first):
 
 | Invocation | Purpose and accepted arguments/options |
 | --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the eleven operations below. |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the fifteen operations below. |
 | `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint; Python's `-m` selects the module. |
 | `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. It is not a Python module to pass to `python3`. |
 | `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
@@ -54,7 +54,7 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | Command | Purpose and prerequisites | JSON result fields |
 | --- | --- | --- |
 | `rss setup` | Inventory/install the missing Podman CLI and initialize the owned rootless VM. Does not start or stop services. Existing unowned resource names and installation plans upgrading/reinstalling existing packages are refused; there is no bypass. | `machine: "rss-aggregator"`, `created: boolean`. |
-| `rss start` | Start the VM if necessary, restart/reuse or create the application, copy both new-user templates while stopped, pass security/readiness/scheduler/fetching gates, and optionally configure private HTTPS/API. Repeated starts interrupt the application, not create duplicate data/users/subscriptions. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
+| `rss start` | Persist running intent (even if startup fails), reset recovery attempts, then start the VM if necessary, restart/reuse or create the application, copy both new-user templates while stopped, pass security/readiness/scheduler/fetching gates, and optionally configure private HTTPS/API. Repeated starts interrupt the application, not create duplicate data/users/subscriptions. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
 | `rss status` | Inspect without starting services. Checks scheduler and HTTP readiness when the app runs; unhealthy cron/readiness, ownership or forwarding checks fail rather than return a healthy result. | `machine`, `application`, selected `volume`, `forwarding`; when available `http_ready`, `scheduler`, `security`. An unconfigured checkout returns only machine/application `"absent"`. With a stopped VM, application is `"unknown"`, not a claim its container disappeared. |
 | `rss api-check [--loopback]` | Prompt locally; check GReader diagnostics and authenticated read access without changing reading state. Requires an owned running app, a matching application security audit and active owned forwarding in **both** modes. | `diagnostics: "PASS"`, `authenticated: true`, integer `subscriptions`, integer `sample_articles` (at most one requested article, not a total), `transport: "https"` / `"loopback"`, `https_verified: true` / `false`. |
 | `rss fetch` | Run feed actualization immediately; requires the owned VM/application to be running. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed; upstream cache/TTL/backoff still apply. |
@@ -63,7 +63,48 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | `rss backup` | Quiesce writers, create/verify an external archive in `RSS_BACKUP_DIR`, then attempt to restore prior application/forwarding/VM state, even on snapshot failure. Can temporarily start an owned stopped VM without starting the application. | `archive`, `sha256`, `verified: true`, `manifest`. |
 | `rss restore ARCHIVE --volume NAME` | Validate locally, then import into a fresh owned volume. May start only the owned VM; leaves it running. Does not activate the imported data, overwrite an existing volume, or require `RSS_BACKUP_DIR`. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
 | `rss select-volume NAME` | Select an owned volume while the VM runs and the application is stopped/absent. Refuses incomplete imports or recorded-image mismatch. Does not start the app or delete the original volume. | `volume`, `selected: true`, `next_step`. |
-| `rss stop` | Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
+| `rss stop` | Persist stopped intent before shutdown (even if already stopped or shutdown fails). Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
+
+### Mac supervision commands
+
+All four commands accept only `--help`; there are no positional arguments or
+additional flags. Install/remove operate on the current normal Mac user's session,
+never system launchd. See the [backup-before-install and owner acceptance
+procedure](operations.md#opt-in-mac-startup-and-recovery) before real activation.
+
+| Command | Purpose/defaults and failure behavior | JSON result |
+| --- | --- | --- |
+| `rss supervision-install` | Explicitly capture the selected stable checkout, its `.venv/bin/python`, existing ownership and non-secret configuration; write/activate the owned user LaunchAgent. Requires macOS, non-root user, normal GUI session, owned Podman VM and available captured dependencies. Does not create running intent. Repeated identical installation is safe; changed configuration requires explicit removal/reinstallation. Foreign/changed/symlinked jobs and loaded-label conflicts are preserved/refused. Partial activation retains registration for retry/removal. | Same supervision-status shape below; `enabled: true` means a registration ledger exists, not that the app is healthy or session available. |
+| `rss supervision-remove` | Unload/remove only the unchanged owned job; repeatable if absent. Preserve app, VM, data, backups and intent. Failures preserve registration for inspection/retry; changed/unowned jobs are never overwritten/deleted. | Supervision-status shape with `enabled: false`, `state: "disabled"`. |
+| `rss supervision-status` | Read registration, captured dependency availability, normal user session, intent and observed service readiness without starting/restarting it. An unavailable/unhealthy state is a successful **query**, not recovery success. Malformed/foreign ownership/state and lock failures still exit 1. | `enabled`, `intent` (`"unset"`, `"running"`, `"stopped"`), `maintenance`, `session` (`"not_checked"`, `"available"`, `"unavailable"`), `observed`, `state`, `action`, `recovery`; registered results add absolute `job`, `root`, `state_dir`. |
+| `rss supervision-tick` | One serialized reconciliation. Disabled/stopped/unset intent is a no-op. Healthy observations do not restart service. Otherwise at most three consecutive normal guarded starts, with minimum 60s and 300s backoff. Maintenance, unavailable/inactive registration, backoff, failed/exhausted recovery and lock contention exit 1 with no result JSON; inspect status for response. No shell/.env assumptions or insecure TLS fallback. | Status shape; successful recovery has `state: "recovered"` and updated `observed`/`recovery`. |
+
+`observed.availability` is `"unknown"`, `"healthy"` or `"unhealthy"`; when known,
+`machine`/`application` describe the owned resources. Query/guard failures produce
+an actionable sanitized observation, not raw underlying output. `state` is one of
+`disabled`, `maintenance`, `configuration_unavailable`, `session_unavailable`,
+`inactive`, `intentionally_stopped`, `intent_unset`, `healthy`, `unhealthy`,
+`recovery_failed`, `retry_exhausted` (plus `recovered` for a successful tick).
+
+`recovery` contains `version: 1`, `attempts` (0–3), `next_retry_at` (UTC Unix seconds
+or null), `history` (last ten outcomes). Each event has UTC Unix `at`, `attempt`
+and `outcome` (`interrupted_or_in_progress`, `failed`, `recovered`). Failed events and
+failed observations also contain sanitized `reason` and `action`, never raw exception
+text. Reasons distinguish `ownership_conflict`, `configuration_conflict`,
+`private_access_refused`, `security_gate_failed`, `readiness_failed`,
+`fetching_unhealthy`, `external_command_failed` and fallback `recovery_guard_failed`.
+Reserving an
+attempt before mutation survives process interruption. Healthy ticks and explicit
+`start` reset the retry count/backoff but retain history. Raw process errors and
+credentials are neither recorded nor copied into the job; background stdout/stderr
+are discarded. Configuration/job failures before the worker can run are exposed
+by status rather than falsely recorded as successful checks.
+
+Only explicit `start` changes stopped/unset intent to running. `verify`, `replace`
+and backup resumption do not change it. Maintenance marker presence blocks public
+`start`/`replace`/`verify`/`fetch` and supervisor recovery; a malformed marker also
+fails closed. A backup never resumes an intentionally stopped app. Default manual
+operation installs no job; actual reboot/login evidence remains separately required.
 
 ### Arguments and flags
 
@@ -99,6 +140,8 @@ passwords, tokens, feed URLs or article content. See the
   `sha256` is the whole ZIP checksum, not just the payload checksum.
 
 Commands share a nonblocking local lock: concurrent callers fail rather than queue.
+Native children inherit it so orphaned external work retains serialization if the
+Python parent is killed; it does not serialize unrelated external writers.
 Resources are normally retained for diagnosis, not automatically rolled back or
 deleted. A failed startup can leave the VM running; first-run loopback readiness
 failure can leave the app serving. Private/previously private post-start failures
@@ -108,7 +151,8 @@ leave existing serving state untouched. Inspect `status` and the
 [operations guide](operations.md), not just the exit code.
 
 **Backup and shutdown failures differ:** explicit `backup` attempts prior-mode
-resumption even after snapshot failure, regardless of this shell's `RSS_TAILSCALE`.
+resumption even after snapshot failure, regardless of this shell's `RSS_TAILSCALE`,
+but never resumes an intentionally stopped application.
 A failure is not proof that remote access is closed. Resume failure also exits 1,
 even if an archive was published; inspect private `last-backup.json`. Shutdown
 backup failure after quiescing leaves writers/forwarding stopped, VM running, data

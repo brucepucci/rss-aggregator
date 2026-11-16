@@ -48,6 +48,30 @@ def status() -> None:
     _execute("status")
 
 
+@main.command("supervision-install")
+def supervision_install() -> None:
+    """Explicitly install/activate Mac user-session startup and recovery."""
+    _execute("supervision-install")
+
+
+@main.command("supervision-remove")
+def supervision_remove() -> None:
+    """Remove only owned supervision; preserve application, intent and data."""
+    _execute("supervision-remove")
+
+
+@main.command("supervision-tick")
+def supervision_tick() -> None:
+    """Check health once and perform bounded guarded recovery if authorized."""
+    _execute("supervision-tick")
+
+
+@main.command("supervision-status")
+def supervision_status() -> None:
+    """Report supervision, persistent intent and actionable recovery state."""
+    _execute("supervision-status")
+
+
 @main.command()
 def fetch() -> None:
     """Fetch feeds immediately while respecting upstream cache and TTL rules."""

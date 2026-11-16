@@ -6,7 +6,7 @@ import sys
 
 import click
 
-from rss_aggregator import private_access, recovery, runtime
+from rss_aggregator import private_access, recovery, runtime, supervision
 
 from .replacement_support import owned_runtime, replacement_names
 from .support import expect
@@ -33,6 +33,9 @@ def run():
     recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
     recovery.BACKUP_RECORD = "test-" + token + "-last-backup.json"
     private_access.SERVE_RECORD = "test-" + token + "-serve.json"
+    supervision.INTENT = "test-" + token + "-operator-intent.json"
+    supervision.REGISTRATION = "test-" + token + "-supervision.json"
+    supervision.RECOVERY_STATE = "test-" + token + "-supervision-recovery.json"
     os.environ["RSS_TAILSCALE"] = "0"
     operation = request["operation"]
     args = [operation]

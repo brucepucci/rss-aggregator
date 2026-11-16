@@ -18,6 +18,7 @@ from urllib.request import urlopen
 
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.recovery import Recovery, volume_name
+from rss_aggregator.supervision import MAINTENANCE, Supervision
 
 Operation = Literal[
     "setup",
@@ -31,6 +32,10 @@ Operation = Literal[
     "restore",
     "select-volume",
     "api-check",
+    "supervision-status",
+    "supervision-install",
+    "supervision-remove",
+    "supervision-tick",
 ]
 
 MACHINE = "rss-aggregator"
@@ -132,6 +137,10 @@ class Runtime:
             "verify": self._verify,
             "replace": self._replace,
             "stop": self._stop,
+            "supervision-status": Supervision(self).status,
+            "supervision-install": Supervision(self).install,
+            "supervision-remove": Supervision(self).remove,
+            "supervision-tick": Supervision(self).tick,
         }
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
@@ -149,7 +158,24 @@ class Runtime:
                 raise RuntimeFailure(
                     "Another project command is running; wait for it to finish."
                 ) from error
-            return handlers[operation]()
+            self._lock_fd = lock.fileno()
+            try:
+                if operation == "stop":
+                    Supervision(self).set_intent("stopped")
+                if operation in (
+                    "start",
+                    "replace",
+                    "verify",
+                    "fetch",
+                ) and os.path.lexists(self.state_dir / MAINTENANCE):
+                    raise RuntimeFailure(
+                        "Maintenance requires reconciliation; inspect locally before starting writers."
+                    )
+                if operation == "start":
+                    Supervision(self).set_intent("running")
+                return handlers[operation]()
+            finally:
+                self._lock_fd = None
 
     def _diagnostic(self, message: str) -> None:
         """Send human-readable progress or captured command chatter to stderr."""
@@ -172,7 +198,16 @@ class Runtime:
         )
         try:
             result = subprocess.run(
-                args, text=True, capture_output=True, env=env, input=input, check=False
+                args,
+                text=True,
+                capture_output=True,
+                env=env,
+                input=input,
+                check=False,
+                # Native work retains serialization if its Python parent dies.
+                pass_fds=(self._lock_fd,)
+                if getattr(self, "_lock_fd", None) is not None
+                else (),
             )
         except OSError as error:
             raise RuntimeFailure(f"{args[0]} unavailable: {error}") from error

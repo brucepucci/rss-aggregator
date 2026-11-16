@@ -7,11 +7,13 @@ feed fetching, articles, a browser interface and reader APIs. **This repository
 manages FreshRSS; it does not implement or fork it.** It adds a pinned container,
 guarded start/stop commands, complete instance backups and optional private HTTPS.
 
-The working deployment is a **session-only Apple Silicon Mac instance**. ReadKit
-on macOS and iOS has been verified with shared read/unread and starred state.
-Always-on Linux deployment and destructive cleanup remain future work; paid-feed
-authorization has not been verified. Nothing starts automatically after login or
-reboot, and readers cannot synchronize while the instance is stopped.
+The deployment is an **Apple Silicon Mac instance**, with manual operation by
+default and optional [normal-user-session startup/recovery](docs/operations.md#opt-in-mac-startup-and-recovery).
+ReadKit on macOS and iOS has been verified with shared read/unread and starred state.
+Real reboot/login recovery and owner acceptance remain unverified; no pre-unlock
+availability is promised. Always-on Linux deployment, destructive cleanup and
+paid-feed authorization remain future/unverified work. Readers cannot synchronize
+while the instance is stopped; explicit stop persists until explicit start.
 
 ## Contents
 
@@ -25,6 +27,7 @@ reboot, and readers cannot synchronize while the instance is stopped.
   - [How do I import or export subscriptions?](#how-do-i-import-or-export-subscriptions)
   - [How do I back up and restore the complete FreshRSS instance?](#how-do-i-back-up-and-restore-the-complete-freshrss-instance)
   - [How do I deploy, start, stop, and update the service?](#how-do-i-deploy-start-stop-and-update-the-service)
+  - [How do I enable automatic Mac startup and check recovery?](#how-do-i-enable-automatic-mac-startup-and-check-recovery)
   - [How do I move the aggregator to another machine?](#how-do-i-move-the-aggregator-to-another-machine)
   - [How do I connect a reading app or access the instance from another device?](#how-do-i-connect-a-reading-app-or-access-the-instance-from-another-device)
   - [Why are articles missing or feeds no longer updating?](#why-are-articles-missing-or-feeds-no-longer-updating)
@@ -50,7 +53,9 @@ FreshRSS fetches feeds at startup and at UTC minutes **00, 20 and 40** while
 running, subject to publisher caching/backoff. Synchronizing a reading app exchanges
 articles and reading state with FreshRSS; it is not a request to fetch publishers.
 The VM's named volume survives container replacement but **not VM deletion**.
-External backups are essential.
+External backups are essential. Optional user-session launchd supervision observes
+health before bounded guarded recovery; it respects persistent operator stop and
+serialized backup maintenance. It does not change login, FileVault or power policy.
 
 Only loopback HTTP is published on the Mac; optional Tailscale Serve adds
 trusted, tailnet-only HTTPS, not public access. There is no host PHP/database
@@ -109,11 +114,12 @@ to stderr and failures return nonzero. `./scripts/rss` is an equivalent launcher
 
 | Command | Use |
 | --- | --- |
-| `uv run --locked rss start` | Start/recheck the service; a repeated start briefly restarts it. |
+| `uv run --locked rss start` | Explicitly enable running intent and start/recheck; a repeated start briefly restarts it. |
 | `uv run --locked rss status` | Inspect the VM, application, scheduler and private forwarding without starting anything. |
 | `uv run --locked rss fetch` | Fetch publisher feeds now, subject to caching/backoff. |
 | `uv run --locked rss backup` | Make a complete backup, then attempt to restore the previous serving state. |
-| `uv run --locked rss stop` | Back up, remove owned forwarding and stop only the project VM. |
+| `uv run --locked rss stop` | Persist stopped intent, back up, remove owned forwarding and stop only the project VM. |
+| `uv run --locked rss supervision-status` | Check optional supervision, intent, observed health and recovery failures without restarting anything. |
 | `uv run --locked rss api-check` | Prompt for separate API credentials and check private HTTPS/API access. |
 | `uv run --locked rss --help` | Show commands; append `--help` to any subcommand for its syntax. |
 
@@ -155,6 +161,9 @@ service is closed.
 - **ReadKit/certificate/API failure:** use the separate API password; check Tailscale
   on both devices and `/api/` diagnostics. Never disable TLS verification.
   [Private-access runbook](docs/tailscale-readkit.md).
+- **Startup/recovery unavailable or intentionally stopped:** check `rss supervision-status`
+  and its `action`; follow the [session-recovery procedure](docs/operations.md#daily-check-and-failure-response).
+  Do not bypass a maintenance hold or repeatedly run `start` against a healthy service.
 - **Security gate failure:** do not enter credentials or bypass checks.
   [Security policy](docs/architecture.md#image-and-php-security-policy).
 
@@ -205,6 +214,18 @@ security advisories and exact platform/digest, update the checked-in pin deliber
 then use `rss replace` and verify persisted state. Follow
 [image updates and rollback](docs/backup-restore.md#image-updates-and-rollback);
 never assume an older image can open a newer database.
+
+### How do I enable automatic Mac startup and check recovery?
+
+Follow the [opt-in startup/recovery procedure](docs/operations.md#opt-in-mac-startup-and-recovery):
+obtain a verified private backup and owner approval before real installation,
+select a stable checkout, then explicitly install user-session supervision.
+`rss supervision-status` reports intent, session/health, recent failures and the
+next operator action. Healthy ticks do not restart FreshRSS; persistent failures
+have a bounded retry budget. `rss stop` remains stopped across ticks/login/reboot
+until `rss start`; backups never undo that intent. Safe removal preserves the app,
+data, backups and unrelated jobs. Actual reboot/login/security/power limitations
+require separately recorded owner acceptance; automated tests are not that evidence.
 
 ### How do I move the aggregator to another machine?
 

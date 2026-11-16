@@ -212,6 +212,9 @@ class ReplacementInstanceFixture(InstanceFixture):
             "recovery.json",
             "last-backup.json",
             "serve.json",
+            "operator-intent.json",
+            "supervision.json",
+            "supervision-recovery.json",
         ):
             (controller.state_dir / ("test-" + self.token + "-" + suffix)).unlink(
                 missing_ok=True

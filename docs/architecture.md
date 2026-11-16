@@ -11,8 +11,9 @@ The supported runtime is a dedicated rootless Podman Linux VM on Apple Silicon
 macOS. Commands explicitly select the owned machine/connection and labelled
 container/volume; they do not adopt colliding resources or change global Podman
 defaults. Only `127.0.0.1:<RSS_PORT>` is published. There is no host PHP/database,
-privileged socket helper, Podman Desktop, login item or automatic application
-startup. Native Linux hosting and other architectures are not implemented/verified.
+privileged socket helper or Podman Desktop. Manual operation installs no host
+service; optional explicit user-session launchd startup/recovery is described below.
+Native Linux hosting and other architectures are not implemented/verified.
 
 The complete FreshRSS `data` directory is in a named volume on the VM's native
 filesystem, initially `rss-aggregator-data`. SQLite avoids an extra database service;
@@ -25,6 +26,41 @@ images, checkout copies or OPML. Extensions outside `data` are not covered.
 managed state records. [Operations](operations.md) explains ownership refusals,
 scheduling and shutdown. [Development](development.md) separates isolated tests,
 Mac integration and human device evidence.
+
+## Session supervision and operator intent
+
+`supervision.py` extends the existing CLI/Runtime boundary rather than providing
+another lifecycle implementation. Only public `start`/`stop` persist operator
+running/stopped intent; absence is unset, never implicit authorization to start.
+Internal `_start` restores temporary backup state without changing intent, and
+backup resumption refuses stopped intent. `verify`/`replace` retain intent.
+
+Explicit registration captures the stable checkout, `.venv` interpreter, ownership,
+reviewed image-configuration identity and required non-secret environment into an
+owned per-user LaunchAgent/ledger. No shell, automatic `.env`, privileged service,
+package installation or host security/power change is involved. The GUI-session
+job requests a tick at load and every 60 seconds; normal-session availability is
+required. Missing/moved code/dependencies and foreign/changed jobs fail without
+falling back to another checkout or adopting resources.
+
+Under the existing nonblocking `command.lock`, a tick first respects intent and
+any crash-persistent `maintenance.json`, then checks owned runtime readiness and
+private forwarding. Healthy observations do not call start. Recovery calls the
+normal start path with all security/readiness/authentication/forwarding guards;
+three consecutive attempts use minimum 60s/300s backoff, persisted before mutation.
+Healthy ticks/explicit start reset attempts while retaining ten secret-free recent
+outcomes. Raw external command errors are not retained or copied into jobs/logs.
+Native child processes inherit the lock descriptor so killing the Python parent
+does not let recovery contend with its still-running external work. Independent
+Podman/Tailscale clients remain outside this lock.
+
+Status distinguishes registration, session, intent, unknown/unhealthy availability,
+maintenance and exhausted/failed recovery. It does not claim remote trusted HTTPS
+from loopback readiness or establish reboot/power evidence. [Operations](operations.md#opt-in-mac-startup-and-recovery)
+owns owner coordination, verified-backup prerequisites, safe reversal and actual
+Mac evidence/acceptance; [configuration](configuration.md#captured-mac-supervision-configuration)
+owns the exact captured settings and managed records. Native Linux supervision
+and networking decoupling remain later work.
 
 ## Startup security gate
 

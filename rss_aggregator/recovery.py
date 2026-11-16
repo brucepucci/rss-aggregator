@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from rss_aggregator.archives import create_archive, validate_archive
 from rss_aggregator.private_access import PrivateAccess
+from rss_aggregator.supervision import Supervision
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -266,7 +267,7 @@ class Recovery:
             quiesced = True
             return self.snapshot(owner, directory)
         finally:
-            if was_running and quiesced:
+            if was_running and quiesced and Supervision(runtime).intent() != "stopped":
                 runtime._start(private_https=was_private)
             elif was_stopped:
                 self._engines_idle(owner, stop=False)

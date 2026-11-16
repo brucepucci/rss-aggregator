@@ -11,7 +11,7 @@ import sys
 
 import click
 
-from rss_aggregator import private_access, recovery, runtime
+from rss_aggregator import private_access, recovery, runtime, supervision
 
 from .replacement_support import (
     checked_application,
@@ -56,6 +56,9 @@ def run():
     runtime.SELECTION = "test-" + token + "-selection.json"
     recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
     private_access.SERVE_RECORD = "test-" + token + "-serve.json"
+    supervision.INTENT = "test-" + token + "-operator-intent.json"
+    supervision.REGISTRATION = "test-" + token + "-supervision.json"
+    supervision.RECOVERY_STATE = "test-" + token + "-supervision-recovery.json"
     os.environ["RSS_TAILSCALE"] = "0"
     from rss_aggregator.cli import main
 

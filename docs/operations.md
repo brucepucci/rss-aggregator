@@ -76,6 +76,139 @@ error warns that exposure may remain. Initial preflight refusals leave existing
 state untouched. General loopback startup failures may leave the application and
 VM running for diagnosis; failure is not proof HTTP is closed. Inspect `status`.
 
+## Opt-in Mac startup and recovery
+
+Manual operation remains the default: `setup`, `start` and code checkout never
+register a host service. `start` persists **running intent**, even if startup fails;
+`stop` persists **stopped intent** before shutdown, even if already stopped or
+shutdown subsequently fails. Only explicit `start` re-enables running intent.
+`verify`, `replace`, temporary backup quiescing and login/reboot do not change it.
+An older instance without an intent record is **unset**, not implicitly running.
+
+### Enable or remove supervision
+
+**Before real installation:** obtain and verify a private instance backup, coordinate
+with the owner, and choose one stable checkout and the existing ownership directory.
+Do not use a temporary worktree that will be deleted. Finish the loopback installer
+and verify the intended private HTTPS/authentication configuration first. Keep all
+existing FileVault, login, power and Tailscale settings unchanged.
+
+From that synchronized checkout, with the instance's existing settings exported:
+
+```sh
+export RSS_STATE_DIR="/absolute/private/existing-ownership-directory"
+# Explicit owner-selected production destination, not a global default:
+export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
+# Keep RSS_PORT and RSS_TAILSCALE consistent with the verified deployment.
+uv run --locked rss backup
+# Confirm verified:true and retain the private archive/checksum before continuing.
+uv run --locked rss supervision-install
+uv run --locked rss supervision-status
+```
+
+Installation is explicit and activates `io.rss-aggregator.supervision` in the normal
+user's `gui/<uid>` launchd domain. It writes only its owned LaunchAgent; no root
+service, login/power change, dependency installation or unrelated job modification.
+Repetition with the same captured configuration is safe. Changed/unowned job files,
+symlinks, loaded-label collisions and ownership ambiguity are refused, not adopted.
+Partial activation retains the registration for inspection and safe retry/removal.
+
+The job uses the selected checkout's `.venv/bin/python`, absolute checkout/state
+paths, captured non-secret runtime settings and explicit dependency search paths;
+it does not invoke uv, source a shell or read `.env`. Keep that checkout, environment
+and ownership directory available. Moving them, changing the image pin or losing a
+captured dependency requires local correction or explicit removal/reinstallation;
+there is no fallback to another installation. Take a verified backup before
+significant changes and remove supervision before intentionally reconfiguring it.
+
+To disable startup/recovery safely:
+
+```sh
+uv run --locked rss supervision-remove
+```
+
+Removal unloads/removes only the unchanged owned job. It **does not stop FreshRSS**,
+erase running/stopped intent, delete data/backups, or stop Tailscale. Use `rss stop`
+for an intentional backed-up shutdown. Removal is repeatable; changed/unowned jobs
+remain intact for manual resolution.
+
+### Daily check and failure response
+
+Run `rss supervision-status`; use `rss status` for the existing detailed runtime
+check. Supervision status separates registration, user session, intent, observed
+availability, maintenance and recent recovery outcomes. A successful status query
+is not a healthy-service assertion: inspect `state`, `observed`, `recovery` and
+`action`. Missing prerequisites are visible, not treated as successful recovery.
+No raw FreshRSS/Podman logs are needed for this first response.
+
+- **disabled / inactive / configuration_unavailable:** verify the selected checkout,
+  `.venv`, captured dependencies and unchanged owned job. Reinstall explicitly only
+  after resolving ownership/configuration; do not replace foreign jobs.
+- **session_unavailable:** log in/unlock the normal Mac user session. The job is not
+  a pre-login/pre-unlock service. Status cannot run on an unreachable/powered-off
+  host; an earlier healthy result is not current remote availability evidence.
+- **intentionally_stopped / intent_unset:** no automatic start is authorized. After
+  any maintenance inspection, `rss start` explicitly resumes running intent.
+- **maintenance:** recovery and public start/fetch/verify/replace refuse to open
+  writers. Preserve the marker and inspect the interrupted operation. The backup
+  scheduling implementation's `backup-reconcile` confirms owned engines are idle
+  before clearing a hold; reconciliation does not itself resume writers or change
+  intent, but retained running intent permits a later supervisor tick to recover.
+  To keep the app stopped, explicitly `rss stop` **before** reconciliation (stopped
+  intent persists even if shutdown is refused). Where reconciliation is unavailable,
+  coordinate with the owner rather than deleting a marker to bypass the boundary.
+- **unhealthy / recovery_failed / retry_exhausted:** inspect dependencies, ownership,
+  readiness/security and private forwarding locally. Never bypass TLS or adopt
+  colliding resources. Correct the cause, then explicit `rss start` resets the
+  retry budget. `observed.reason`/`action` and failed history events distinguish
+  ownership/configuration conflicts, private-access refusal, security/readiness/
+  fetching failures and dependency errors without copying sensitive process output.
+  `stop` remains authoritative even after a failed recovery.
+
+Launchd requests a check at load/login and every **60 seconds** while the session
+and host are available; sleep/missed intervals are not continuous availability or
+an overlapping queue. Healthy checks inspect HTTP, fetching cron and owned
+forwarding without restarting the application. An unhealthy instance gets at most
+**three consecutive guarded recovery attempts**, with at least **60 seconds** then
+**300 seconds** before attempts two and three. Exhaustion requires operator action;
+healthy observation or explicit start resets the budget, retaining the last ten
+sanitized outcomes. An attempt is reserved before mutation, so process death does
+not reset retries. Ordinary startup ownership/image/PHP/authentication/readiness/
+fetching/forwarding gates remain mandatory.
+
+The nonblocking project lock spans each entire check/recovery/backup/lifecycle
+operation; contention fails visibly and is retried on a later tick, not queued.
+Native children inherit the lock so orphaned work keeps serialization after a
+Python process dies. Backup quiescing does not change intent, and a backup never
+resumes an intentionally stopped application. Independent external writers are
+not serialized by this lock.
+
+### Owner-assisted Mac acceptance (not automated evidence)
+
+The implementation and controlled tests do **not** establish actual launchd,
+reboot, login/unlock, outage, power-recovery or trusted-client behavior. Before
+#21's production trial, coordinate and record separately:
+
+1. A fresh verified private backup, selected revision/checkout/settings and a
+   preservation inventory of unrelated jobs/resources; never publish credentials,
+   private URLs or raw application logs.
+2. Owner acceptance of the existing FileVault/unlock/login, sleep and power-recovery
+   limitations. Verify the mini's actual settings/behavior without changing them;
+   do not silently enable automatic login or simulate physical power loss.
+3. A real coordinated reboot, its time and normal-session availability time, then
+   successful startup/status and trusted HTTPS/actual reader checks. Locked disks,
+   login prerequisites and any unperformed power/outage scenarios stay explicit.
+4. A coordinated disposable application-failure recovery check and a healthy-check
+   noninterruption check, preserving subscriptions/articles/read/star state and
+   unrelated VM/forwarding resources.
+5. Explicit `stop`, ticks and another coordinated reboot/login remaining stopped;
+   explicit `start` alone resumes service. Record backup quiescing interaction and
+   persistent-error response separately from application availability.
+
+The mini's existing self-HTTPS diagnostic limitation is not permission for insecure
+TLS. Trusted client checks and loopback diagnostics remain distinct. See the
+[private-access runbook](tailscale-readkit.md).
+
 ## Scheduling and reading state
 
 FreshRSS actualizes feeds at startup and through the official image's enabled cron
@@ -125,7 +258,9 @@ rolled back or deleted. No backups are pruned or uploaded automatically.
 
 Stopping the VM releases its memory allocations and stops fetching/serving. Idle
 guest memory is not guaranteed to return to macOS while it remains up. Nothing
-starts automatically at login or reboot. Tailscale itself is not stopped by project
+starts automatically at login or reboot unless the owner explicitly installs
+[session supervision](#opt-in-mac-startup-and-recovery); persisted stopped intent
+still prevents recovery. Tailscale itself is not stopped by project
 shutdown; clients cannot synchronize with a stopped FreshRSS instance.
 
 ## Safe cleanup

@@ -97,7 +97,11 @@ update. The marker is managed state, not a user-configurable override.
 ## Consistency and failure behavior
 
 The normal project lock covers backup, restore and explicit volume selection as
-well as lifecycle commands. Both rootless and rootful engine states are inspected
+well as lifecycle/supervision commands. Native subprocesses inherit the held lock,
+so an orphaned export retains serialization after its Python parent is killed.
+Supervision also refuses a durable maintenance hold; never delete one to bypass a
+consistency window. See [session recovery response](operations.md#daily-check-and-failure-response).
+Both rootless and rootful engine states are inspected
 through the verified machine/connection before stopping anything. Foreign running
 workloads cause refusal. All owned application and preflight containers stop, exit
 is verified, and the engines must be idle before export. This stops both HTTP writes
@@ -113,12 +117,17 @@ after publication (for example, failed application resumption) does not erase th
 valid archive and still returns nonzero.
 
 Explicit backup attempts to preserve the earlier application/forwarding/VM state
-where safe, including after snapshot failure. A previously running private service
+where safe, including after snapshot failure. It never resumes an application with
+persisted **stopped intent**, even if an earlier failed stop left it running.
+Temporary quiescing and internal resumption do not change operator intent. A previously running private service
 resumes privately; a loopback-only service stays loopback-only, regardless of the
 current `RSS_TAILSCALE` setting. A failed explicit backup is not confirmation that
 remote access is closed. It can start an owned stopped VM for export without starting
 the application; forwarding-query failure is also covered by VM restoration.
 Restoration of a running application goes through the normal security gate.
+Explicit `stop` records stopped intent before any shutdown attempt, including
+already-stopped and failed shutdowns; only explicit `start` re-enables running
+intent. Supervision respects that decision across ticks/login/reboot.
 Normal shutdown stops the VM only after a successful backup. Shutdown backup failure
 after quiescing leaves writers/forwarding stopped and the VM running; fix the cause
 and retry. Preflight refusals can leave existing serving state untouched. This

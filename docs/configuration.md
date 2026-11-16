@@ -54,6 +54,43 @@ do not namespace Podman resources. Keep a single controlling checkout; never cop
 replace or fabricate ownership records to adopt resources. Preserve the ownership
 directory when relocating a checkout.
 
+## Captured Mac supervision configuration
+
+Supervision is optional and disabled until explicit `rss supervision-install`.
+Read the [backup/owner-coordination safeguard](operations.md#enable-or-remove-supervision)
+before activation. There are no additional user-configurable retry/schedule flags:
+the owned job checks at load and every 60 seconds in the normal user GUI session;
+three consecutive recovery attempts use minimum 60s/300s backoff. Sleep/login/unlock
+and real power-recovery behavior are limitations, not settings changed by this app.
+
+Installation captures absolute checkout, ownership directory, checkout-local
+`.venv/bin/python`, image-configuration SHA-256 and executable locations for
+`launchctl`, `podman` and (with private HTTPS) `tailscale`. Child `PATH` comprises
+those executable directories plus `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`;
+`HOME`, resolved `RSS_STATE_DIR`, effective `RSS_PORT` and `RSS_TAILSCALE` are
+explicitly captured. `RSS_BACKUP_DIR` is captured only if explicitly set, expanded
+and absolute; it still has **no implicit default**. This deployment's owner-selected
+`~/FreshRSS-Backups` must be exported explicitly. The job does not copy arbitrary
+environment variables, credentials or shell initialization and does not load `.env`.
+
+`RSS_SUPERVISION_ROOT` is an internal captured identity guard, not a user deployment
+selector; do not set it manually. A tick uses captured settings even if a manually
+invoking shell has different selectors. Status refuses moved/missing code, changed
+image configuration, missing executable/dependency lookup and changed owned jobs
+instead of choosing another installation. Keep `.venv` synchronized in the stable
+checkout. For deliberate settings/pin/path changes, take a verified backup, remove
+supervision, apply/verify the change, then explicitly reinstall with the intended
+settings. No package installation or image update is performed by registration.
+
+The only service definition is
+`~/Library/LaunchAgents/io.rss-aggregator.supervision.plist` (new file `0600`),
+loaded into `gui/<uid>` rather than privileged/system launchd. Its arguments select
+Python isolated mode (`-I -B -m rss_aggregator supervision-tick`), fixed working
+directory and non-secret environment. Job stdout/stderr go to `/dev/null`; use
+sanitized `supervision-status` and persisted recovery outcomes, not raw sensitive
+application logs. Changed/foreign/symlinked job definitions are preserved/refused.
+Removal preserves app, ownership, intent, backup copies and all unrelated jobs.
+
 ## Checked-in application configuration
 
 | File | Current purpose/default | Change and apply |
@@ -94,7 +131,7 @@ These values are implementation settings, not environment overrides or CLI flags
 | Podman VM/connection | `rss-aggregator`, rootless. Initial 2 CPUs, 2048 MiB RAM, 20 GiB virtual disk capacity; capacity is not immediate physical disk use. No project resize/delete command. Machine/SSH/connection identity is ownership-checked. |
 | Application / preflight container | `rss-aggregator-freshrss` / disposable `rss-aggregator-check`; ownership label `io.rss-aggregator.owner`. Do not relabel resources to force adoption. |
 | Initial data volume | `rss-aggregator-data`, mounted at `/var/www/FreshRSS/data` on the VM's native filesystem. Change active selection with `rss select-volume NAME`, not by editing records. |
-| Publication / restart | `127.0.0.1:${RSS_PORT}:80`, `--restart=no`. Official image entrypoint/default command retained. No host cron, login item or service registration. |
+| Publication / restart | `127.0.0.1:${RSS_PORT}:80`, `--restart=no`. Official image entrypoint/default command retained. No host cron or default service registration; explicit optional user-session supervision is separate from container restart policy. |
 | Container environment | `CRON_MIN=*/20`, `TZ=UTC`, `ENABLE_ACCESS_LOG=0`, `COPY_LOG_TO_SYSLOG=Off`, `COPY_SYSLOG_TO_STDERR=Off`, `TRUSTED_PROXY=0`, initial internal gate `LISTEN=127.0.0.1:8088`. Apply reviewed changes with `replace`. |
 | Homebrew safeguards | Child commands force `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_INSTALL_UPGRADE=1`, `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`, `HOMEBREW_NO_INSTALL_CLEANUP=1`. Not user bypass switches; setup refuses an upgrade/reinstall plan. |
 
@@ -117,7 +154,11 @@ not permission to uninstall packages that other projects may later use.
 | Record | Purpose and handling |
 | --- | --- |
 | `owner.json` | Owner token plus machine/connection identity, tied to container/volume labels. Never delete, copy, fabricate or replace it to adopt existing resources. Loss needs a deliberate recovery decision, not blind setup. |
-| `command.lock` | Nonblocking lock shared by CLI and callable runtime operations. Another active operation causes refusal. It does not serialize independent Podman or Tailscale clients. |
+| `command.lock` | Nonblocking lock shared by CLI and callable runtime operations, including supervision. Native children inherit the held descriptor, retaining the lock after parent death until native work exits. Another active operation causes refusal. It does not serialize independent Podman or Tailscale clients. |
+| `operator-intent.json` | Version 1, `intent: running` or `stopped`. Only public `start`/`stop` write it, including failed starts/stops; absence means unset/no automatic startup. Persist through login/reboot; backup quiescing/resumption never changes it. Do not hand-edit it to authorize recovery. |
+| `supervision.json` | Versioned owner-bound registration and captured non-secret checkout/configuration/executable/job identity. Retained on partial activation/removal failure. Use install/remove, not manual ownership adoption. |
+| `supervision-recovery.json` | Versioned consecutive attempt count (0–3), next-retry UTC Unix timestamp/null and last ten sanitized attempt outcomes. Healthy tick or explicit start resets attempts/backoff, not history. An interrupted/in-progress event is not successful recovery. |
+| `maintenance.json` | Shared durable maintenance hold: **any presence**, even malformed, prevents supervisor recovery and public start/fetch/verify/replace. Backup scheduling owns creation/reconciliation; never delete it merely to bypass a consistency safeguard. See [operations](operations.md#daily-check-and-failure-response). |
 | `serve.json` | Owner token, private hostname/backend and pending/active/inactive intent; no passwords/API tokens. Preserve alongside ownership. Exact-match and conditional LocalAPI checks reject changed/unowned routes. Rejected starts grant no new authority; inactive intent does not authorize adopting a reappearing identical listener. Resolve uncertain outcomes locally, never hand-edit/copy/adopt. Detailed intent/ETag failure semantics are in [architecture](architecture.md) and [private access](tailscale-readkit.md). |
 | `selected-volume.json` | Explicitly selected owned data-volume name; absence means `rss-aggregator-data`. Use `rss select-volume NAME` with running VM/stopped application. |
 | `recovery-volumes.json` | Per-volume image provenance, import completeness and completed-first-activation marker. Never edit incomplete imports into ready state or bypass activation markers. Backup refuses unattached volumes without known matching provenance; start with the reviewed matching pin first. |
