@@ -1,6 +1,7 @@
 # Keep database storage native and make recovery portable
 
-Status: Accepted. Local backup/restore implementation: issue #2; see
+Status: Accepted. Local backup/restore implementation: issue #2; opt-in daily Mac orchestration:
+issue #23. See
 [verification scope](../development.md#verification-and-adoption-status) and
 [format/recovery guide](../backup-restore.md) for tested scope and limitations.
 
@@ -20,6 +21,7 @@ Portability means being able to deploy a fresh instance elsewhere and restore it
 - Restore into a fresh, explicitly named volume without implicitly overwriting or activating an existing instance. Activation requires a separate explicit owned-volume selection with the application stopped. Incomplete imports remain unselected and cannot be selected. Verify restored application behavior, including subscriptions, article content, accounts, and reading state.
 - Restore a compatible recorded application version first, select an image appropriate to the destination architecture, and adjust host-specific settings such as the external URL. Neither an architecture-specific image digest nor a database downgrade is assumed portable.
 - Backups contain credentials and private feed URLs. Keep them outside Git with restrictive permissions; these permissions are not encryption. Environment cleanup preserves external backups, and permanent data deletion is a distinct, explicitly confirmed operation.
-- Do not automatically prune backups or articles in the initial setup. Offsite backup, archive encryption/key management, database-engine changes, and production deployment remain out of scope.
+- Opt-in Mac daily orchestration reuses the same guarded archive boundary and explicit private destination, rather than adding an export/transfer engine. Daily attempt, verified publication and safe resumption are separate evidence. A durable maintenance hold plus inherited project lock prevents supervision from reopening writers after parent-process death; releasing the hold requires explicit owned-engine reconciliation, not guessing from elapsed time or PID reuse. Backups never change persisted operator intent or resume intentional stopped intent.
+- Do not automatically prune backups or articles. The initial production Mac slice adds daily scheduling and failure/freshness reporting, not automatic transfer, archive encryption/key management or database-engine changes. Actual Time Machine inclusion/copy retrieval/full-state recovery remain separate owner-coordinated evidence, not a consequence of local archive publication. Broader portable/Linux production operations remain deferred.
 
 Implementation and verification: [backup and restore](https://github.com/brucepucci/rss-aggregator/issues/2) and [safe removal and recreation](https://github.com/brucepucci/rss-aggregator/issues/5).

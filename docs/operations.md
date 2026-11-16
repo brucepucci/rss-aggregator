@@ -125,8 +125,44 @@ rolled back or deleted. No backups are pruned or uploaded automatically.
 
 Stopping the VM releases its memory allocations and stops fetching/serving. Idle
 guest memory is not guaranteed to return to macOS while it remains up. Nothing
-starts automatically at login or reboot. Tailscale itself is not stopped by project
+automatically starts the application at login or reboot merely by enabling backups. Tailscale itself is not stopped by project
 shutdown; clients cannot synchronize with a stopped FreshRSS instance.
+
+## Daily backup checks
+
+Daily full-instance protection is separate from container feed-fetch cron and
+application supervision. It is disabled until the owner explicitly enables the
+Mac backup LaunchAgent; ordinary start/manual backup/stop never enable it. Follow
+[the coordinated setup procedure](backup-restore.md#opt-in-daily-mac-backups), with
+a verified pre-change backup, stable checkout/dependencies, original ownership
+path and the explicitly approved private `~/FreshRSS-Backups` destination.
+Never install a test schedule or change login/power settings against production.
+
+Routine check: `uv run --locked rss backup-status --check`. JSON is emitted even
+when protection is unhealthy and `--check` exits 1. Registration alone is not a
+successful backup. Inspect daily target/attempt, missed/deferred/failed work,
+latest verified archive age/availability and separate resumption/maintenance
+outcomes. Daily targets are UTC (default 03:00), not the local zone; wakeups may
+lag up to 15 minutes and sleep/logout can miss work. Three actual failures per
+target exhaust automatic retry until the next day. No backlog/pruning is created.
+See [failure response](backup-restore.md#daily-check-and-failure-response).
+
+After interruption, do not force writer restart or remove records/locks. Native
+subprocesses may survive their parent while retaining the command lock. Coordinate
+with the owner, inspect status and processes, then use
+[`backup-reconcile`](backup-restore.md#interrupted-maintenance-and-reconciliation)
+to confirm owned writers idle before releasing maintenance. It never itself
+resumes or changes intent; a separately enabled #22 supervisor may subsequently
+honor running intent. Use its explicit stop-intent procedure first if stopped
+state should persist. Preserve prior good archives,
+source data and sensitive temporary remnants until inspection. A verified archive
+and a successfully resumed service are separate outcomes.
+
+A real unattended mini attempt and sanitized verification/status evidence remain
+required before the production trial. Manually invoking `backup-due`, registering
+a job or passing isolated tests does not supply that evidence. Local publication
+does not prove Time Machine protection; actual copy retrieval and isolated restore
+are separately owner-coordinated (#24).
 
 ## Safe cleanup
 
@@ -218,6 +254,10 @@ This is source verification, not a new live session; see
 - **Backup destination/export failure:** check private external directory permissions,
   free space and engine availability. Follow [failure handling](backup-restore.md#consistency-and-failure-behavior);
   never delete the VM/data as a workaround.
+- **Missed/stale daily backup or maintenance hold:** run `backup-status --check`;
+  follow [daily response and reconciliation](backup-restore.md#daily-check-and-failure-response).
+  Do not mistake a last-archive locator, enabled job or manual backup for daily
+  protection, or force supervision/start through a hold.
 - **Restore target/image refusal:** use a fresh target and exact reviewed matching
   image configuration. Failed imports stay unselected; choose another fresh name.
 - **Registry, virtualization or network failure:** restore prerequisites and retry.

@@ -11,8 +11,8 @@ The supported runtime is a dedicated rootless Podman Linux VM on Apple Silicon
 macOS. Commands explicitly select the owned machine/connection and labelled
 container/volume; they do not adopt colliding resources or change global Podman
 defaults. Only `127.0.0.1:<RSS_PORT>` is published. There is no host PHP/database,
-privileged socket helper, Podman Desktop, login item or automatic application
-startup. Native Linux hosting and other architectures are not implemented/verified.
+privileged socket helper or Podman Desktop. Backup scheduling is a separately
+opted-in per-user LaunchAgent, not automatic application startup. Native Linux hosting and other architectures are not implemented/verified.
 
 The complete FreshRSS `data` directory is in a named volume on the VM's native
 filesystem, initially `rss-aggregator-data`. SQLite avoids an extra database service;
@@ -153,6 +153,41 @@ against arbitrary later changes by other clients, and does not extend cleanup to
 failures before application startup. Initial preflight refusals are nonmutating;
 first-run unconfigured loopback behavior is unchanged. Tailscale itself and
 certificates are never removed/stopped by these commands.
+
+## Daily backup orchestration
+
+`backup_schedule.py` owns daily eligibility, launchd configuration and private
+attempt/publication/freshness evidence around `Recovery`, not a second archive
+format or export engine. CLI remains a thin adapter; `Runtime.run` serializes
+callable and CLI operations under the existing nonblocking lock. launchd uses the
+stable selected checkout's installed Python with isolated imports and captured
+absolute settings/dependency paths, without an interactive shell or uv downloads.
+The UTC daily policy and bounded retries are detailed in the
+[backup procedure](backup-restore.md#opt-in-daily-mac-backups).
+
+Temporary maintenance and persisted operator intent are deliberately separate.
+A durable, owner-tagged hold precedes quiescing, covers export/publication and
+prior-mode resumption, and survives process death. Runtime subprocesses inherit
+the locked descriptor: an orphaned export retains serialization even after its
+parent is SIGKILLed. Public writer operations and the #22 supervisor must refuse
+any hold, not infer that a stopped container is an application failure. Backups
+never write intent, and never resume persisted stopped intent. A failed/uncertain
+capture cannot authorize automatic writer recovery.
+
+Reconciliation is an explicit locked, ownership-checked idle-engine operation,
+not a timer/PID-based stale-marker cleanup or automatic resume. Ordinary completed
+shutdown refusals retain the pre-existing forwarding/retry semantics; abrupt death
+still retains maintenance. Private JSON writes flush/fsync before atomic replace
+and directory fsync. Archive publication remains verified, nonoverwriting hard-link
+publication with directory fsync. No new pruning/export/transfer engine is introduced.
+
+Latest attempt, verified publication and safe resumption are separate facts; a
+published archive survives failed resumption, and an interrupted/missed/contended
+job is never success. `backup-status` can inspect atomic records read-only while
+busy. Scheduler registration and manual archives cannot stand in for eligible
+daily work or actual unattended evidence. An available local archive is not proof
+of Time Machine inclusion/retrieval or host-loss recovery. Existing full-state
+live tests remain explicit selections, not default-suite proof of infrastructure.
 
 ## Decisions
 

@@ -85,7 +85,16 @@ Hook-refusal permutations use minimal disposable repositories and installed CLI
 code without repeatedly synchronizing environments. Full environments remain for
 installation, actual disposable pushes and A/B isolation tests. Fixture-only import
 sentinels verify selected-code isolation without rewriting production source or
-relying on unrelated test counts. Runtime root/configuration tests are separate.
+relying on unrelated test counts. Runtime root/configuration tests are separate. Daily-backup regressions use the
+same CLI/Runtime seam, private temporary destinations, synthetic source data,
+controlled launchctl/Podman responses and an aware `now` at the public orchestration
+boundary. No actual LaunchAgent is installed by the default suite. Coverage includes
+opt-in/idempotence, eligibility/missed/stale work, bounded retry and contention,
+changed ownership/code/dependencies, stopped intent, archive/resumption separation
+and prior-archive preservation. Disposable processes are SIGKILLed during export
+and immediately before/after hard-link publication; surviving external exports
+retain the lock and block reconciliation until finished. These are real process/
+filesystem boundaries, not ordinary exception-unwinding substitutes.
 Readiness regressions use controlled Podman responses plus a disposable loopback
 HTTP server, not live-VM fault injection.
 
@@ -205,7 +214,9 @@ The six retained live tests cover:
   It retains production Click behavior/ownership/locking while redirecting reserved
   resources, selection/provenance, backup-locator and Serve-record names. Fixture
   `test-<token>-last-backup.json` is removed on cleanup and the user's normal
-  locator bytes/absence preserved. Separate VM-restart tests still update the real
+  locator bytes/absence preserved. Backup attempt/publication/daily/maintenance/
+  intent records are also fixture-namespaced; the recovery runner verifies separate
+  publication/resumption status and never claims daily protection from manual backup. Separate VM-restart tests still update the real
   locator with a real instance backup in `RSS_BACKUP_DIR`.
 
 Replacement/recovery fixture runners force loopback mode and reserved Serve-record
@@ -243,17 +254,21 @@ working directory. Defaults are resolved per instance, not an import-time single
 Construction itself does not inspect or change native resources.
 
 `run(operation, *, archive=None, volume=None, username=None, api_password=None,
-loopback=False)` returns the same JSON-compatible operation dictionaries and sends
+loopback=False, now=None, hour=3, minute=0)` returns the same JSON-compatible operation dictionaries and sends
 diagnostics to stderr. It serializes callable as well as CLI callers under the
 same nonblocking project lock. Unknown operations/ownership/lock failures raise
 `RuntimeFailure`; OS/configuration errors propagate for the caller to handle.
-There are eleven public operations, not a command for every helper.
+There are sixteen public operations, not a command for every helper. Optional
+`now` is an aware `datetime` controlling backup eligibility/freshness tests only;
+there is no CLI clock override. Omit it in production. `hour`/`minute` apply only
+to explicit `backup-enable` and use UTC.
 
 | Call | Required values and behavior |
 | --- | --- |
 | `run("setup")`, `run("start")`, `run("status")`, `run("fetch")`, `run("verify")`, `run("replace")`, `run("stop")`, `run("backup")` | Same guards, side effects, defaults and results as their [CLI commands](cli.md#runtime-commands-and-results). |
 | `run("restore", archive=Path(...), volume="fresh-name")` | Requires archive path and fresh target name; missing values raise `ValueError`. Shares archive validation, ownership and no-activation safeguards. |
 | `run("select-volume", volume="owned-name")` | Requires volume name; omission raises `ValueError`. Same stopped-app/running-VM and provenance checks. |
+| `run("backup-enable", hour=3, minute=0)`, `run("backup-disable")`, `run("backup-due")`, `run("backup-status")`, `run("backup-reconcile")` | Same opt-in, captured-setting, daily retry, status and maintenance semantics as the [CLI](cli.md#daily-backup-status-results). Status returns `protected` for callable checks; CLI `--check` translates false into exit 1. Busy status alone may return an atomic read-only view without the operation lock. |
 | `run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")` | No prompts; supply credentials only in local process memory, never source/shell arguments. Same owned/running/security-checked app and active-forwarding guards; only sanitized counts/diagnostics/transport returned. Optional `loopback=True` selects the verified owned HTTP publication and returns `https_verified: false`; omitted/false retains trusted HTTPS. |
 
 `Operation`, `Runtime` and `RuntimeFailure` are exported by `rss_aggregator`.
@@ -314,6 +329,21 @@ intended check. They demonstrate gate failure semantics for those revisions, not
 new CI results or branch protection.
 
 Remaining limits:
+
+- Daily scheduling tests use disposable launchd/engine substitutes; actual per-user
+  launchd registration/output compatibility, a natural unattended mini run and
+  missing-session/sleep behavior require owner-coordinated evidence with a verified
+  pre-change backup. The selected full-state integration test is separate and does
+  not prove daily timing or Time Machine inclusion/retrieval. No test may activate a
+  production schedule, create the real owner destination or change host settings
+  without that coordination.
+- #22 supervision shares operator-intent version 1, maintenance presence (including
+  dangling links) and the same inherited command lock. Combined-revision tests must
+  verify supervisor/backup interaction after integration; independent branch passes
+  are not combined proof. Native daemonizing Podman helpers must close unrelated
+  inherited descriptors; the controlled orphan test is not evidence for their real
+  descriptor behavior. A stuck inherited lock requires inspection, never unlinking
+  the lock/hold. Live integration of that behavior remains an explicit Mac check.
 
 - Python 3.10 (declared minimum), other Mac providers/versions, alternate image
   architectures and native Linux rootless-Podman integration remain unverified.

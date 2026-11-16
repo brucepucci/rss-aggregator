@@ -6,7 +6,7 @@ import sys
 
 import click
 
-from rss_aggregator import private_access, recovery, runtime
+from rss_aggregator import backup_schedule, private_access, recovery, runtime
 
 from .replacement_support import owned_runtime, replacement_names
 from .support import expect
@@ -23,7 +23,8 @@ def run():
         "Use the real existing owner directory",
     )
     expect(
-        request["operation"] in {"backup", "restore", "select-volume", "start"},
+        request["operation"]
+        in {"backup", "backup-status", "restore", "select-volume", "start"},
         "Unsupported recovery test operation",
     )
     runtime.APP, runtime.VOLUME, runtime.CHECK = app, source, check
@@ -32,6 +33,21 @@ def run():
     runtime.SELECTION = "test-" + token + "-selection.json"
     recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
     recovery.BACKUP_RECORD = "test-" + token + "-last-backup.json"
+    for name in (
+        "ATTEMPT",
+        "SUCCESS",
+        "DAILY",
+        "SCHEDULE",
+        "MAINTENANCE",
+        "DEFER",
+        "INTENT",
+    ):
+        setattr(
+            backup_schedule,
+            name,
+            "test-" + token + "-" + getattr(backup_schedule, name),
+        )
+    recovery.SUCCESS = backup_schedule.SUCCESS
     private_access.SERVE_RECORD = "test-" + token + "-serve.json"
     os.environ["RSS_TAILSCALE"] = "0"
     operation = request["operation"]

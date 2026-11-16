@@ -34,14 +34,15 @@ The named data volume is not a backup, and `.local/` is not a disposable tool ca
 | --- | --- | --- |
 | `RSS_PORT` | Optional; `8080`. Mac IPv4 loopback TCP port, integer `1024–65535`. No LAN/IPv6/all-interface publication. | Export consistently for operational commands, e.g. `export RSS_PORT=8081`. Existing containers need `replace`; installed loopback instances also need the base URL changed as below. Invalid values refuse startup. |
 | `RSS_TAILSCALE` | Optional; `0` (loopback-only). Exactly `1` enables private Serve HTTPS on fixed node port 443; any other value fails. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and incoming TCP 443 authorization. | Keep set for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value. Explicit `backup` restores the observed prior forwarding mode, even after snapshot failure, rather than applying this shell's opt-in. Set `0` and run `start` to remove the owned route and return an installed instance's base URL to loopback; API enablement/passwords remain. |
-| `RSS_BACKUP_DIR` | Required for explicit backup and shutdown with data; **no default**. Absolute host directory outside this and every other Git checkout. New directory mode `0700`, archives `0600`; an existing directory must be owned by you with no group/other permissions. Destination filesystem must support hard links for atomic non-overwriting publication. | Export before `backup`/`stop`, as below. Changing it chooses a new destination; existing archives are not moved, pruned or uploaded. Not required to validate/restore an archive, or to repeat shutdown of an already-stopped VM. |
+| `RSS_BACKUP_DIR` | Required for explicit/daily backup and shutdown with data; **no default**. Absolute host directory outside this and every other Git checkout. New directory mode `0700`, archives `0600`; an existing directory must be owned by you with no group/other permissions. Destination filesystem must support hard links for atomic non-overwriting publication. | Export before `backup`/`stop`/`backup-enable`, as below. The owner's approved deployment value is explicitly `$HOME/FreshRSS-Backups`, not an implicit default. Daily jobs capture the resolved value: disable/re-enable to change it. Changing it for manual commands chooses a new destination; existing archives are not moved, pruned or uploaded. Not required to validate/restore an archive, or to repeat shutdown of an already-stopped VM. |
 | `RSS_STATE_DIR` | Optional; `<source-checkout>/.local`. Ownership, inventory, lock, recovery-selection and security records; **not** the FreshRSS database location. | Prefer an absolute private path, never tracked by Git; choose any custom location outside Git. Set before setup and use consistently. The implementation expands `~` and resolves relative values against the process working directory; absolute paths avoid ambiguity. Changing it does not adopt or migrate an existing machine. |
 
-Example backup destination (choose a private durable location appropriate to your
-host; this placeholder-like local path is not an automatic default):
+This deployment's explicitly approved destination is below, not an automatic
+global default. Other deployments must choose their own private durable location:
 
 ```sh
-export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
+# Explicitly approved for this deployment; never created merely by reading config:
+export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
 ```
 
 A local archive on the same Mac does not protect against losing that Mac. Keep
@@ -53,6 +54,30 @@ that checkout's existing private ownership directory before operating it. Worktr
 do not namespace Podman resources. Keep a single controlling checkout; never copy,
 replace or fabricate ownership records to adopt resources. Preserve the ownership
 directory when relocating a checkout.
+
+## Daily backup configuration
+
+No new environment default enables scheduling. Explicit `backup-enable` captures
+`RSS_STATE_DIR`, resolved `RSS_BACKUP_DIR`, `RSS_PORT` (8080 when omitted),
+`RSS_TAILSCALE` (0 when omitted), normal-user `HOME`, the absolute selected checkout
+and its own `.venv/bin/python`. It captures absolute Podman/launchctl and required
+Tailscale paths and builds PATH only from their directories plus standard system
+bins. It does not inherit arbitrary shell state, aliases or `.env`. Keep executables
+and installed code available; status detects missing/mismatching selected code or
+captured dependencies. No dependency installation or host setting change is implicit.
+
+The explicit `--hour`/`--minute` policy defaults to **03:00 UTC**, with launchd
+15-minute wakeups/RunAtLoad and at most three actual attempts per daily target.
+Freshness is **26 hours**, with missed-attempt reporting after 15 minutes; these
+are fixed policy constants, not environment overrides. A private `0700` owned state
+directory is required for enable. The private `0600` job is
+`~/Library/LaunchAgents/io.rss-aggregator.backup.plist`, in the normal user's GUI
+session. Existing job conflicts are refused. Use `backup-disable` then enable to
+apply deliberate captured-setting/checkout/dependency-path changes; never hand-edit
+managed records or move archives/ownership implicitly. Follow the
+[owner-coordinated setup and recovery safeguards](backup-restore.md#opt-in-daily-mac-backups).
+Linux scheduling, pre-login availability, wake/power changes and external alerts
+are unsupported. Installed configuration is not successful unattended protection.
 
 ## Checked-in application configuration
 
@@ -94,7 +119,7 @@ These values are implementation settings, not environment overrides or CLI flags
 | Podman VM/connection | `rss-aggregator`, rootless. Initial 2 CPUs, 2048 MiB RAM, 20 GiB virtual disk capacity; capacity is not immediate physical disk use. No project resize/delete command. Machine/SSH/connection identity is ownership-checked. |
 | Application / preflight container | `rss-aggregator-freshrss` / disposable `rss-aggregator-check`; ownership label `io.rss-aggregator.owner`. Do not relabel resources to force adoption. |
 | Initial data volume | `rss-aggregator-data`, mounted at `/var/www/FreshRSS/data` on the VM's native filesystem. Change active selection with `rss select-volume NAME`, not by editing records. |
-| Publication / restart | `127.0.0.1:${RSS_PORT}:80`, `--restart=no`. Official image entrypoint/default command retained. No host cron, login item or service registration. |
+| Publication / restart | `127.0.0.1:${RSS_PORT}:80`, `--restart=no`. Official image entrypoint/default command retained. No automatic application startup. Daily backup LaunchAgent registration occurs only through explicit `backup-enable`; no host cron is installed. |
 | Container environment | `CRON_MIN=*/20`, `TZ=UTC`, `ENABLE_ACCESS_LOG=0`, `COPY_LOG_TO_SYSLOG=Off`, `COPY_SYSLOG_TO_STDERR=Off`, `TRUSTED_PROXY=0`, initial internal gate `LISTEN=127.0.0.1:8088`. Apply reviewed changes with `replace`. |
 | Homebrew safeguards | Child commands force `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_INSTALL_UPGRADE=1`, `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`, `HOMEBREW_NO_INSTALL_CLEANUP=1`. Not user bypass switches; setup refuses an upgrade/reinstall plan. |
 
@@ -122,6 +147,13 @@ not permission to uninstall packages that other projects may later use.
 | `selected-volume.json` | Explicitly selected owned data-volume name; absence means `rss-aggregator-data`. Use `rss select-volume NAME` with running VM/stopped application. |
 | `recovery-volumes.json` | Per-volume image provenance, import completeness and completed-first-activation marker. Never edit incomplete imports into ready state or bypass activation markers. Backup refuses unattached volumes without known matching provenance; start with the reviewed matching pin first. |
 | `last-backup.json` | Most recently published archive location and whole-ZIP checksum. Useful if a later resumption/operation step fails; not a substitute for archive verification or durable storage. |
+| `backup-schedule.json` | Version/owner, selected checkout/state/Python/job paths, UTC hour/minute, captured environment and absolute dependencies, job SHA-256, policy identity (definition plus UTC target), destination and activation state. Not user-editable; disable/re-enable for changes. |
+| `backup-attempt.json` | Latest manual/daily/normal-stop attempt start, kind, outcome and resumption/action. Running plus a free lock is interrupted, never successful. Secret-safe fixed diagnostics, no engine stderr/content. |
+| `backup-success.json` | Latest verified publication result, completion time and selected volume. Written before resumption, retained after later failures. Availability/freshness is not Time Machine inclusion or proof of unattended invocation. |
+| `backup-daily.json` | Today's/most recent eligible UTC target, captured policy identity, attempt count/time, volume and running/success/failed outcome. At most three actual tries per target; never a backlog of older daily targets. |
+| `backup-defer.json` | Most recent contention time/action, independently atomically recorded without overwriting an active attempt. Deferral is not success. |
+| `maintenance.json` | Durable version 1, owner token, operation (`backup`/`stop`), UTC start and phase (`preparing`, `quiescing`, `snapshot`, `resuming`, `stopping_vm`). Presence blocks writers/supervision; never remove by hand. `backup-reconcile` validates owner/schema and idle engines without resuming or changing intent. |
+| `operator-intent.json` integration | Sibling #22 owns version 1 `intent: running/stopped`; absence preserves legacy observed backup state, but never enables running intent. Backups only read it and never resume persisted stopped intent. Invalid records fail closed. |
 | `security.json` | Last sanitized image/effective-web/CLI-PHP check, which may identify the disposable preflight rather than the app after a failed start. Past audit metadata is not proof of current readiness or a current advisory scan. |
 | `host-before.json`, `host-latest.json` | First successful host inventory and most recent later inventory, recorded before installation. `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. Failed inventory does not replace previous records. |
 | Cask fallback inventory fields | Only when `brew list --cask --versions` fails: `cask_names` retains raw newline-delimited names and `cask_inventory_warning` retains failed query, exit code and original stderr. `casks` contains only known installed versions from JSON, never latest available versions; incomplete names can exist only in `cask_names`. Empty inventories are valid. No manual configuration/bypass; see [operations](operations.md). |

@@ -31,17 +31,149 @@ encryption; keep independent copies on durable storage. A copy on the same Mac
 cannot protect against losing that Mac.
 
 ```sh
-export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
+# Explicitly approved for this deployment, not a global default:
+export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
 uv run --locked rss backup
 # Or back up as part of normal shutdown:
 uv run --locked rss stop
 ```
 
 Success returns the archive path, whole-ZIP SHA-256 and verified manifest as JSON.
-Inspect `status` and private `last-backup.json` if resumption fails after publication.
+Inspect `backup-status` and private `last-backup.json` if resumption fails after
+publication; archive success and resumption are separate.
 Do not treat an interrupted unpublished file as a completed archive. Nothing
 prunes, overwrites or uploads prior backups. See [failure behavior](#consistency-and-failure-behavior)
 before assuming a failed operation left the service stopped.
+
+## Opt-in daily Mac backups
+
+**Owner-coordinated operational change:** obtain a verified instance backup before
+production activation. Confirm the stable controlling checkout, original ownership
+directory, destination, normal Mac user/session and dependencies. Do not exercise
+production or change login, power or security settings merely to test scheduling.
+The approved production destination is explicitly `~/FreshRSS-Backups`; disposable
+tests use separate private directories. Existing unsafe permissions are refused,
+not silently repaired. After coordination, from the synchronized checkout:
+
+```sh
+export RSS_STATE_DIR="/absolute/private/existing/ownership-directory"
+export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
+# Also retain the instance's consistent RSS_PORT and RSS_TAILSCALE settings.
+uv run --locked rss backup-enable --hour 3 --minute 0
+uv run --locked rss backup-status --check
+```
+
+The initial check fails until eligible daily work succeeds: installation is not
+protection. Enable explicitly bootstraps only the private per-user
+`~/Library/LaunchAgents/io.rss-aggregator.backup.plist` in the normal user's GUI
+session. It captures absolute checkout, `.venv/bin/python`, original ownership
+path, destination, port, forwarding setting and a dependency-only executable PATH.
+The job uses no interactive shell, uv, `.env`, aliases or package installation.
+Keep the selected checkout/environment available. Identical enable is repeatable;
+settings changes require disable then enable. Changed policies/destinations require
+new daily evidence; old successes cannot suppress their first eligible capture. Conflicting/unowned/changed job
+files or loaded paths/programs are refused, never replaced or adopted.
+
+Policy is **03:00 UTC daily** by default, adjustable with `--hour`/`--minute`, not
+local daylight-saving time. launchd wakes every **15 minutes** and at load. Actual
+failures retry no sooner than 15 minutes, at most **three attempts per UTC target**,
+then wait for the next day's target; manual `backup` remains available. Contention
+records a separate defer and retries on a later wakeup, without consuming the
+actual-attempt budget or building an overlapping job backlog.
+
+Sleep, logout/unavailable sessions, unavailable code/dependencies or host loss
+prevent guarantees. No wake-from-sleep or pre-login service is installed. After
+today's target, a wakeup catches up once for today's target, not every missed day;
+before today's target it waits, reporting stale history instead of backfilling.
+No archive pruning, transfer, encryption or Time Machine configuration is performed.
+
+### Daily check and failure response
+
+```sh
+uv run --locked rss backup-status --check
+```
+
+Inspect `enabled`, `registered`, `scheduler_problem`, `daily_attempt`,
+`next_expected_attempt`, `daily_due`, `missed`, `latest_defer`, `latest_attempt`,
+`latest_success`, `age_seconds`, `overdue`, `archive_available`, `resumption` and
+`maintenance_required`. `--check` emits the JSON and exits 1 unless `protected` is
+true; ordinary status exits 0 when inspection succeeds even if unhealthy. Status
+is available read-only while busy. A recovery point becomes stale after **26
+hours** (daily cadence plus a two-hour reporting allowance, not extra promised
+protection). A target with no attempt more than 15 minutes after due is `missed`.
+
+`protected` requires a recent successful eligible daily operation, an available
+verified archive for the selected volume, registration/dependencies and no due,
+maintenance or latest-attempt failure condition. Manual/stop-time backups cannot
+substitute for daily evidence. Status does not rehash archives on every check.
+Manual `backup-due` can exercise eligibility but **does not prove an actual
+unattended launchd run**.
+
+- Destination/export/integrity/write failure: preserve source and prior archives;
+  inspect private directory permissions, free space and local engine availability.
+  Share only sanitized outcomes, never raw engine diagnostics or archived content.
+- Missing checkout/Python/dependencies/registration: restore selected paths; if
+  needed run `uv sync --locked` in the selected checkout. For deliberate changes,
+  disable and re-enable the exact owned job. Do not copy ownership records or
+  overwrite another job to force adoption.
+- Contention: inspect the ongoing command; defer is not success. A stuck native
+  subprocess can still hold the inherited lock. Do not remove locks/holds or kill
+  production processes without owner coordination.
+- Verified archive but failed resumption: preserve the archive and inspect the
+  maintenance hold; use reconciliation below before explicit restart.
+
+Opt out without deleting data, evidence or archives:
+
+```sh
+uv run --locked rss backup-disable
+```
+
+Disable uses the same nonblocking lock: it does not interrupt an active backup,
+and refuses changed/unowned definitions. Manual and normal-stop backups remain.
+Record a real unattended mini run after owner-approved activation, with sanitized
+scheduled/attempt/completion times, archive verification/checksum and status.
+Registration, fake clocks or a manually invoked job are not that evidence.
+
+### Interrupted maintenance and reconciliation
+
+A durable hold precedes backup VM/writer mutations and remains through capture
+and resumption. Native subprocesses inherit the project lock: killing a parent
+cannot let supervision restart writers while its export survives. Any hold,
+including malformed data, blocks managed writer operations and supervision.
+Temporary maintenance never changes persisted operator intent; resumption refuses
+persisted stopped intent. Inspect `backup-status` and local process/engine state
+with the owner, then:
+
+```sh
+uv run --locked rss backup-reconcile
+uv run --locked rss backup-status
+# Only after inspection, if running is intended:
+# uv run --locked rss start
+```
+
+Reconciliation acquires the lock, validates marker owner/schema and the real
+VM/connection, safely stops only owned writers/forwarding and verifies both engines
+idle. Foreign workloads, uncertain forwarding or a surviving locked export cause
+refusal. It never starts a stopped VM, resumes the app or changes operator intent.
+Success clears the hold but does not itself start anything. When #22 supervision
+is separately enabled, a later tick may honor persisted running intent after this
+confirmed-idle release. To keep stopped, use that feature's explicit stop-intent
+procedure before releasing maintenance; stop persists intent even if the hold
+refuses its shutdown work. Corrupt or unrecognized records require deliberate
+inspection, not hand-edited JSON.
+
+Hidden `.rss-export-*`/`.rss-backup-*` remnants can survive abrupt death. They are
+not completed archives and are never automatically promoted or pruned. A final
+archive linked just before death may be valid but absent from success evidence;
+after reconciliation, validate a trusted copy through restore into a fresh owned
+volume before relying on it. Never rename a temporary file into a backup. Cleanup
+of sensitive remnants is a separate owner-approved action after confirming idle.
+
+A daily interval accepts roughly **24 hours of reading-state loss** under normal
+successful operation, not during failures. This child alone does not prove
+host-loss protection. #24 separately verifies actual Time Machine inclusion,
+access/encryption assessment, retrieval and isolated full-instance recovery of a
+scheduled copy. Local publication and private permissions are not that evidence.
 
 ## Format version 1
 

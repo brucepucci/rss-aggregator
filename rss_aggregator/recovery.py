@@ -5,10 +5,12 @@ import os
 import re
 import stat
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rss_aggregator.archives import create_archive, validate_archive
+from rss_aggregator.backup_schedule import SUCCESS, BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
 
 if TYPE_CHECKING:
@@ -245,16 +247,33 @@ class Recovery:
             BACKUP_RECORD,
             {"archive": result["archive"], "sha256": result["sha256"]},
         )
+        runtime._save(
+            SUCCESS,
+            {
+                **result,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "volume": runtime.volume,
+            },
+        )
         return result
 
     def backup(self) -> dict[str, Any]:
         """Back up while preserving the prior VM/application running state."""
         runtime = self.runtime
         directory = self._directory()
-        owner, was_stopped = self._ensure_vm()
+        owner, _machine = runtime._owned()
+        maintenance = BackupSchedule(runtime)
+        maintenance.begin(owner, "backup")
+        was_stopped = False
         was_running = False
         quiesced = False
+        quiescing = False
+        vm_ready = False
+        snapshot_finished = False
+        restored = False
         try:
+            owner, was_stopped = self._ensure_vm()
+            vm_ready = True
             was_private = PrivateAccess(runtime).status(owner)["status"] == "running"
             runtime._check_label("volume", runtime.volume, owner)
             self._source_image(owner)
@@ -262,15 +281,38 @@ class Recovery:
                 was_running = runtime._check_label("container", self.app, owner)[
                     "State"
                 ]["Running"]
+            maintenance.phase("quiescing")
+            quiescing = True
             self._engines_idle(owner, stop=True)
             quiesced = True
-            return self.snapshot(owner, directory)
+            maintenance.phase("snapshot")
+            try:
+                result = self.snapshot(owner, directory)
+            except Exception:
+                snapshot_finished = True
+                raise
+            snapshot_finished = True
+            return result
         finally:
-            if was_running and quiesced:
-                runtime._start(private_https=was_private)
-            elif was_stopped:
-                self._engines_idle(owner, stop=False)
-                runtime._run("podman", "machine", "stop", self.machine)
+            safe_to_restore = vm_ready and (
+                not quiescing or (quiesced and snapshot_finished)
+            )
+            try:
+                if safe_to_restore:
+                    if was_running and quiesced and maintenance.may_resume():
+                        maintenance.phase("resuming")
+                        runtime._start(private_https=was_private)
+                    elif was_stopped:
+                        self._engines_idle(owner, stop=False)
+                        runtime._run("podman", "machine", "stop", self.machine)
+                    restored = True
+            finally:
+                if restored:
+                    maintenance.finish()
+                else:
+                    runtime._diagnostic(
+                        "Backup maintenance remains unresolved; run rss backup-status and rss backup-reconcile. Archive success and resumption are separate."
+                    )
 
     def shutdown(self) -> dict[str, Any]:
         """Back up stopped writers before stopping the VM; fail closed on export errors."""
@@ -289,7 +331,18 @@ class Recovery:
                 + machine["State"]
                 + "; wait and inspect before retrying."
             )
-        self._engines_idle(owner, stop=True)
+        maintenance = BackupSchedule(runtime)
+        maintenance.begin(owner, "stop")
+        maintenance.phase("quiescing")
+        try:
+            self._engines_idle(owner, stop=True)
+        except Exception:
+            # A completed native refusal cannot leave an export running: capture
+            # has not begun. Preserve normal stop/forwarding retry semantics.
+            # Abrupt process death/BaseException still leaves the durable hold.
+            maintenance.finish()
+            raise
+        maintenance.phase("snapshot")
         try:
             backup = (
                 self.snapshot(owner)
@@ -297,12 +350,16 @@ class Recovery:
                 else {"status": "no_data"}
             )
         except (self.failure, OSError, ValueError, KeyError, TypeError) as error:
+            self._engines_idle(owner, stop=False)
+            maintenance.finish()
             raise self.failure(
                 "Shutdown backup failed; application writers remain stopped and VM remains running. Fix RSS_BACKUP_DIR/export and retry rss stop. "
                 + str(error)
             ) from error
         self._engines_idle(owner, stop=False)
+        maintenance.phase("stopping_vm")
         runtime._run("podman", "machine", "stop", self.machine)
+        maintenance.finish()
         return {"machine": "stopped", "already_stopped": False, "backup": backup}
 
     def restore(self, archive: Path, volume: str) -> dict[str, Any]:

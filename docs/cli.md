@@ -13,7 +13,7 @@ Run from a synchronized checkout (`uv sync --locked` first):
 
 | Invocation | Purpose and accepted arguments/options |
 | --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the eleven operations below. |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the sixteen operations below. |
 | `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint; Python's `-m` selects the module. |
 | `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. It is not a Python module to pass to `python3`. |
 | `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
@@ -42,13 +42,15 @@ not the invoked application's access to live services.
 ## Runtime commands and results
 
 Use `uv run --locked rss COMMAND` or either runtime alias above. Every subcommand
-accepts `--help`. Except for `api-check`, `restore` and `select-volume`, commands
+accepts `--help`. Except for `api-check`, `restore`, `select-volume`,
+`backup-enable` and `backup-status`, commands
 have **no positional arguments or options other than `--help`**.
 
 Successful operations emit exactly one indented JSON object on stdout and exit 0.
 Progress/underlying command chatter goes to stderr. Runtime/configuration/external
 command failures exit 1 with stderr diagnostics and **no result JSON**; invalid
-usage exits 2. Capture stdout separately when consuming results. Results are
+usage exits 2. Exception: `backup-status --check` emits inspection JSON and exits
+1 when protection is unhealthy. Capture stdout separately when consuming results. Results are
 operation-specific, not a universal envelope; there is no extra text-output mode.
 
 | Command | Purpose and prerequisites | JSON result fields |
@@ -61,6 +63,11 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | `rss verify` | Requires a running owned VM; runs the normal start/restart path, including effective Apache PHP, cron and immediate fetching checks. Can start a stopped application; briefly interrupts a running one. | Start fields plus `verified: true`. |
 | `rss replace` | Requires a running owned VM and selected owned data volume. Stop/remove only the owned application container, then recreate it with current configuration, preserving named volumes. First-recovery-activation pin and opt-in checks precede removal. | Start fields plus `replaced: true`. |
 | `rss backup` | Quiesce writers, create/verify an external archive in `RSS_BACKUP_DIR`, then attempt to restore prior application/forwarding/VM state, even on snapshot failure. Can temporarily start an owned stopped VM without starting the application. | `archive`, `sha256`, `verified: true`, `manifest`. |
+| `rss backup-enable [--hour H] [--minute M]` | Explicitly install/activate the owned daily Mac LaunchAgent. Requires the normal user's GUI session, synchronized selected checkout `.venv`, absolute dependency PATH, existing VM ownership, private state/destination and a verified pre-change backup plus owner coordination for production. Captures settings; identical repeats are safe. | `enabled: true`, `job`, `daily_utc`, `next_expected_attempt` (UTC ISO timestamp). Activation failure is not successful protection. |
+| `rss backup-disable` | Remove only the exact unchanged owned job under the project lock; never interrupts active work. Refuses foreign/changed definitions. | `enabled: false`; removal also returns `archives_preserved: true`. Already unconfigured is a no-op; preserves archives and evidence. |
+| `rss backup-due` | Scheduler entrypoint: execute eligible daily work through existing backup guards. No automatic installation. Uses captured settings/dependencies; refuses a mismatching invocation. | `outcome: "disabled"`, `"not_due"` (with `next_expected_attempt`) or `"success"` (with nested `backup` archive result). Failures/contention exit 1, not a successful archive. Manual invocation is not unattended timing evidence. |
+| `rss backup-status [--check]` | Inspect private evidence, scheduler/dependencies and freshness without changing runtime resources; remains read-only when the lock is busy. | Status fields below; a successful inspection need not mean protection is healthy. |
+| `rss backup-reconcile` | After owner inspection, validate maintenance ownership and confirm both engines idle, safely stopping only owned writers/forwarding if needed. Does not start a stopped VM or resume the app. Surviving exports/foreign workloads/uncertain forwarding refuse. | `reconciled: boolean`, `resumed: false`, `action`. No hold is a no-op. Clear only through this command, never hand-edit records. |
 | `rss restore ARCHIVE --volume NAME` | Validate locally, then import into a fresh owned volume. May start only the owned VM; leaves it running. Does not activate the imported data, overwrite an existing volume, or require `RSS_BACKUP_DIR`. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
 | `rss select-volume NAME` | Select an owned volume while the VM runs and the application is stopped/absent. Refuses incomplete imports or recorded-image mismatch. Does not start the app or delete the original volume. | `volume`, `selected: true`, `next_step`. |
 | `rss stop` | Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
@@ -73,6 +80,9 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | `restore ARCHIVE` | Required existing local file; no default. Relative paths resolve from the process working directory. | Missing/nonexistent/directory arguments are usage errors (exit 2). Invalid/corrupt/incompatible archive content fails the operation (exit 1) before VM startup or volume creation. |
 | `restore --volume NAME` | Required option, no default. | Fresh target name, different from the selected name even when that selected volume is absent. Every existing target is refused, including empty owned volumes. Failed imports retain an incomplete, unselected target; choose a different fresh name to retry. |
 | `select-volume NAME` | Required positional volume name, no default. | Existing owned target; selection alone does not activate it. Use `replace` afterward if an old application container exists, otherwise `start`. |
+| `backup-enable --hour H` | Optional integer `0–23`, default `3`. | Daily UTC hour, not local time; invalid range/type is usage error 2. Changing an installed policy requires disable/re-enable. |
+| `backup-enable --minute M` | Optional integer `0–59`, default `0`. | Daily UTC minute; invalid range/type is usage error 2. Wakeups may lag the target by up to 15 minutes while the session/host is available. |
+| `backup-status --check` | Optional boolean, default absent. | Emit the same status JSON, then exit 1 with sanitized stderr guidance unless `protected` is true; inspection errors still fail without JSON. |
 | Volume name syntax | Applies to both commands above. | 1–128 characters, first ASCII letter/digit, remaining ASCII letters/digits/`_`/`.`/`-`. Not a path or option; invalid names fail the operation (exit 1). |
 
 `api-check` accepts no positional arguments, credential flags/environment variables
@@ -98,7 +108,43 @@ passwords, tokens, feed URLs or article content. See the
 - Backup/restore `manifest`: the [versioned archive metadata](backup-restore.md#format-version-1).
   `sha256` is the whole ZIP checksum, not just the payload checksum.
 
-Commands share a nonblocking local lock: concurrent callers fail rather than queue.
+### Daily backup status results
+
+`backup-status` returns:
+
+- `enabled` (captured schedule activated), `registered` (matching file and loaded
+  path/program/arguments/captured environment), `scheduler_problem` (null or sanitized remediation), `busy`.
+- `daily_attempt`: null or `{slot, count, attempted_at, outcome, volume, policy_id}`;
+  outcome is running/success/failed. `next_expected_attempt`: UTC ISO target or
+  null when unconfigured; an overdue target stays in the past rather than being
+  silently advanced. `daily_due`, `missed` (no attempt 15 minutes after target).
+- `latest_attempt`: null or `{started_at, kind, outcome, resumption?, action?}`;
+  kind is backup/stop, outcome is running/success/failed/interrupted/already_stopped/
+  no_data. A running record observed with a free lock is interrupted, not success.
+- `latest_success`: null or verified archive result plus `completed_at`, `volume`;
+  survives a later failed resumption. `age_seconds`: nonnegative age or null;
+  `overdue`: no success or age over 26 hours; `archive_available` checks existence,
+  not a new whole-archive integrity scan.
+- `latest_defer`: null or `{outcome: "deferred", at, action}`, recorded separately
+  on lock contention without overwriting the active attempt.
+- `resumption`: preserved/failed/unresolved/not_resumed/not_attempted;
+  `maintenance_required`: any hold exists. `protected`: active registration and
+  dependencies, recent successful eligible daily work and available selected-volume
+  success, no overdue/due/maintenance/latest-attempt failure. Manual/normal-stop
+  success alone never satisfies daily protection; no Time Machine or unattended
+  timing verification is implied.
+
+The policy is daily at 03:00 UTC by default, with 15-minute launchd wakeups and
+at most three actual attempts per UTC daily target, at least 15 minutes apart.
+Contention defers to a later wakeup without a queued backlog or consuming the
+actual-attempt budget. Daily evidence is bound to the exact captured policy; a
+changed destination or time requires new eligible success. No pre-target backfill of older missed days occurs.
+See [daily procedures and interruption recovery](backup-restore.md#opt-in-daily-mac-backups).
+
+Commands share a nonblocking local lock: concurrent callers fail rather than queue
+(except read-only busy `backup-status`). Native subprocesses inherit the lock so
+an abruptly killed parent cannot authorize writers during a surviving export.
+Durable maintenance blocks writer operations until explicit reconciliation.
 Resources are normally retained for diagnosis, not automatically rolled back or
 deleted. A failed startup can leave the VM running; first-run loopback readiness
 failure can leave the app serving. Private/previously private post-start failures

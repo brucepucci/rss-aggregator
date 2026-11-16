@@ -109,6 +109,20 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
 
         report = recovery_command(fixture, directory, "backup")
         expect(report["verified"], "Backup was not verified")
+        protection = recovery_command(fixture, directory, "backup-status")
+        expect(
+            protection["latest_success"]["archive"] == report["archive"],
+            "Missing verified publication evidence",
+        )
+        expect(
+            protection["resumption"] == "preserved"
+            and not protection["maintenance_required"],
+            "Backup resumption incomplete",
+        )
+        expect(
+            not protection["enabled"] and not protection["protected"],
+            "Manual backup claimed unattended scheduling",
+        )
         fixture.login()
         assert_persisted_http(fixture, read_id, snapshot)
         app = controller._check_label("container", fixture.name, owner)
@@ -199,6 +213,19 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
         selection.unlink(missing_ok=True)
         records.unlink(missing_ok=True)
         fixture_locator.unlink(missing_ok=True)
+        for name in (
+            "backup-attempt.json",
+            "backup-success.json",
+            "backup-daily.json",
+            "backup-schedule.json",
+            "backup-defer.json",
+            "operator-intent.json",
+        ):
+            (controller.state_dir / ("test-" + fixture.token + "-" + name)).unlink(
+                missing_ok=True
+            )
+        # Never erase an interrupted maintenance hold in fixture cleanup. It must
+        # still block future operations until an owner inspects/reconciles it.
         if original_running:
             result = project("start")
             expect(
