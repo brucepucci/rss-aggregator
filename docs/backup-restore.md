@@ -87,11 +87,16 @@ backup fails safely without publishing an archive. Existing archives are never r
 after publication (for example, failed application resumption) does not erase the
 valid archive and still returns nonzero.
 
-Explicit backup preserves the earlier application/VM running state where safe.
-It can start an owned stopped VM for export without starting the application;
-restoration of a running application goes through the normal security gate.
-Normal shutdown stops the VM only after a successful backup. Failed shutdown
-backup leaves writers stopped and the VM running; fix the cause and retry. This
+Explicit backup attempts to preserve the earlier application/forwarding/VM state
+where safe, including after snapshot failure. A previously running private service
+resumes privately; a loopback-only service stays loopback-only, regardless of the
+current `RSS_TAILSCALE` setting. A failed explicit backup is not confirmation that
+remote access is closed. It can start an owned stopped VM for export without starting
+the application; forwarding-query failure is also covered by VM restoration.
+Restoration of a running application goes through the normal security gate.
+Normal shutdown stops the VM only after a successful backup. Shutdown backup failure
+after quiescing leaves writers/forwarding stopped and the VM running; fix the cause
+and retry. Preflight refusals can leave existing serving state untouched. This
 replaces issue #1's former deferral. A repeat stop of an already-stopped VM does
 not start it or create another archive. There is no bypass to delete data.
 

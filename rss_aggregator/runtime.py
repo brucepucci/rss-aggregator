@@ -16,6 +16,7 @@ from typing import Any, Literal
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.recovery import Recovery, volume_name
 
 Operation = Literal[
@@ -29,6 +30,7 @@ Operation = Literal[
     "backup",
     "restore",
     "select-volume",
+    "api-check",
 ]
 
 MACHINE = "rss-aggregator"
@@ -41,6 +43,10 @@ SELECTION = "selected-volume.json"
 
 class RuntimeFailure(Exception):
     """Report a lifecycle guard or external command failure without CLI coupling."""
+
+
+class ServeConfigRejected(RuntimeFailure):
+    """Report a conditional Serve write known not to have applied any change."""
 
 
 class Runtime:
@@ -94,6 +100,9 @@ class Runtime:
         *,
         archive: Path | None = None,
         volume: str | None = None,
+        username: str | None = None,
+        api_password: str | None = None,
+        loopback: bool = False,
     ) -> dict[str, Any]:
         """Execute one public operation under the nonblocking project lock.
 
@@ -113,6 +122,9 @@ class Runtime:
             "backup": recovery.backup,
             "restore": lambda: recovery.restore(archive, volume),
             "select-volume": lambda: recovery.select_volume(volume),
+            "api-check": lambda: self._api_check(
+                username, api_password, loopback=loopback
+            ),
             "setup": self._setup,
             "start": self._start,
             "status": self._status,
@@ -436,7 +448,7 @@ class Runtime:
                 )
         return owner, current
 
-    def _start(self) -> dict[str, Any]:
+    def _start(self, *, private_https: bool | None = None) -> dict[str, Any]:
         """Start serving only after ownership, image, and effective PHP gates."""
         owner, machine = self._owned()
         if machine["State"] not in ("stopped", "running"):
@@ -453,7 +465,11 @@ class Runtime:
             ) from error
         if not 1024 <= port <= 65535:
             raise RuntimeFailure("RSS_PORT must be between 1024 and 65535.")
+        private = PrivateAccess(self)
+        enabled = private.enabled() if private_https is None else private_https
+        origin = private.prepare(owner, port) if enabled else None
         Recovery(self).check_activation()
+        private.stop(owner)
         if machine["State"] != "running":
             conflicts = [
                 m["Name"]
@@ -559,13 +575,49 @@ class Runtime:
             str(self.root / "config/public-feed.opml"),
             APP + ":/var/www/FreshRSS/data/opml.xml",
         )
-        self._podman("start", APP)
-        security = self._security(owner, target=APP)
-        self._ready(port)
-        scheduler = self._scheduler(owner)
-        fetch = self._fetch()
+        guard_access = bool(origin or private.path.exists())
+        try:
+            self._podman("start", APP)
+            security = self._security(owner, target=APP)
+            self._ready(port)
+            scheduler = self._scheduler(owner)
+            fetch = self._fetch()
+            url = origin or f"http://127.0.0.1:{port}"
+            forwarding = None
+            if guard_access:
+                if fetch["status"] == "installer_pending":
+                    if origin:
+                        raise RuntimeFailure(
+                            "Complete the FreshRSS installer on loopback first (RSS_TAILSCALE=0), then retry private start. No Serve route was published."
+                        )
+                else:
+                    self._configure_access(url, api=bool(origin))
+            if origin:
+                forwarding = private.start(owner, port, origin)
+        except Exception:
+            if not guard_access:
+                raise
+            # Preserved routes can reach an unverified backend even if an earlier
+            # post-start check fails before the authentication gate is evaluated.
+            # Close only the owned application, never roll back foreign Serve.
+            try:
+                app = self._check_label("container", APP, owner)
+                if app["State"]["Running"]:
+                    self._podman("stop", "--time", "60", APP)
+            except Exception:
+                raise RuntimeFailure(
+                    "FreshRSS access/forwarding startup failed; stopping the project "
+                    "application could not be confirmed. It may still be "
+                    "exposed through foreign forwarding. Inspect and close "
+                    "the backend locally; no forwarding rollback was attempted."
+                ) from None
+            self._diagnostic(
+                "FreshRSS access/forwarding startup failed; the owned FreshRSS "
+                "application was stopped. Resolve access settings/forwarding locally "
+                "before retrying; no forwarding rollback was attempted."
+            )
+            raise
         Recovery(self).record_image(activated=True)
-        url = f"http://127.0.0.1:{port}"
         self._diagnostic(
             f"FreshRSS: {url} (form login; complete installer locally on first run)."
         )
@@ -575,6 +627,115 @@ class Runtime:
             "security": security,
             "scheduler": scheduler,
             "fetch": fetch,
+            **({"forwarding": forwarding} if forwarding else {}),
+        }
+
+    def _configure_access(self, origin: str, *, api: bool) -> None:
+        """Set the external origin and retain form authentication without credentials."""
+        options = [
+            "--base-url",
+            origin,
+            "--auth-type",
+            "form",
+            "--allow-anonymous=false",
+            "--allow-anonymous-refresh=false",
+        ]
+        if api:
+            options.append("--api-enabled=true")
+        result = self._podman(
+            "exec",
+            "--user",
+            "www-data",
+            APP,
+            "php",
+            "cli/reconfigure.php",
+            *options,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeFailure(
+                "FreshRSS HTTPS/API configuration failed; inspect the installed instance locally. No credentials were printed."
+            )
+        code = (
+            'require "cli/_cli.php";$c=FreshRSS_Context::systemConf();'
+            'echo json_encode(["api_enabled"=>$c->api_enabled,"auth_type"=>$c->auth_type,'
+            '"allow_anonymous"=>$c->allow_anonymous,"allow_anonymous_refresh"=>$c->allow_anonymous_refresh,'
+            '"base_url"=>$c->base_url]);'
+        )
+        effective = self._podman(
+            "exec", "--user", "www-data", APP, "php", "-r", code, check=False
+        )
+        try:
+            settings = json.loads(effective.stdout)
+        except ValueError:
+            settings = {}
+        if (
+            effective.returncode
+            or not isinstance(settings, dict)
+            or settings.get("auth_type") != "form"
+            or settings.get("allow_anonymous") is not False
+            or settings.get("allow_anonymous_refresh") is not False
+            or settings.get("base_url") != origin
+            or (api and settings.get("api_enabled") is not True)
+        ):
+            raise RuntimeFailure(
+                "FreshRSS effective HTTPS/API configuration differs from the required authenticated settings; no Serve route published. Inspect configuration overrides locally."
+            )
+
+    def _api_check(
+        self, username: str | None, api_password: str | None, *, loopback: bool = False
+    ) -> dict[str, Any]:
+        """Require a running security-checked owned app before sending API credentials."""
+        if not username or not api_password:
+            raise RuntimeFailure(
+                "API check requires a FreshRSS user and separate API password, entered locally."
+            )
+        owner, machine = self._owned()
+        if machine["State"] != "running":
+            raise RuntimeFailure(
+                "Start the project with RSS_TAILSCALE=1 before checking its API."
+            )
+        app = self._check_label("container", APP, owner)
+        audit = self.state_dir / "security.json"
+        security = json.loads(audit.read_text()) if audit.exists() else {}
+        if (
+            not app["State"]["Running"]
+            or security.get("checked_container") != APP
+            or security.get("image_id") != app["Image"]
+        ):
+            raise RuntimeFailure(
+                "Complete a security-checked private start before API authentication."
+            )
+        private = PrivateAccess(self)
+        forwarding = private.status(owner)
+        if forwarding["status"] != "running":
+            raise RuntimeFailure(
+                "Project Serve forwarding is stopped; start with RSS_TAILSCALE=1 first."
+            )
+        origin = forwarding["url"]
+        if loopback:
+            bindings = (
+                app.get("HostConfig", {}).get("PortBindings", {}).get("80/tcp", [])
+            )
+            if len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1":
+                raise RuntimeFailure(
+                    "Loopback API check requires exactly one owned 127.0.0.1 publication."
+                )
+            try:
+                port = int(bindings[0]["HostPort"])
+            except (ValueError, TypeError, KeyError):
+                raise RuntimeFailure(
+                    "Invalid owned loopback API port; inspect project status."
+                ) from None
+            if not 1024 <= port <= 65535:
+                raise RuntimeFailure(
+                    "Invalid owned loopback API port; inspect project status."
+                )
+            origin = f"http://127.0.0.1:{port}"
+        return {
+            **private.check_api(origin, username, api_password),
+            "transport": "loopback" if loopback else "https",
+            "https_verified": not loopback,
         }
 
     def _podman(
@@ -764,6 +925,7 @@ class Runtime:
             "machine": machine["State"],
             "application": "unknown",
             "volume": self.volume,
+            "forwarding": PrivateAccess(self).status(owner),
         }
         self._diagnostic("Project VM: " + machine["State"])
         if machine["State"] == "running":
@@ -877,6 +1039,9 @@ class Runtime:
             raise RuntimeFailure("Start the project before replacing its container.")
         self._check_label("volume", self.volume, owner)
         Recovery(self).check_activation()
+        private = PrivateAccess(self)
+        private.enabled()  # Validate opt-in before stopping forwarding or removing the app.
+        private.stop(owner)
         if self._exists("container", APP):
             self._check_label("container", APP, owner)
             self._podman("stop", "--time", "60", APP)

@@ -110,6 +110,35 @@ def project(tmp_path, tooling_environment):
     return project, run
 
 
+@pytest.fixture
+def foreign_repository(tmp_path, tooling_environment):
+    directory = tmp_path / "foreign"
+    for arguments in (
+        ("git", "init", "--initial-branch=main", str(directory)),
+        (
+            "git",
+            "-C",
+            str(directory),
+            "remote",
+            "add",
+            "origin",
+            str(tmp_path / "unused.git"),
+        ),
+    ):
+        result = subprocess.run(
+            arguments,
+            env=tooling_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    hook = directory / ".git/hooks/pre-push"
+    hook.write_bytes(b"#!/bin/sh\n# Foreign hook must be preserved.\nexit 0\n")
+    hook.chmod(0o755)
+    return directory, hook
+
+
 def invoke(run, command):
     result = run("uv", "run", "--locked", "--offline", "rss-dev", command)
     return result, json.loads(result.stdout)
@@ -407,6 +436,80 @@ def test_fix_does_not_apply_unsafe_changes_even_if_project_config_enables_them(p
     assert not payload["ok"]
     assert "UP031" in result.stderr
     assert sample.read_text() == original
+
+
+@pytest.mark.parametrize("interface", ["callable", "cli"])
+@pytest.mark.parametrize("variable", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
+def test_setup_uses_selected_repository_despite_inherited_git_context(
+    project, foreign_repository, tooling_environment, monkeypatch, interface, variable
+):
+    directory, run = project
+    foreign, foreign_hook = foreign_repository
+    original = foreign_hook.read_bytes(), foreign_hook.stat().st_mode
+    value = str(foreign if variable == "GIT_WORK_TREE" else foreign / ".git")
+    monkeypatch.setenv(variable, value)
+    monkeypatch.setitem(tooling_environment, variable, value)
+    if interface == "callable":
+        payload = setup(directory)
+    else:
+        result, payload = invoke(run, "setup")
+        assert result.returncode == 0, result.stderr
+    assert payload["ok"] and not payload["active"]
+    assert "No Git remote" in payload["reason"]
+    assert not (directory / ".git/hooks/pre-push").exists()
+    assert (foreign_hook.read_bytes(), foreign_hook.stat().st_mode) == original
+
+
+def test_check_does_not_pass_repository_selectors_into_test_subprocesses(
+    project, foreign_repository, monkeypatch
+):
+    directory, _ = project
+    foreign, foreign_hook = foreign_repository
+    original = foreign_hook.read_bytes(), foreign_hook.stat().st_mode
+    for variable, value in {
+        "GIT_DIR": str(foreign / ".git"),
+        "GIT_COMMON_DIR": str(foreign / ".git"),
+        "GIT_WORK_TREE": str(foreign),
+        "GIT_INDEX_FILE": str(foreign / ".git/index"),
+        "GIT_OBJECT_DIRECTORY": str(foreign / ".git/objects"),
+    }.items():
+        monkeypatch.setenv(variable, value)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    (directory / "tests/test_sample.py").write_text(
+        "import os\nimport subprocess\nfrom pathlib import Path\n\n\n"
+        "def test_git_context_is_local():\n"
+        '    variables = (\n        "GIT_DIR",\n        "GIT_COMMON_DIR",\n'
+        '        "GIT_WORK_TREE",\n        "GIT_INDEX_FILE",\n        "GIT_OBJECT_DIRECTORY",\n    )\n'
+        "    for name in variables:\n"
+        "        present = name in os.environ\n"
+        "        assert not present\n"
+        '    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull\n'
+        "    actual = subprocess.check_output(\n"
+        '        ["git", "rev-parse", "--show-toplevel"], text=True\n'
+        "    ).strip()\n"
+        "    assert Path(actual).resolve() == Path.cwd().resolve()\n"
+        '    assert subprocess.check_output(["git", "remote"], text=True) == ""\n'
+    )
+    assert check(directory)["ok"]
+    assert (foreign_hook.read_bytes(), foreign_hook.stat().st_mode) == original
+
+
+def test_setup_still_honors_global_hook_configuration_when_git_context_is_inherited(
+    project, foreign_repository, monkeypatch, tmp_path
+):
+    directory, run = project
+    foreign, foreign_hook = foreign_repository
+    add_remote(directory, run)
+    global_config = tmp_path / "global-gitconfig"
+    global_config.write_text(f'[core]\n\thooksPath = "{foreign_hook.parent}"\n')
+    original = foreign_hook.read_bytes(), foreign_hook.stat().st_mode
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    payload = setup(directory)
+    assert not payload["ok"] and not payload["active"]
+    assert "core.hooksPath" in payload["reason"]
+    assert (foreign_hook.read_bytes(), foreign_hook.stat().st_mode) == original
+    assert not (directory / ".git/hooks/pre-push").exists()
 
 
 def test_public_operations_work_without_click(project):
