@@ -130,18 +130,20 @@ class PrivateAccess:
     def _check_public_backend(self, config: dict[str, Any], port: int) -> None:
         """Refuse any enabled Funnel reaching this backend, regardless of port.
 
-        Inspect node, foreground and virtual-service configurations without
-        claiming ownership of them. Match loopback proxy/TCP targets by endpoint,
-        not handler path or external listener port; unrelated services stay intact.
+        Combine node/foreground authorization and effective handlers, keeping
+        each virtual service in a separate routing namespace. Match supported
+        proxy/TCP targets by endpoint, not handler path or external port.
         """
 
-        def reaches_backend(target: str) -> bool:
-            """Normalize local IP targets without DNS or network requests."""
+        def reaches_backend(target: str, *, proxy: bool) -> bool:
+            """Expand numeric HTTP proxies and local endpoints without DNS requests."""
             try:
+                if proxy and re.fullmatch(r"[0-9]+", target):
+                    return int(target) == port
                 endpoint = urlsplit(target if "://" in target else "http://" + target)
                 if endpoint.port != port:
                     return False
-                if endpoint.hostname == "localhost":
+                if endpoint.hostname in (None, "localhost"):
                     return True
                 address = ip_address(endpoint.hostname)
                 if isinstance(address, IPv6Address):
@@ -152,21 +154,45 @@ class PrivateAccess:
             except ValueError:
                 return False
 
-        scopes = [config]
-        while scopes:
-            scope = scopes.pop()
-            scopes.extend(scope.get("Foreground", {}).values())
-            scopes.extend(scope.get("Services", {}).values())
-            for address, enabled in scope.get("AllowFunnel", {}).items():
-                if not enabled:
-                    continue
-                handlers = scope.get("Web", {}).get(address, {}).get("Handlers", {})
-                targets = [handler.get("Proxy", "") for handler in handlers.values()]
+        namespaces = [config]
+        while namespaces:
+            background = namespaces.pop()
+            foreground = list(background.get("Foreground", {}).values())
+            scopes = [background, *foreground]
+            for scope in scopes:
+                namespaces.extend(scope.get("Services", {}).values())
+            public = {
+                address
+                for scope in scopes
+                for address, enabled in scope.get("AllowFunnel", {}).items()
+                if enabled
+            }
+            for address in public:
                 external_port = address.rsplit(":", 1)[-1]
-                targets.append(
-                    scope.get("TCP", {}).get(external_port, {}).get("TCPForward", "")
+                # FindTCP and FindWeb independently prefer foreground matches.
+                # Consider all foreground matches: their map order is unspecified.
+                tcp = [
+                    scope["TCP"][external_port]
+                    for scope in foreground
+                    if scope.get("TCP", {}).get(external_port) is not None
+                ] or [background.get("TCP", {}).get(external_port, {})]
+                web = [
+                    scope["Web"][address]
+                    for scope in foreground
+                    if scope.get("Web", {}).get(address) is not None
+                ] or [background.get("Web", {}).get(address, {})]
+                tcp_exposed = any(
+                    reaches_backend(listener.get("TCPForward", ""), proxy=False)
+                    for listener in tcp
                 )
-                if any(reaches_backend(target) for target in targets):
+                http_exposed = any(
+                    listener.get("HTTPS") or listener.get("HTTP") for listener in tcp
+                ) and any(
+                    reaches_backend(handler.get("Proxy", ""), proxy=True)
+                    for server in web
+                    for handler in server.get("Handlers", {}).values()
+                )
+                if tcp_exposed or http_exposed:
                     raise self.failure(
                         "Existing Funnel reaches this FreshRSS backend; preserve the "
                         "foreign route and resolve public exposure locally before "
@@ -244,14 +270,25 @@ class PrivateAccess:
             # False Funnel entries confer no access, but should not remain as a
             # stale reference to a removed listener. Preserve all other ports.
             replacement.get("AllowFunnel", {}).pop(record["host"] + ":443", None)
-            self._config_client().write(replacement, etag)
+            # Persist relinquished authority BEFORE the remote request: a local
+            # write failure must not leave stale authority after successful removal.
+            self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
+            try:
+                self._config_client().write(replacement, etag)
+            except self.rejected:
+                # Known rejection made no change; restore only prior local intent.
+                self.runtime._save(SERVE_RECORD, record)
+                raise
+            # An unknown removal outcome stays inactive for local inspection,
+            # never automatic adoption/deletion of a possibly recreated listener.
             after, _etag = self._config_client().read()
             if self._validate(after, record):
                 raise self.failure(
                     "Project Serve forwarding did not stop; inspect it locally."
                 )
             self._preserved(config, after)
-        self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
+        else:
+            self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
         return active
 
     def _preserved(self, before: dict[str, Any], after: dict[str, Any]) -> None:

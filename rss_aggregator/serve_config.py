@@ -154,8 +154,9 @@ class ServeConfigClient:
         Raises
         ------
         ServeConfigRejected
-            On invalid input before a request or concurrent modification (HTTP
-            412), when this operation is known not to have applied a change.
+            On invalid input before a request, authentication/authorization
+            refusal (HTTP 401/403), or concurrent modification (HTTP 412), when
+            this operation is known not to have applied a change.
         RuntimeFailure
             On other request failures. An uncertain write is never retried or
             rolled back here.
@@ -169,6 +170,11 @@ class ServeConfigClient:
                 "Invalid conditional Tailscale Serve configuration."
             ) from None
         status, _, _ = self._request("POST", body, etag)
+        if status in (401, 403):
+            raise self._rejected(
+                "Tailscale Serve configuration authorization rejected; check "
+                "local credentials and write permissions before retrying."
+            )
         if status == 412:
             raise self._rejected(
                 "Tailscale Serve configuration changed concurrently; "

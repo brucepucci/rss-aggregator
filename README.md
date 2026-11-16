@@ -215,20 +215,32 @@ This includes foreground-session listeners, checked before any VM/application ch
 Private-start preflight also checks enabled Funnel targets across all ports and
 foreground/virtual-service configurations: a public HTTP proxy (including subpaths)
 or TCP forward to this FreshRSS loopback backend causes refusal without changing
-the foreign route. Endpoint matching normalizes IP literals, including IPv4-mapped
-IPv6, and treats local unspecified IPv4 destinations as conflicts too. Genuinely
-unrelated ports/services and private forwarding on
-other ports are preserved. There is no reset/adoption/bypass flag. This preflight
+the foreign route. Funnel authorization and TCP/Web handlers can come from different
+node/foreground scopes; foreground handlers take precedence over background ones.
+Virtual services remain separate routing namespaces. Endpoint matching expands
+numeric HTTP proxy targets (for example `8080` to IPv4 loopback), normalizes IP
+literals including IPv4-mapped IPv6, and treats local empty-host/unspecified IPv4
+destinations as conflicts too. Numeric-only TCP forwards do not use HTTP proxy
+shorthand. Genuinely unrelated ports/services and private forwarding on other ports
+are preserved. There is no reset/adoption/bypass flag. This preflight
 does not prove each physical client's authorization.
 
 Forwarding mutations use the existing daemon's LocalAPI: read configuration and its
 ETag together, validate ownership, then conditionally write with that exact
 `If-Match`. A concurrent change causes refusal without an automatic retry or global
-rollback, protecting both start and stop. A definitively rejected start (HTTP 412
-or invalid input before sending) restores the preceding local ownership record,
+rollback, protecting both start and stop. A definitively rejected start (HTTP
+401/403 authentication/authorization refusal, HTTP 412, or invalid input before
+sending) restores the preceding local ownership record,
 or removes only the newly created local intent when none existed. It does not
 roll back remote configuration or authorize a later stop to adopt a competing
-client's identical route. Uncertain writes retain pending intent for recovery.
+client's identical route. Uncertain start writes retain pending intent for recovery.
+Before attempting route removal, stop persists an inactive record; a persistence
+failure prevents the remote request. A definitive refusal restores preceding local
+intent. A confirmed removal or uncertain removal outcome leaves the retained record
+inactive, including when read-back verification fails. This deliberately refuses
+automatic adoption/deletion of an identical listener that might have been recreated:
+inspect and resolve ownership locally before retrying. Verification errors still
+fail the command and are not proof the application or VM stopped.
 The CLI's `tailscale debug local-creds`
 provides a loopback port/credential or Unix socket; its output stays private in
 memory and is never executed as shell text. Requests stay local, bypass proxies
@@ -246,8 +258,18 @@ reading/refresh. Startup reads those effective settings back and refuses forward
 if an override or unsuccessful application leaves any required value wrong. FreshRSS natively honors Serve's `X-Forwarded-Proto`; `TRUSTED_PROXY=0`
 remains in place (it disables Apache forwarded-client-IP trust, not HTTPS URL
 handling). Serve is created only after scheduler and fetching checks complete.
-No broad bind, automatic Tailscale installation, service shutdown, certificate
-removal, or Funnel command is used.
+If the final private-forwarding startup stage fails after backend publication
+(including a newly detected Funnel), startup stops the ownership-rechecked
+application and reports the failure, without changing foreign forwarding or
+rolling back an uncertain write. This leaves data/VM intact, does not require an
+external-backup destination, and retains uncertain-write recovery intent. If
+application ownership or shutdown cannot be confirmed, the error explicitly warns
+that the backend may still be exposed; inspect and close it locally before retrying.
+This does not prevent arbitrary later changes by other Tailscale clients or promise
+that every earlier startup failure closes the backend. Initial preflight refusals
+still leave the VM/application untouched.
+No broad bind, automatic Tailscale installation, Tailscale service shutdown,
+certificate removal, or Funnel command is used.
 
 Use the private HTTPS `url` returned by `start` locally. Open it, sign in using
 the **web** password, and in **Profile** set a strong, separate **API password**.
@@ -515,8 +537,12 @@ command is added here.
   locally, including Funnel targets on other ports. Preserve
   the other listener, handler or Funnel configuration and resolve ownership manually;
   do not run `serve reset`, edit the ownership record or enable Funnel to bypass it.
-  Stop refuses a changed route rather than deleting it. Other applications' ports
-  and services are not project resources.
+  Stop refuses a changed route rather than deleting it. A final private-forwarding
+  startup failure closes the owned application; if cleanup cannot confirm this,
+  the error warns of possible remaining exposure. A verification error after
+  confirmed route removal leaves ownership inactive, not authorized for adoption;
+  it is not proof overall shutdown completed. Other applications' ports and services
+  are not project resources.
 - **Certificate/access failure:** check Tailscale on both devices, MagicDNS, HTTPS
   authorization, device clocks and current trust stores. Never use a self-signed
   certificate bypass or `curl -k`. Check macOS/iOS local-network permissions if
@@ -543,7 +569,7 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` restores the observed prior forwarding mode, even after snapshot failure; it does not apply this shell's opt-in. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
-| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted/uncertain starts can be recovered; a definitively rejected write restores the preceding local record or removes the new intent. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. A rejected start grants no new ownership; an inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
+| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted/uncertain starts can be recovered; a definitively rejected write restores the preceding local record or removes the new intent. Removal persists inactive intent before the remote request (persistence failure prevents mutation); a definitive refusal restores prior intent, while uncertain/confirmed removal keeps it inactive, even if verification fails. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. A rejected start grants no new ownership; an inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
@@ -987,6 +1013,32 @@ rerun. The earlier real Homebrew footprint is listed under installation above;
 installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
+
+- **PR #18 C7–C10 local fixes (after `31f61da`, `issue-3`):**
+  `uv run --locked rss-dev check` passed **395 default tests in 80.99s**, six live
+  deselected; Ruff lint/format passed. The focused private-access/LocalAPI suites
+  passed **228 tests in 1.36s**. Before fixes, the four reported failure families
+  reproduced as **19 failures with two passing HTTP-412 controls**: cross-scope
+  Funnel/numeric proxies bypassed preflight, late detection left the backend
+  running, HTTP 401/403 granted false ownership, and failed removal verification
+  permitted adoption/deletion of an identical foreign route. Additional persistence
+  fault checks reproduced six failures before their fixes. Retirement is now
+  persisted before removal, so local write failure prevents the remote request;
+  definite rejection restores preceding intent, while uncertain removal stays
+  inactive for manual ownership resolution. Uncertain starts still retain pending
+  recovery intent. Final private-forwarding errors close only the ownership-checked
+  application; cleanup failure warns that exposure may remain. Coverage includes
+  routing precedence/service isolation, installed/uninstalled and running/stopped
+  states, OS/configuration errors, applied/unapplied unknown writes, verification
+  failures and foreign-route preservation. Runtime/developer help was checked
+  against the unchanged CLI reference; `git diff --check` passed. Upstream routing,
+  proxy expansion and pre-mutation authorization refusals were checked against
+  Tailscale v1.104.2 source. Independent read-only verification confirmed the
+  persistence repairs. **No live Podman/Tailscale services, public Funnel or daemon
+  collision injection, fresh HTTPS/API/device checks, new CI or alternate-platform
+  run was performed.** Earlier live/device results remain historical; the mini's
+  self-HTTPS limitation is unresolved. Changes are local, not committed/pushed;
+  this checkpoint is not publication verification or review approval.
 
 - **PR #18 local review fixes (after `62626a8`, `issue-3`):**
   `uv run --locked rss-dev check` passed **329 default tests in 81.61s**, six live

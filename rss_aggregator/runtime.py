@@ -591,7 +591,27 @@ class Runtime:
             else:
                 self._configure_access(url, api=bool(origin))
         if origin:
-            forwarding = private.start(owner, port, origin)
+            try:
+                forwarding = private.start(owner, port, origin)
+            except Exception:
+                # A late public route can already reach the published backend.
+                # Close only the owned application, never roll back foreign Serve.
+                try:
+                    self._check_label("container", APP, owner)
+                    self._podman("stop", "--time", "60", APP)
+                except Exception:
+                    raise RuntimeFailure(
+                        "Private forwarding startup failed; stopping the project "
+                        "application could not be confirmed. It may still be "
+                        "exposed through foreign forwarding. Inspect and close "
+                        "the backend locally; no forwarding rollback was attempted."
+                    ) from None
+                self._diagnostic(
+                    "Private forwarding startup failed; the owned FreshRSS "
+                    "application was stopped. Resolve forwarding locally before "
+                    "retrying; no forwarding rollback was attempted."
+                )
+                raise
         Recovery(self).record_image(activated=True)
         self._diagnostic(
             f"FreshRSS: {url} (form login; complete installer locally on first run)."

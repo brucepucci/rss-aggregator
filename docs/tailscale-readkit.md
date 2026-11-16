@@ -17,9 +17,13 @@ passwords and private feed URLs do not belong here.
    foreground-session listeners. These are refused before VM/application changes.
    Enabled Funnel routes on any port that proxy/forward to this FreshRSS loopback
    backend also cause refusal before backend changes, including subpath proxies
-   and foreground/virtual-service configurations. The foreign route is not changed.
-   Genuinely unrelated ports/services, private other-port forwarding, certificates
-   and Tailscale itself are preserved.
+   and foreground/virtual-service configurations. Authorization and handlers may
+   span node/foreground scopes; handler lookup prefers foreground matches. Virtual
+   services stay in separate routing namespaces. Numeric HTTP proxy targets expand
+   to IPv4 loopback; local empty-host/unspecified/mapped-IP targets are checked too.
+   Numeric TCP forwarding targets are not HTTP proxy shorthand. The foreign route
+   is not changed. Genuinely unrelated ports/services, private other-port forwarding,
+   certificates and Tailscale itself are preserved.
 4. An administrator must approve/enable MagicDNS and HTTPS certificates if absent.
    Certificate hostnames appear in public Certificate Transparency logs. Serve
    remains private; do not configure public DNS, router forwarding or Funnel.
@@ -34,13 +38,31 @@ existing daemon's loopback/Unix-socket transport; its sensitive output is never
 printed or shell-executed. Ownership validation uses the same configuration/ETag
 snapshot as the conditional LocalAPI write (`If-Match`). Concurrent changes refuse
 start/stop without unconditional retry or rollback; unrelated configuration is
-copied unchanged. A rejected start (HTTP 412 or invalid input before sending)
-restores the preceding local ownership record, or removes the newly created local
+copied unchanged. A definitively rejected start (HTTP 401/403 authentication or
+permission refusal, HTTP 412, or invalid input before sending) restores the
+preceding local ownership record, or removes the newly created local
 intent if there was none; it does not touch remote configuration. A competing
 client's identical route is not thereby adopted by a later status/stop. Unknown
-write outcomes retain pending intent for recovery. Unsupported transport/ETag
-output or LocalAPI permissions fail
-closed, not back to a separate unguarded `tailscale serve` mutation. A write-time
+start-write outcomes retain pending intent for recovery. Before a removal request,
+stop persists inactive intent; a persistence error prevents the request. A definite
+refusal restores preceding intent. Confirmed or uncertain removal keeps the retained
+record inactive, even if read-back verification fails: inspect/resolve ownership
+locally rather than automatically adopting/deleting a possibly recreated identical
+listener. Verification errors still fail; this is not proof overall application/VM
+shutdown completed.
+
+If the final private-forwarding startup stage fails after publication (including a
+late public-backend conflict), startup ownership-checks and stops the application,
+leaving data/VM and foreign Serve configuration intact. It does not roll back remote
+writes or discard uncertain-write recovery intent. If ownership/shutdown cannot be
+confirmed, the error warns the backend may remain exposed; inspect and close it
+locally before retrying. This cleanup needs no external-backup configuration and
+does not stop Tailscale. Initial preflight refusals remain nonmutating; arbitrary
+future changes by other clients and earlier startup failures are not covered by
+this cleanup guarantee.
+
+Unsupported transport/ETag output or LocalAPI permissions fail closed, not back to
+a separate unguarded `tailscale serve` mutation. A write-time
 transport failure can have an unknown outcome: inspect local Serve status before
 retrying, without an automatic rollback. These diagnostic interfaces are
 version-dependent. Initial implementation verification combined a read-only GET

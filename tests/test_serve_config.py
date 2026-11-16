@@ -356,6 +356,22 @@ def test_412_is_concurrent_sanitized_and_never_retried(
     assert not caplog.records
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_authorization_rejection_is_definitive_sanitized_and_not_retried(
+    runtime, transport, capsys, caplog, status
+):
+    sock = queue(transport, reply(SECRET.encode(), status=status))
+    with pytest.raises(ServeConfigRejected, match="authorization") as error:
+        ServeConfigClient(runtime).write({}, TAG)
+    assert_sanitized(error)
+    assert transport.factory.call_count == 1
+    assert sock.request()[0].startswith("POST ")
+    assert sock.request()[1]["If-Match"] == TAG
+    assert sock.closed
+    assert capsys.readouterr() == ("", "")
+    assert not caplog.records
+
+
 @pytest.mark.parametrize("method", ["read", "write"])
 @pytest.mark.parametrize("status", [201, 204, 301, 302, 307, 308, 401, 403, 404, 500])
 def test_other_statuses_and_redirects_fail_without_followup(
@@ -373,6 +389,8 @@ def test_other_statuses_and_redirects_fail_without_followup(
     with pytest.raises(RuntimeFailure) as error:
         client.read() if method == "read" else client.write({}, TAG)
     assert_sanitized(error)
+    if method == "write":
+        assert isinstance(error.value, ServeConfigRejected) == (status in (401, 403))
     assert transport.factory.call_count == 1
 
 
