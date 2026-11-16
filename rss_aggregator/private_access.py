@@ -418,10 +418,19 @@ class PrivateAccess:
         except self.rejected:
             # A definitive refusal grants no new authority over a matching route
             # installed by another client. Restore only local intent, never Serve.
-            if previous is None:
-                self.path.unlink()
-            else:
-                self.runtime._save(SERVE_RECORD, previous)
+            # Retire new authority before a restoration that may fail (e.g.
+            # ENOSPC writing serve.tmp). Missing intent cannot adopt a competitor.
+            self.path.unlink(missing_ok=True)
+            if previous is not None:
+                try:
+                    self.runtime._save(SERVE_RECORD, previous)
+                except Exception:
+                    raise self.failure(
+                        "Tailscale Serve start was rejected; new local intent was "
+                        "retired, but preceding intent could not be restored. "
+                        "Inspect local storage and forwarding ownership before "
+                        "retrying; no remote rollback was attempted."
+                    ) from None
             raise
         after, _etag = self._config_client().read()
         if not self._validate(after, record):

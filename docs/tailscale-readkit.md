@@ -39,9 +39,12 @@ printed or shell-executed. Ownership validation uses the same configuration/ETag
 snapshot as the conditional LocalAPI write (`If-Match`). Concurrent changes refuse
 start/stop without unconditional retry or rollback; unrelated configuration is
 copied unchanged. A definitively rejected start (HTTP 401/403 authentication or
-permission refusal, HTTP 412, or invalid input before sending) restores the
-preceding local ownership record, or removes the newly created local
-intent if there was none; it does not touch remote configuration. A competing
+permission refusal, HTTP 412, invalid input, or connection failure before
+transmission) removes the new intent before restoring any preceding record; it
+does not touch remote configuration. If restoration fails (such as full storage
+writing `serve.tmp`), no new authority remains. The command fails with local
+storage/ownership guidance: inspect and resolve ownership before retrying; never
+recreate or hand-edit records to adopt a listener. A competing
 client's identical route is not thereby adopted by a later status/stop. Unknown
 start-write outcomes retain pending intent for recovery. Before a removal request,
 stop persists inactive intent; a persistence error prevents the request. A definite
@@ -51,18 +54,26 @@ locally rather than automatically adopting/deleting a possibly recreated identic
 listener. Verification errors still fail; this is not proof overall application/VM
 shutdown completed.
 
-If the final private-forwarding startup stage fails after publication (including a
-late public-backend conflict), startup ownership-checks and stops the application,
+For a private or previously private instance, application startup and subsequent
+PHP-security, readiness, scheduler, fetching, authenticated-access
+configuration/read-back and forwarding gates share failure cleanup. On failure (including a late
+public-backend conflict), startup ownership-checks and stops the application,
 leaving data/VM and foreign Serve configuration intact. It does not roll back remote
 writes or discard uncertain-write recovery intent. If ownership/shutdown cannot be
 confirmed, the error warns the backend may remain exposed; inspect and close it
 locally before retrying. This cleanup needs no external-backup configuration and
-does not stop Tailscale. Initial preflight refusals remain nonmutating; arbitrary
-future changes by other clients and earlier startup failures are not covered by
-this cleanup guarantee.
+does not stop Tailscale. Access-gate cleanup also applies to loopback fallback of
+a previously private instance, so a preserved private other-port route cannot
+continue reaching a backend whose authentication gate failed. Initial preflight
+refusals remain nonmutating; arbitrary future changes by other clients and failures
+before application startup are not covered by this cleanup guarantee. First-run,
+unconfigured loopback behavior is unchanged.
 
 Unsupported transport/ETag output or LocalAPI permissions fail closed, not back to
-a separate unguarded `tailscale serve` mutation. A write-time
+a separate unguarded `tailscale serve` mutation. TCP/Unix connection establishment
+is classified before transmission: a failed connect is a definite refusal, not an
+unknown write. Once sending begins, send/response failures remain uncertain
+regardless of exception type. A write-time
 transport failure can have an unknown outcome: inspect local Serve status before
 retrying, without an automatic rollback. These diagnostic interfaces are
 version-dependent. Initial implementation verification combined a read-only GET

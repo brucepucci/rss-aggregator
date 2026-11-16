@@ -154,8 +154,9 @@ class ServeConfigClient:
         Raises
         ------
         ServeConfigRejected
-            On invalid input before a request, authentication/authorization
-            refusal (HTTP 401/403), or concurrent modification (HTTP 412), when
+            On invalid input or connection failure before transmission,
+            authentication/authorization refusal (HTTP 401/403), or concurrent
+            modification (HTTP 412), when
             this operation is known not to have applied a change.
         RuntimeFailure
             On other request failures. An uncertain write is never retried or
@@ -192,6 +193,7 @@ class ServeConfigClient:
         """Make one bounded direct request, suppressing all remote diagnostics."""
         connection = None
         response = None
+        transmission_started = False
         try:
             if self._socket_path is not None:
                 connection = _UnixHTTPConnection(self._socket_path)
@@ -200,6 +202,10 @@ class ServeConfigClient:
             headers = dict(self._headers)
             if etag is not None:
                 headers.update({"If-Match": etag, "Content-Type": "application/json"})
+            # HTTPConnection.request otherwise connects lazily. A failed connect
+            # cannot have transmitted this operation; send/response failures can.
+            connection.connect()
+            transmission_started = True
             connection.request(method, _PATH, body=body, headers=headers)
             response = connection.getresponse()
             status = response.status
@@ -214,6 +220,11 @@ class ServeConfigClient:
                 raise ValueError("Response oversized or incomplete")
             return status, etags, payload
         except Exception:
+            if method == "POST" and not transmission_started:
+                raise self._rejected(
+                    "Tailscale Serve LocalAPI connection failed before transmission; "
+                    "no change was sent. Check local daemon availability and permissions."
+                ) from None
             if method == "POST":
                 message = (
                     "Tailscale Serve LocalAPI request failed; the write outcome may "

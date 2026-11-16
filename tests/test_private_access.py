@@ -1,12 +1,14 @@
 """Private-access behavior at project-command and callable runtime boundaries."""
 
 import copy
+import errno
 import io
 import json
 import socket
 import subprocess
 from http.client import BadStatusLine
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from threading import Thread
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
@@ -605,9 +607,12 @@ def test_late_public_conflict_reports_unconfirmed_backend_shutdown(
 
 
 @pytest.mark.parametrize("rejected_status", [401, 403, 412])
-@pytest.mark.parametrize("prior_phase", [None, "inactive"])
+@pytest.mark.parametrize(
+    "prior_phase,restoration_fails",
+    [(None, False), ("inactive", False), ("inactive", True), ("active", True)],
+)
 def test_rejected_start_does_not_authorize_identical_foreign_route(
-    private_runtime, monkeypatch, prior_phase, rejected_status
+    private_runtime, monkeypatch, prior_phase, rejected_status, restoration_fails
 ):
     runtime, engine = private_runtime
     record_path = runtime.state_dir / "serve.json"
@@ -646,8 +651,22 @@ def test_rejected_start_does_not_authorize_identical_foreign_route(
         engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
     )
     monkeypatch.setattr(engine, "write", client.write)
-    with pytest.raises(RuntimeFailure, match="concurrent|authorization|unknown"):
-        runtime.run("start")
+    write_text = Path.write_text
+
+    def write_with_full_storage(path, *args, **kwargs):
+        if restoration_fails and path == record_path.with_suffix(".tmp") and statuses:
+            raise OSError(errno.ENOSPC, "Fixture full filesystem")
+        return write_text(path, *args, **kwargs)
+
+    # Keep production _save intact; fail only the post-rejection temporary write.
+    with monkeypatch.context() as storage:
+        storage.setattr(Path, "write_text", write_with_full_storage)
+        with pytest.raises(
+            RuntimeFailure,
+            match="concurrent|authorization|unknown|could not be restored",
+        ):
+            runtime.run("start")
+    assert not engine.app["State"]["Running"]
     after_rejection = (
         json.loads(record_path.read_text()) if record_path.exists() else None
     )
@@ -666,7 +685,62 @@ def test_rejected_start_does_not_authorize_identical_foreign_route(
     assert statuses == [rejected_status]
     assert engine.config == competing[0]
     assert forwarding != "running"
-    assert after_rejection == (previous if prior_phase else None)
+    assert after_rejection == (
+        previous if prior_phase and not restoration_fails else None
+    )
+
+
+def test_preconnect_refusal_does_not_authorize_identical_foreign_route(
+    private_runtime, monkeypatch
+):
+    from test_serve_config import ControlledSocket, reply
+
+    runtime, engine = private_runtime
+    discovery = MagicMock()
+    discovery._run.return_value = subprocess.CompletedProcess(
+        [], 0, "curl -u:fixture http://localhost:1234/localapi/v0/status\n", ""
+    )
+    client = ServeConfigClient(discovery)
+    later_socket = ControlledSocket(reply(b""))
+    connections = []
+
+    def connect(*args):
+        connections.append(args)
+        if len(connections) == 1:
+            raise ConnectionRefusedError("Fixture daemon unavailable")
+        return later_socket
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    monkeypatch.setattr(
+        engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
+    )
+    monkeypatch.setattr(engine, "write", client.write)
+    with pytest.raises(
+        RuntimeFailure, match="before transmission|outcome may be unknown"
+    ):
+        runtime.run("start")
+    assert not later_socket.wire
+    assert not engine.app["State"]["Running"]
+    competing = copy.deepcopy(engine.original)
+    competing["TCP"]["443"] = {"HTTPS": True}
+    competing["Web"]["reader.example.ts.net:443"] = {
+        "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
+    }
+    engine.config = copy.deepcopy(competing)
+    try:
+        forwarding = runtime.run("status")["forwarding"]["status"]
+    except RuntimeFailure:
+        forwarding = "refused"
+    engine.volumes.clear()
+    try:
+        runtime.run("stop")
+    except RuntimeFailure:
+        pass
+    assert not later_socket.wire, "A foreign route must not receive a deletion POST"
+    assert len(connections) == 1
+    assert engine.config == competing
+    assert forwarding != "running"
+    assert not (runtime.state_dir / "serve.json").exists()
 
 
 @pytest.mark.parametrize("verification", ["read", "unrelated", "recreated"])
@@ -962,6 +1036,59 @@ def test_missing_certificate_authorization_fails_without_account_changes(
         runtime.run("start")
     assert engine.config == engine.original
     assert not engine.reconfigured
+
+
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("failure", [None, "auth", "fetch"])
+def test_access_gate_closes_backend_through_preserved_private_route(
+    private_runtime, monkeypatch, private, failure
+):
+    runtime, engine = private_runtime
+    monkeypatch.setenv("RSS_TAILSCALE", "1" if private else "0")
+    engine.app["State"].update(Running=False, Status="exited")
+    engine.policy_ports.append({"First": 8443, "Last": 8443})
+    engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
+        "Proxy": f"http://127.0.0.1:{engine.port}"
+    }
+    foreign = copy.deepcopy(engine.config)
+    if not private:
+        # The loopback fallback of a previously private instance also gates auth.
+        (runtime.state_dir / "serve.json").write_text(
+            json.dumps(
+                {
+                    "owner": "test-owner",
+                    "host": "reader.example.ts.net",
+                    "target": f"http://127.0.0.1:{engine.port}",
+                    "phase": "inactive",
+                }
+            )
+        )
+    if failure is None:
+        runtime.run("start")
+        assert engine.app["State"]["Running"]
+        assert ("443" in engine.config["TCP"]) == private
+        assert (
+            engine.config["Web"]["other.example.ts.net:8443"]
+            == foreign["Web"]["other.example.ts.net:8443"]
+        )
+    else:
+        engine.settings_override = {"auth_type": "none", "allow_anonymous": True}
+
+        def run(*args, **kwargs):
+            if failure == "fetch" and args[-1] == "app/actualize_script.php":
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return engine.run(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "_run", run)
+        with pytest.raises(
+            RuntimeFailure,
+            match="required authenticated settings|Immediate feed fetching failed",
+        ):
+            runtime.run("start")
+        assert not engine.app["State"]["Running"]
+        assert engine.published
+        assert engine.config == foreign
+        assert engine.machine["State"] == "running"
 
 
 @pytest.mark.parametrize("failure", ["security", "serve", "installer", "disconnected"])

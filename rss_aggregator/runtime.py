@@ -575,43 +575,48 @@ class Runtime:
             str(self.root / "config/public-feed.opml"),
             APP + ":/var/www/FreshRSS/data/opml.xml",
         )
-        self._podman("start", APP)
-        security = self._security(owner, target=APP)
-        self._ready(port)
-        scheduler = self._scheduler(owner)
-        fetch = self._fetch()
-        url = origin or f"http://127.0.0.1:{port}"
-        forwarding = None
-        if origin or private.path.exists():
-            if fetch["status"] == "installer_pending":
-                if origin:
-                    raise RuntimeFailure(
-                        "Complete the FreshRSS installer on loopback first (RSS_TAILSCALE=0), then retry private start. No Serve route was published."
-                    )
-            else:
-                self._configure_access(url, api=bool(origin))
-        if origin:
-            try:
+        guard_access = bool(origin or private.path.exists())
+        try:
+            self._podman("start", APP)
+            security = self._security(owner, target=APP)
+            self._ready(port)
+            scheduler = self._scheduler(owner)
+            fetch = self._fetch()
+            url = origin or f"http://127.0.0.1:{port}"
+            forwarding = None
+            if guard_access:
+                if fetch["status"] == "installer_pending":
+                    if origin:
+                        raise RuntimeFailure(
+                            "Complete the FreshRSS installer on loopback first (RSS_TAILSCALE=0), then retry private start. No Serve route was published."
+                        )
+                else:
+                    self._configure_access(url, api=bool(origin))
+            if origin:
                 forwarding = private.start(owner, port, origin)
-            except Exception:
-                # A late public route can already reach the published backend.
-                # Close only the owned application, never roll back foreign Serve.
-                try:
-                    self._check_label("container", APP, owner)
-                    self._podman("stop", "--time", "60", APP)
-                except Exception:
-                    raise RuntimeFailure(
-                        "Private forwarding startup failed; stopping the project "
-                        "application could not be confirmed. It may still be "
-                        "exposed through foreign forwarding. Inspect and close "
-                        "the backend locally; no forwarding rollback was attempted."
-                    ) from None
-                self._diagnostic(
-                    "Private forwarding startup failed; the owned FreshRSS "
-                    "application was stopped. Resolve forwarding locally before "
-                    "retrying; no forwarding rollback was attempted."
-                )
+        except Exception:
+            if not guard_access:
                 raise
+            # Preserved routes can reach an unverified backend even if an earlier
+            # post-start check fails before the authentication gate is evaluated.
+            # Close only the owned application, never roll back foreign Serve.
+            try:
+                app = self._check_label("container", APP, owner)
+                if app["State"]["Running"]:
+                    self._podman("stop", "--time", "60", APP)
+            except Exception:
+                raise RuntimeFailure(
+                    "FreshRSS access/forwarding startup failed; stopping the project "
+                    "application could not be confirmed. It may still be "
+                    "exposed through foreign forwarding. Inspect and close "
+                    "the backend locally; no forwarding rollback was attempted."
+                ) from None
+            self._diagnostic(
+                "FreshRSS access/forwarding startup failed; the owned FreshRSS "
+                "application was stopped. Resolve access settings/forwarding locally "
+                "before retrying; no forwarding rollback was attempted."
+            )
+            raise
         Recovery(self).record_image(activated=True)
         self._diagnostic(
             f"FreshRSS: {url} (form login; complete installer locally on first run)."

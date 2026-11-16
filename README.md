@@ -229,9 +229,13 @@ Forwarding mutations use the existing daemon's LocalAPI: read configuration and 
 ETag together, validate ownership, then conditionally write with that exact
 `If-Match`. A concurrent change causes refusal without an automatic retry or global
 rollback, protecting both start and stop. A definitively rejected start (HTTP
-401/403 authentication/authorization refusal, HTTP 412, or invalid input before
-sending) restores the preceding local ownership record,
-or removes only the newly created local intent when none existed. It does not
+401/403 authentication/authorization refusal, HTTP 412, invalid input, or connection
+failure before transmission) first removes the newly created local intent, then
+restores the preceding record if one existed. If restoration fails (for example,
+full storage writing `serve.tmp`), no new ownership authority remains: status is
+unconfigured, and stop does not adopt/delete an identical foreign listener. The
+command fails with local storage/ownership guidance; inspect and resolve ownership
+before retrying rather than recreating or hand-editing records. It does not
 roll back remote configuration or authorize a later stop to adopt a competing
 client's identical route. Uncertain start writes retain pending intent for recovery.
 Before attempting route removal, stop persists an inactive record; a persistence
@@ -245,8 +249,11 @@ The CLI's `tailscale debug local-creds`
 provides a loopback port/credential or Unix socket; its output stays private in
 memory and is never executed as shell text. Requests stay local, bypass proxies
 and refuse redirects. Missing credentials/ETag, unsupported debug output or denied
-LocalAPI access cause failure; there is no unconditional CLI fallback. A transport
-failure during a write can have an unknown outcome. Inspect `tailscale serve status`
+LocalAPI access cause failure; there is no unconditional CLI fallback. Connection
+establishment is separate from transmission for both TCP and Unix sockets: failure
+before sending is a definite rejection. Send/response failures may have an unknown
+outcome, even if the exception is `ConnectionRefusedError`. Inspect
+`tailscale serve status`
 locally before retrying and resolve ownership/availability first; never blindly roll
 back someone else's configuration.
 LocalAPI/debug compatibility and real HTTPS must be checked on the installed version;
@@ -258,16 +265,21 @@ reading/refresh. Startup reads those effective settings back and refuses forward
 if an override or unsuccessful application leaves any required value wrong. FreshRSS natively honors Serve's `X-Forwarded-Proto`; `TRUSTED_PROXY=0`
 remains in place (it disables Apache forwarded-client-IP trust, not HTTPS URL
 handling). Serve is created only after scheduler and fetching checks complete.
-If the final private-forwarding startup stage fails after backend publication
-(including a newly detected Funnel), startup stops the ownership-rechecked
-application and reports the failure, without changing foreign forwarding or
-rolling back an uncertain write. This leaves data/VM intact, does not require an
+For a private or previously private instance, application startup and the subsequent
+PHP-security, readiness, scheduler, fetching, authenticated-access
+configuration/read-back and forwarding gates share ownership-checked failure
+cleanup. A failure after backend startup (including a newly detected Funnel) stops
+the application and reports the failure, without changing foreign forwarding or
+rolling back an uncertain write. This also covers the access gate during loopback
+fallback for a previously private instance: a preserved private route on another port must not expose a backend whose
+authentication gate failed. It leaves data/VM intact, does not require an
 external-backup destination, and retains uncertain-write recovery intent. If
 application ownership or shutdown cannot be confirmed, the error explicitly warns
 that the backend may still be exposed; inspect and close it locally before retrying.
-This does not prevent arbitrary later changes by other Tailscale clients or promise
-that every earlier startup failure closes the backend. Initial preflight refusals
-still leave the VM/application untouched.
+This does not prevent arbitrary later changes by other Tailscale clients or extend
+cleanup to failures before application startup. Initial preflight refusals still
+leave the VM/application untouched; first-run, unconfigured loopback behavior is
+unchanged.
 No broad bind, automatic Tailscale installation, Tailscale service shutdown,
 certificate removal, or Funnel command is used.
 
@@ -569,7 +581,7 @@ permissions are not encryption. Treat VM storage and application logs as sensiti
 | --- | --- | --- |
 | `RSS_PORT` (optional environment variable) | Mac IPv4 loopback port; `8080`, allowed range `1024–65535`. | Set the same value for operational commands, e.g. `export RSS_PORT=8081`; use `replace` for an existing container. For an installed instance, also update its base URL as shown below. |
 | `RSS_TAILSCALE` (optional environment variable) | `0` by default: loopback-only. `1`: private Serve HTTPS on the node's fixed port 443. Other values fail before startup changes. Requires an initialized FreshRSS instance, connected existing Tailscale, enabled HTTPS certificates and an incoming TCP 443 grant. | Set consistently for `start`/`verify`/`replace`. `stop` removes recorded owned forwarding regardless of this value; `backup` restores the observed prior forwarding mode, even after snapshot failure; it does not apply this shell's opt-in. Switching to `0` and starting removes the owned route and resets the installed base URL to loopback, but retains API enablement/passwords. |
-| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted/uncertain starts can be recovered; a definitively rejected write restores the preceding local record or removes the new intent. Removal persists inactive intent before the remote request (persistence failure prevents mutation); a definitive refusal restores prior intent, while uncertain/confirmed removal keeps it inactive, even if verification fails. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. A rejected start grants no new ownership; an inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
+| `.local/serve.json` (managed ownership record) | Owner token, private hostname/backend target and pending/active/inactive phase. No passwords or API tokens. Written privately before creating forwarding so interrupted/uncertain starts can be recovered; a definitively rejected write (including failure to connect before transmission) removes new intent before restoring any preceding record. Failed restoration leaves no new authority and requires local storage/ownership inspection. Removal persists inactive intent before the remote request (persistence failure prevents mutation); a definitive refusal restores prior intent, while uncertain/confirmed removal keeps it inactive, even if verification fails. | Preserve with `.local/owner.json`; never hand-edit/copy/adopt. Exact-match checks refuse changed or unowned routes; conditional LocalAPI updates refuse concurrent configuration changes. A rejected start grants no new ownership; an inactive record does not authorize adopting a newly appearing listener. Paths follow `RSS_STATE_DIR`. |
 | `RSS_BACKUP_DIR` (required for explicit backup and shutdown with data) | Absolute host backup directory outside every Git checkout; **no default**. New directory mode `0700`, archive mode `0600`; existing directory must be private and owned by you. | Export before `backup`/`stop`, e.g. the path in Getting Started. Change it explicitly to choose a different external destination; existing archives are never moved/pruned. Not required just to validate/restore an archive. |
 | `.local/host-before.json`, `.local/host-latest.json` (managed host inventories) | First successful host inventory and most recent later inventory; `packages` maps formula names to installed-version strings; `casks` is newline-delimited `name version` text; `dependencies` and `podman_formula` retain raw Homebrew output. On cask-version fallback only, `cask_names` retains raw newline-delimited names and `cask_inventory_warning` records the failed query, exit code and original stderr. `casks` then contains only known installed versions from JSON, never the latest available version; incomplete names can appear only in `cask_names`. Empty inventories are valid. | Setup records these before any installation; a failed inventory does not replace the previous records. No manual configuration or bypass. Preserve as private audit evidence, not uninstall authorization. Paths follow `RSS_STATE_DIR`. |
 | `.local/selected-volume.json` (managed local record) | Explicitly selected owned data-volume name; absent means `rss-aggregator-data`. | Use `rss select-volume NAME` while application stopped and VM running. Do not hand-edit or copy to adopt another project's data. |
@@ -1014,7 +1026,30 @@ installation was not repeated for the PR #13 candidate.
 
 ### Verification checkpoints and limits
 
-- **PR #18 C7–C10 local fixes (after `31f61da`, `issue-3`):**
+- **PR #18 C11–C13 local fixes (after `7072758`, `issue-3`):**
+  `uv run --locked rss-dev check` passed **420 default tests in 80.06s**, six live
+  deselected; Ruff lint/format passed. Focused private-access/LocalAPI tests passed
+  **253 tests in 1.11s**. Regressions first reproduced rejected-start ENOSPC
+  restoration leaving false authority, connection refusal before any wire request
+  leading to later foreign-route deletion, and authenticated-access failure leaving
+  the backend reachable through preserved private forwarding. A targeted follow-up
+  also reproduced failed immediate fetching before the access gate in private and
+  loopback fallback modes. Fixes retire rejected intent before restoration (with
+  sanitized storage/ownership guidance on failure), distinguish TCP/Unix connect
+  failure from uncertain send/response errors, and close the ownership-rechecked
+  application on private/previously private post-start gate failures. Foreign
+  forwarding, data and VM are preserved; uncertain starts retain recovery intent.
+  Independent read-only verification confirmed the reported cases and fetching
+  repair. Runtime/developer help was checked against the unchanged CLI reference;
+  `git diff --check` passed. No CLI syntax, settings, dependencies or ownership-record
+  schema changed.
+  **No live services, actual daemon/storage fault injection, fresh HTTPS/API/device
+  checks, new CI or alternate-platform run was performed.** Earlier live/device
+  evidence remains historical and the mini's self-HTTPS limitation is unresolved.
+  These changes are **local, not committed or pushed**; this is implementation
+  verification, not isolated-candidate publication verification or review approval.
+
+- **PR #18 C7–C10 implementation checkpoint (after `31f61da`, `issue-3`):**
   `uv run --locked rss-dev check` passed **395 default tests in 80.99s**, six live
   deselected; Ruff lint/format passed. The focused private-access/LocalAPI suites
   passed **228 tests in 1.36s**. Before fixes, the four reported failure families
@@ -1037,8 +1072,9 @@ installation was not repeated for the PR #13 candidate.
   persistence repairs. **No live Podman/Tailscale services, public Funnel or daemon
   collision injection, fresh HTTPS/API/device checks, new CI or alternate-platform
   run was performed.** Earlier live/device results remain historical; the mini's
-  self-HTTPS limitation is unresolved. Changes are local, not committed/pushed;
-  this checkpoint is not publication verification or review approval.
+  self-HTTPS limitation is unresolved. These were implementation-time checks;
+  subsequent exact-candidate publication as `7072758` is recorded in PR #18.
+  This historical checkpoint is not verification of the newer local fixes.
 
 - **PR #18 local review fixes (after `62626a8`, `issue-3`):**
   `uv run --locked rss-dev check` passed **329 default tests in 81.61s**, six live

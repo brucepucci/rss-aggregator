@@ -396,18 +396,27 @@ def test_other_statuses_and_redirects_fail_without_followup(
 
 @pytest.mark.parametrize("method", ["read", "write"])
 @pytest.mark.parametrize(
-    "phase", ["connect", "send", "receive", "protocol", "truncated"]
+    ("phase", "exception"),
+    [
+        ("connect", OSError),
+        ("send", OSError),
+        ("send", ConnectionRefusedError),
+        ("receive", TimeoutError),
+        ("receive", ConnectionRefusedError),
+        ("protocol", None),
+        ("truncated", None),
+    ],
 )
 def test_transport_failures_are_sanitized_and_not_retried(
-    runtime, transport, method, phase
+    runtime, transport, method, phase, exception
 ):
     sock = queue(transport, reply())
     if phase == "connect":
-        transport.factory.side_effect = OSError(SECRET)
+        transport.factory.side_effect = exception(SECRET)
     elif phase == "send":
-        sock.send_error = OSError(SECRET)
+        sock.send_error = exception(SECRET)
     elif phase == "receive":
-        sock.receive_error = TimeoutError(SECRET)
+        sock.receive_error = exception(SECRET)
     elif phase == "protocol":
         sock.response = SECRET.encode() + b"\r\n\r\n"
     else:
@@ -416,16 +425,87 @@ def test_transport_failures_are_sanitized_and_not_retried(
     with pytest.raises(RuntimeFailure) as error:
         client.read() if method == "read" else client.write({}, TAG)
     assert_sanitized(error)
-    if method == "write":
+    if method == "write" and phase == "connect":
+        assert isinstance(error.value, ServeConfigRejected)
+        assert "connection failed before transmission; no change was sent" in str(
+            error.value
+        )
+        assert not sock.wire
+    elif method == "write":
         assert not isinstance(error.value, ServeConfigRejected)
         assert "outcome may be unknown" in str(error.value)
         assert "Inspect local Serve status before retrying" in str(error.value)
+        assert sock.wire
     else:
+        assert not isinstance(error.value, ServeConfigRejected)
         assert "compatibility" in str(error.value)
         assert "local permissions" in str(error.value)
     assert transport.factory.call_count == 1
     if phase != "connect":
         assert sock.closed
+        if sock.stream is not None:
+            assert sock.stream.closed
+
+
+@pytest.mark.parametrize("endpoint", ["tcp", "unix"])
+@pytest.mark.parametrize("exception", [ConnectionRefusedError, TimeoutError])
+@pytest.mark.parametrize("method", ["read", "write"])
+def test_connect_failure_sends_no_bytes_and_closes_without_retry(
+    runtime, monkeypatch, endpoint, exception, method, capsys, caplog
+):
+    credentials = TCP_CREDS if endpoint == "tcp" else UNIX_CREDS
+    runtime._run.return_value = subprocess.CompletedProcess([], 0, credentials, SECRET)
+    sock = ControlledSocket(reply())
+    sock.connect_error = exception(SECRET)
+    connect = Mock(wraps=sock.connect)
+    monkeypatch.setattr(sock, "connect", connect)
+    factory = Mock(side_effect=[sock])
+    monkeypatch.setattr(socket, "socket", factory)
+    # Keep the real stdlib TCP connector, but prevent DNS and live socket access.
+    addresses = Mock(
+        return_value=[
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 41112),
+            )
+        ]
+    )
+    monkeypatch.setattr(socket, "getaddrinfo", addresses)
+    client = ServeConfigClient(runtime)
+    expected = ServeConfigRejected if method == "write" else RuntimeFailure
+    with pytest.raises(expected) as error:
+        client.read() if method == "read" else client.write({}, TAG)
+    assert_sanitized(error)
+    if method == "write":
+        assert "connection failed before transmission; no change was sent" in str(
+            error.value
+        )
+        assert "outcome may be unknown" not in str(error.value)
+    else:
+        assert not isinstance(error.value, ServeConfigRejected)
+        assert "read failed" in str(error.value)
+        assert "compatibility" in str(error.value)
+        assert "local permissions" in str(error.value)
+    connect.assert_called_once_with(
+        ("127.0.0.1", 41112) if endpoint == "tcp" else UNIX_PATH
+    )
+    assert factory.call_count == 1
+    if endpoint == "unix":
+        addresses.assert_not_called()
+    else:
+        assert addresses.call_count == 1
+    assert sock.timeout == 10
+    assert not sock.wire
+    assert sock.stream is None
+    assert sock.closed
+    runtime._run.assert_called_once_with(
+        "tailscale", "debug", "local-creds", check=False
+    )
+    assert capsys.readouterr() == ("", "")
+    assert not caplog.records
 
 
 @pytest.mark.parametrize("method", ["read", "write"])
