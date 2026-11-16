@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,10 +40,25 @@ elif args == ["system", "connection", "list", "--format", "json"]:
 elif args[:2] == ["machine", "start"]:
     state["machine"]["State"] = "running"
     save()
+elif args == ["machine", "stop", "rss-aggregator"]:
+    if state["app"]["State"]["Running"]:
+        fail()
+    state["machine"]["State"] = "stopped"
+    save()
+elif args[:3] == ["machine", "ssh", "rss-aggregator"]:
+    print(json.dumps(state.get("rootful", [])))
 elif args[:2] == ["--connection", "rss-aggregator"]:
     args = args[2:]
     app = state["app"]
-    if args[:2] == ["image", "inspect"]:
+    if args[0] == "ps":
+        print(
+            json.dumps(
+                [{"Names": ["rss-aggregator-freshrss"]}]
+                if app["State"]["Running"]
+                else []
+            )
+        )
+    elif args[:2] == ["image", "inspect"]:
         if state.get("fail_image"):
             fail()
         print(json.dumps([state["image"]]))
@@ -67,6 +83,15 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         raise SystemExit(0)
     elif args[:2] == ["volume", "inspect"]:
         print(json.dumps([{"Labels": {"io.rss-aggregator.owner": "fixture-owner"}}]))
+    elif args[:2] == ["volume", "export"]:
+        if os.environ.get("BACKUP_TEST_GATE"):
+            gate = Path(os.environ["BACKUP_TEST_GATE"])
+            gate.with_suffix(".ready").write_text(str(os.getpid()))
+            with gate.open("rb") as barrier:
+                barrier.read(1)
+        if app["State"]["Running"] or state.get("fail_export"):
+            fail()
+        shutil.copyfile(state["payload"], args[args.index("--output") + 1])
     elif args[0] == "run":
         state["checks"][args[args.index("--name") + 1]] = {
             "Config": {"Labels": {"io.rss-aggregator.owner": "fixture-owner"}}

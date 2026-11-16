@@ -85,7 +85,16 @@ Hook-refusal permutations use minimal disposable repositories and installed CLI
 code without repeatedly synchronizing environments. Full environments remain for
 installation, actual disposable pushes and A/B isolation tests. Fixture-only import
 sentinels verify selected-code isolation without rewriting production source or
-relying on unrelated test counts. Runtime root/configuration tests are separate.
+relying on unrelated test counts. Runtime root/configuration tests are separate. Daily-backup regressions use the
+same CLI/Runtime seam, private temporary destinations, synthetic source data,
+controlled launchctl/Podman responses and an aware `now` at the public orchestration
+boundary. No actual LaunchAgent is installed by the default suite. Coverage includes
+opt-in/idempotence, eligibility/missed/stale work, bounded retry and contention,
+changed ownership/code/dependencies, stopped intent, archive/resumption separation
+and prior-archive preservation. Disposable processes are SIGKILLed during export
+and immediately before/after hard-link publication; surviving external exports
+retain the lock and block reconciliation until finished. These are real process/
+filesystem boundaries, not ordinary exception-unwinding substitutes.
 Readiness regressions use controlled Podman responses plus a disposable loopback
 HTTP server, not live-VM fault injection.
 
@@ -205,8 +214,14 @@ The retained live tests cover:
   It retains production Click behavior/ownership/locking while redirecting reserved
   resources, selection/provenance, backup-locator and Serve-record names. Fixture
   `test-<token>-last-backup.json` is removed on cleanup and the user's normal
-  locator bytes/absence preserved. Separate VM-restart tests still update the real
-  locator with a real instance backup in `RSS_BACKUP_DIR`.
+  locator bytes/absence preserved. Backup attempt/publication/daily/intent records
+  are also fixture-namespaced; the recovery runner verifies separate publication/
+  resumption status and never claims daily protection from manual backup. All
+  runners retain the real `command.lock` and shared `maintenance.json` guard, checked
+  under the lock. An interrupted fixture can therefore block real writers until
+  owner-coordinated reconciliation; fixture cleanup never deletes that hold.
+  Separate VM-restart tests still update the real locator with a real instance
+  backup in `RSS_BACKUP_DIR`.
 
 - **Disposable application supervision recovery:** the selected test
   `tests/integration/test_live_replace.py::test_supervision_recovers_only_disposable_application_and_preserves_reading_state`
@@ -257,11 +272,14 @@ working directory. Defaults are resolved per instance, not an import-time single
 Construction itself does not inspect or change native resources.
 
 `run(operation, *, archive=None, volume=None, username=None, api_password=None,
-loopback=False)` returns the same JSON-compatible operation dictionaries and sends
-diagnostics to stderr. It serializes callable as well as CLI callers under the
+loopback=False, now=None, hour=3, minute=0)` returns the same JSON-compatible
+operation dictionaries and sends diagnostics to stderr. It serializes callable as well as CLI callers under the
 same nonblocking project lock. Unknown operations/ownership/lock failures raise
 `RuntimeFailure`; OS/configuration errors propagate for the caller to handle.
-There are fifteen public operations, not a command for every helper.
+There are twenty public operations, not a command for every helper. Optional
+`now` is an aware `datetime` controlling backup eligibility/freshness tests only;
+there is no CLI clock override. Omit it in production. `hour`/`minute` apply only
+to explicit `backup-enable` and use UTC.
 
 | Call | Required values and behavior |
 | --- | --- |
@@ -269,6 +287,7 @@ There are fifteen public operations, not a command for every helper.
 | `run("supervision-install")`, `run("supervision-remove")`, `run("supervision-status")`, `run("supervision-tick")` | Same opt-in normal-user-session registration, captured environment, intent, health, bounded retry and maintenance semantics as the [CLI commands](cli.md#mac-supervision-commands). All share the existing nonblocking lock; none needs Click context. Installation is explicit; status does not start writers. |
 | `run("restore", archive=Path(...), volume="fresh-name")` | Requires archive path and fresh target name; missing values raise `ValueError`. Shares archive validation, ownership and no-activation safeguards. |
 | `run("select-volume", volume="owned-name")` | Requires volume name; omission raises `ValueError`. Same stopped-app/running-VM and provenance checks. |
+| `run("backup-enable", hour=3, minute=0)`, `run("backup-disable")`, `run("backup-due")`, `run("backup-status")`, `run("backup-reconcile")` | Same opt-in, captured-setting, daily retry, status and maintenance semantics as the [CLI](cli.md#daily-backup-status-results). Status returns `protected` for callable checks; CLI `--check` translates false into exit 1. Busy status alone may return an atomic read-only view without the operation lock. |
 | `run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")` | No prompts; supply credentials only in local process memory, never source/shell arguments. Same owned/running/security-checked app and active-forwarding guards; only sanitized counts/diagnostics/transport returned. Optional `loopback=True` selects the verified owned HTTP publication and returns `https_verified: false`; omitted/false retains trusted HTTPS. |
 
 `Operation`, `Runtime` and `RuntimeFailure` are exported by `rss_aggregator`.
@@ -302,10 +321,68 @@ baseline coverage. Actual normal-user launchd registration/removal, reboot/login
 intentional-stop across reboot, sleep/power behavior and trusted HTTPS/device
 availability require the [owner-assisted runbook](operations.md#owner-assisted-mac-acceptance-not-automated-evidence).
 No pre-unlock service or unchanged real-host settings are inferred from fixture
-passes. Daily scheduling/interruption reconciliation belongs to the backup sibling;
-combined intent/maintenance/scheduler tests must be rerun when integrating both
-changes. Keep revision-specific command results and unrun checks in the issue
-handoff, not as an implied platform pass here.
+passes. Use the combined verification guidance below whenever changing either
+supervision or backup orchestration. Keep revision-specific command results and
+unrun checks in the issue handoff, not as an implied platform pass here.
+
+## Combined supervision and backup verification
+
+Use the existing CLI/`Runtime.run` boundary for deterministic integration regressions,
+with scratch HOME/LaunchAgents, private temporary state and destinations, controlled
+launchctl/Podman responses, synthetic data and disposable subprocesses. Do not install
+either real job, use production ownership/data, create the owner's backup directory,
+or change host settings. Keep these tests in the default suite and shared
+`rss-dev check` gate; independent feature-suite passes are not combined proof.
+
+Cross-feature regressions live in `tests/test_supervised_backups.py`, alongside
+both feature suites. A focused iteration command is:
+
+```sh
+uv run --locked pytest tests/test_supervised_backups.py \
+  tests/test_fixture_namespaces.py tests/test_supervision.py tests/test_backup_schedule.py \
+  tests/test_backups.py tests/test_backup_forwarding_state.py
+# Always follow focused checks with the complete check-only baseline:
+uv run --locked rss-dev check
+```
+
+Maintain cross-feature assertions at the public command/callable boundary:
+
+- Only public start/stop write version 1 running/stopped intent. Absent intent
+  stays unset for supervision. Stop persists stopped before maintenance refusal;
+  blocked start cannot overwrite it. Successful maintenance admission precedes
+  running intent even when a later startup gate fails.
+- A normal stop retains the `BackupSchedule.shutdown` wrapper around recovery:
+  attempt/publication/resumption evidence and maintenance handling must not be
+  bypassed by lifecycle dispatch. Backups never write intent, and manual/daily
+  resumption never reopens an intentionally stopped app.
+- Any maintenance presence, including malformed data or dangling links, blocks
+  writer commands and supervisor recovery. One inherited nonblocking `command.lock`
+  serializes both features; contention is not queued or reported as backup success.
+  Busy backup-status remains an atomic read-only inspection.
+- Exercise capture/publication/resumption failures and real disposable parent
+  interruption while an export survives: the child retains the lock and the hold
+  prevents supervisor recovery. Preserve source data and prior good archives;
+  verified publication is independent of successful resumption.
+- Reconciliation validates owner/schema and idle engines, refusing foreign work
+  and surviving locked exports. It clears only the hold, never starts the app or
+  changes intent. With retained running intent a **later** supervisor tick may
+  recover; explicit stop before reconcile keeps subsequent ticks stopped.
+- Disposable runner regressions in `tests/test_fixture_namespaces.py` verify
+  namespaced intent/backup evidence without redirecting the real command lock or
+  maintenance guard, including a hold arriving after initial owner inspection.
+  Fixture interruption must not bypass shared safety or overwrite real records.
+- Preserve both opt-in job identities/captured settings and their independent
+  disable/remove behavior. No registration, manual archive or manual `backup-due`
+  invocation is proof of unattended daily work or healthy remote availability.
+
+These checks exercise controlled command/process/filesystem boundaries, not real
+launchd compatibility or live Podman descriptor behavior. Separately selected
+Mac integration requires owner coordination and a verified pre-change backup;
+actual registration/removal, reboot/login, intentional-stop persistence across
+reboot, sleep/power behavior, natural unattended daily timing, trusted reader
+availability, Time Machine retrieval and host-loss recovery remain separate live
+acceptance limits. Do not infer them from the default suite or simulate them
+against production merely to fill evidence gaps.
 
 ## Verification and adoption status
 
@@ -357,6 +434,22 @@ intended check. They demonstrate gate failure semantics for those revisions, not
 new CI results or branch protection.
 
 Remaining limits:
+
+- Daily scheduling tests use disposable launchd/engine substitutes; actual per-user
+  launchd registration/output compatibility, a natural unattended mini run and
+  missing-session/sleep behavior require owner-coordinated evidence with a verified
+  pre-change backup. The selected full-state integration test is separate and does
+  not prove daily timing or Time Machine inclusion/retrieval. No test may activate a
+  production schedule, create the real owner destination or change host settings
+  without that coordination.
+- Supervision and backup orchestration share operator-intent version 1, any
+  maintenance presence and one inherited command lock. Follow the
+  [combined deterministic verification guidance](#combined-supervision-and-backup-verification)
+  for changes to either feature. Native daemonizing Podman helpers must close
+  unrelated inherited descriptors; controlled orphan tests are not evidence for
+  their real descriptor behavior. A stuck inherited lock requires inspection,
+  never unlinking the lock/hold. Live descriptor behavior remains an explicit Mac
+  check, not a guarantee from fixture passes.
 
 - Python 3.10 (declared minimum), other Mac providers/versions, alternate image
   architectures and native Linux rootless-Podman integration remain unverified.

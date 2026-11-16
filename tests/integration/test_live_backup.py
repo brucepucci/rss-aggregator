@@ -11,6 +11,7 @@ import pytest
 from rss_aggregator import runtime
 
 from .replacement_support import (
+    FIXTURE_RECORD_SUFFIXES,
     ReplacementInstanceFixture,
     owned_runtime,
     volume_identity,
@@ -51,11 +52,7 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
     fixture = ReplacementInstanceFixture(tmp_path)
     controller, owner = owned_runtime()
     target = fixture.volume + "-recovered"
-    selection = controller.state_dir / ("test-" + fixture.token + "-selection.json")
     records = controller.state_dir / ("test-" + fixture.token + "-recovery.json")
-    fixture_locator = controller.state_dir / (
-        "test-" + fixture.token + "-last-backup.json"
-    )
     locator = controller.state_dir / "last-backup.json"
     original_locator = locator.read_bytes() if locator.exists() else None
     original_selection = (
@@ -109,6 +106,20 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
 
         report = recovery_command(fixture, directory, "backup")
         expect(report["verified"], "Backup was not verified")
+        protection = recovery_command(fixture, directory, "backup-status")
+        expect(
+            protection["latest_success"]["archive"] == report["archive"],
+            "Missing verified publication evidence",
+        )
+        expect(
+            protection["resumption"] == "preserved"
+            and not protection["maintenance_required"],
+            "Backup resumption incomplete",
+        )
+        expect(
+            not protection["enabled"] and not protection["protected"],
+            "Manual backup claimed unattended scheduling",
+        )
         fixture.login()
         assert_persisted_http(fixture, read_id, snapshot)
         app = controller._check_label("container", fixture.name, owner)
@@ -196,9 +207,13 @@ def test_backup_recovers_http_state_after_source_volume_is_removed(
                 "Interrupted preflight retained; inspect before manual cleanup",
             )
             controller._podman("volume", "rm", target)
-        selection.unlink(missing_ok=True)
-        records.unlink(missing_ok=True)
-        fixture_locator.unlink(missing_ok=True)
+        for name in FIXTURE_RECORD_SUFFIXES:
+            (controller.state_dir / ("test-" + fixture.token + "-" + name)).unlink(
+                missing_ok=True
+            )
+        # maintenance.json is shared with the real instance, not namespaced.
+        # Never erase it: an interrupted fixture operation must still block all
+        # writers until an owner inspects/reconciles the hold.
         if original_running:
             result = project("start")
             expect(

@@ -82,6 +82,48 @@ def test_backup_restores_observed_forwarding_not_current_opt_in(
         assert engine.settings["base_url"] == f"http://127.0.0.1:{engine.port}"
 
 
+def test_archive_success_is_distinct_from_failed_resumption(
+    backup_runtime, monkeypatch
+):
+    runtime, engine, _directory = backup_runtime
+    runtime.run("start")
+    failed = False
+
+    def run(*args, check=True, input=None):
+        nonlocal failed
+        if args[:4] == ("podman", "--connection", "rss-aggregator", "start"):
+            failed = True
+            raise RuntimeFailure("injected start failure")
+        return engine.run(*args, check=check, input=input)
+
+    monkeypatch.setattr(runtime, "_run", run)
+    with pytest.raises(RuntimeFailure, match="injected start failure"):
+        runtime.run("backup")
+    assert failed
+    report = runtime.run("backup-status")
+    assert report["latest_success"]["verified"] is True
+    assert Path(report["latest_success"]["archive"]).exists()
+    assert report["latest_attempt"]["outcome"] == "failed"
+    assert report["resumption"] == "failed"
+    assert report["maintenance_required"] is True
+    assert report["protected"] is False
+    assert runtime.run("backup-reconcile")["resumed"] is False
+    assert not engine.app["State"]["Running"]
+
+
+def test_backup_preserves_persisted_stopped_intent_without_resuming(backup_runtime):
+    runtime, engine, _directory = backup_runtime
+    runtime.run("start")
+    intent = runtime.state_dir / "operator-intent.json"
+    original = b'{"version":1,"intent":"stopped"}\n'
+    intent.write_bytes(original)
+    result = runtime.run("backup")
+    assert result["verified"] is True
+    assert not engine.app["State"]["Running"]
+    assert intent.read_bytes() == original
+    assert runtime.run("backup-status")["resumption"] == "preserved"
+
+
 def test_backup_forwarding_query_failure_does_not_leave_stopped_vm_running(
     backup_runtime, monkeypatch
 ):

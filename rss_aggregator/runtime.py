@@ -16,9 +16,10 @@ from typing import Any, Literal
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.recovery import Recovery, volume_name
-from rss_aggregator.supervision import MAINTENANCE, Supervision
+from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
     "setup",
@@ -36,6 +37,11 @@ Operation = Literal[
     "supervision-install",
     "supervision-remove",
     "supervision-tick",
+    "backup-status",
+    "backup-reconcile",
+    "backup-enable",
+    "backup-disable",
+    "backup-due",
 ]
 
 MACHINE = "rss-aggregator"
@@ -74,6 +80,7 @@ class Runtime:
             .expanduser()
             .resolve()
         )
+        self._command_lock_fd: int | None = None
         self.state_dir = (
             Path(
                 state_dir
@@ -108,6 +115,9 @@ class Runtime:
         username: str | None = None,
         api_password: str | None = None,
         loopback: bool = False,
+        now: datetime | None = None,
+        hour: int = 3,
+        minute: int = 0,
     ) -> dict[str, Any]:
         """Execute one public operation under the nonblocking project lock.
 
@@ -123,8 +133,14 @@ class Runtime:
             resource safety guard fails. OS and configuration errors propagate.
         """
         recovery = Recovery(self)
+        backups = BackupSchedule(self, now)
         handlers = {
-            "backup": recovery.backup,
+            "backup": backups.backup,
+            "backup-status": backups.status,
+            "backup-reconcile": backups.reconcile,
+            "backup-enable": lambda: backups.enable(hour, minute),
+            "backup-disable": backups.disable,
+            "backup-due": backups.due,
             "restore": lambda: recovery.restore(archive, volume),
             "select-volume": lambda: recovery.select_volume(volume),
             "api-check": lambda: self._api_check(
@@ -136,7 +152,7 @@ class Runtime:
             "fetch": self._fetch,
             "verify": self._verify,
             "replace": self._replace,
-            "stop": self._stop,
+            "stop": backups.shutdown,
             "supervision-status": Supervision(self).status,
             "supervision-install": Supervision(self).install,
             "supervision-remove": Supervision(self).remove,
@@ -155,27 +171,34 @@ class Runtime:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
+                if operation == "backup-status":
+                    return backups.status(busy=True)
+                if operation == "backup-due":
+                    backups.deferred()
                 raise RuntimeFailure(
                     "Another project command is running; wait for it to finish."
                 ) from error
-            self._lock_fd = lock.fileno()
+            self._command_lock_fd = lock.fileno()
             try:
                 if operation == "stop":
                     Supervision(self).set_intent("stopped")
-                if operation in (
-                    "start",
-                    "replace",
-                    "verify",
-                    "fetch",
-                ) and os.path.lexists(self.state_dir / MAINTENANCE):
+                if backups.pending() and operation not in (
+                    "status",
+                    "backup-status",
+                    "backup-reconcile",
+                    "backup-disable",
+                    "supervision-status",
+                    "supervision-tick",
+                    "supervision-remove",
+                ):
                     raise RuntimeFailure(
-                        "Maintenance requires reconciliation; inspect locally before starting writers."
+                        "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
                     )
                 if operation == "start":
                     Supervision(self).set_intent("running")
                 return handlers[operation]()
             finally:
-                self._lock_fd = None
+                self._command_lock_fd = None
 
     def _diagnostic(self, message: str) -> None:
         """Send human-readable progress or captured command chatter to stderr."""
@@ -205,8 +228,8 @@ class Runtime:
                 input=input,
                 check=False,
                 # Native work retains serialization if its Python parent dies.
-                pass_fds=(self._lock_fd,)
-                if getattr(self, "_lock_fd", None) is not None
+                pass_fds=(self._command_lock_fd,)
+                if self._command_lock_fd is not None
                 else (),
             )
         except OSError as error:
@@ -222,9 +245,18 @@ class Runtime:
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         target = self.state_dir / name
         temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, indent=2) + "\n")
-        temporary.chmod(0o600)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(json.dumps(value, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
         temporary.replace(target)
+        descriptor = os.open(self.state_dir, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _image(self) -> dict[str, Any]:
         """Read this checkout's pinned image configuration only when needed."""

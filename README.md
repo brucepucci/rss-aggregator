@@ -5,21 +5,26 @@ without giving up control of your subscriptions and collected articles.
 [FreshRSS](https://freshrss.org/) provides the reading service: subscriptions,
 feed fetching, articles, a browser interface and reader APIs. **This repository
 manages FreshRSS; it does not implement or fork it.** It adds a pinned container,
-guarded start/stop commands, complete instance backups and optional private HTTPS.
+guarded start/stop commands, complete instance backups, opt-in daily Mac backups
+and optional private HTTPS.
 
 The deployment is an **Apple Silicon Mac instance**, with manual operation by
-default and optional [normal-user-session startup/recovery](docs/operations.md#opt-in-mac-startup-and-recovery).
+default and optional [normal-user-session startup/recovery](docs/operations.md#opt-in-mac-startup-and-recovery)
+and [daily backups](docs/backup-restore.md#opt-in-daily-mac-backups). Neither job is
+installed by default; backup scheduling does not enable application supervision.
 ReadKit on macOS and iOS has been verified with shared read/unread and starred state.
-Real reboot/login recovery and owner acceptance remain unverified; no pre-unlock
-availability is promised. Always-on Linux deployment, destructive cleanup and
-paid-feed authorization remain future/unverified work. Readers cannot synchronize
-while the instance is stopped; explicit stop persists until explicit start.
+Real reboot/login recovery, unattended daily backups and owner acceptance remain
+unverified; no pre-unlock availability is promised. Always-on Linux deployment,
+destructive cleanup and paid-feed authorization remain future/unverified work.
+Readers cannot synchronize while the instance is stopped; explicit stop persists
+until explicit start.
 
 ## Contents
 
 - [Architecture](#architecture)
 - [Getting started](#getting-started)
 - [Routine CLI commands](#routine-cli-commands)
+- [Daily backup setup and checks](docs/backup-restore.md#opt-in-daily-mac-backups)
 - [Essential configuration](#essential-configuration)
 - [Common troubleshooting](#common-troubleshooting)
 - [FAQ](#faq)
@@ -55,7 +60,10 @@ articles and reading state with FreshRSS; it is not a request to fetch publisher
 The VM's named volume survives container replacement but **not VM deletion**.
 External backups are essential. Optional user-session launchd supervision observes
 health before bounded guarded recovery; it respects persistent operator stop and
-serialized backup maintenance. It does not change login, FileVault or power policy.
+serialized backup maintenance. A separate opt-in LaunchAgent can make verified
+daily copies outside the VM/Git. Sleep/logout and failures limit both jobs; neither
+changes login, FileVault or power policy. Local publication alone does not prove
+Time Machine or host-loss protection.
 
 Only loopback HTTP is published on the Mac; optional Tailscale Serve adds
 trusted, tailnet-only HTTPS, not public access. There is no host PHP/database
@@ -118,6 +126,7 @@ to stderr and failures return nonzero. `./scripts/rss` is an equivalent launcher
 | `uv run --locked rss status` | Inspect the VM, application, scheduler and private forwarding without starting anything. |
 | `uv run --locked rss fetch` | Fetch publisher feeds now, subject to caching/backoff. |
 | `uv run --locked rss backup` | Make a complete backup, then attempt to restore the previous serving state. |
+| `uv run --locked rss backup-status --check` | Check daily protection, freshness and separate resumption problems; nonzero if unhealthy. |
 | `uv run --locked rss stop` | Persist stopped intent, back up, remove owned forwarding and stop only the project VM. |
 | `uv run --locked rss supervision-status` | Check optional supervision, intent, observed health and recovery failures without restarting anything. |
 | `uv run --locked rss api-check` | Prompt for separate API credentials and check private HTTPS/API access. |
@@ -156,6 +165,8 @@ service is closed.
   After shutdown quiesces writers, backup failure leaves the application stopped
   and VM running; fix the cause and retry `stop`. A failed explicit `backup` may
   have resumed serving. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
+- **Missed/stale daily backups or interrupted maintenance:** inspect
+  `rss backup-status --check`; follow [daily failure/reconciliation procedures](docs/backup-restore.md#daily-check-and-failure-response), not a forced restart or deleted lock.
 - **Missing articles:** check the [fetching FAQ](#why-are-articles-missing-or-feeds-no-longer-updating)
   and [logs](#how-do-i-view-service-logs-and-investigate-feed-fetching-errors).
 - **ReadKit/certificate/API failure:** use the separate API password; check Tailscale
@@ -194,7 +205,13 @@ see [upstream import/export help](https://freshrss.github.io/FreshRSS/en/users/0
 
 Set `RSS_BACKUP_DIR` and run `uv run --locked rss backup`. It briefly stops writers
 and verifies an external archive before attempting to resume the prior state.
-`stop` also backs up. Copy successful archives to independent durable storage;
+`stop` also backs up. Daily scheduling is opt-in: follow the
+[owner-coordinated setup and daily checks](docs/backup-restore.md#opt-in-daily-mac-backups),
+with a verified pre-change backup and this deployment's explicit private
+`~/FreshRSS-Backups` destination. No schedule is enabled by ordinary manual use.
+An actual unattended run and separate Time Machine recovery evidence are still
+required; a registered job or fresh manual archive is not that proof.
+Copy successful archives to independent durable storage;
 there is no automatic pruning, encryption or upload.
 
 Restore validates a **trusted archive into a fresh volume**, then requires explicit

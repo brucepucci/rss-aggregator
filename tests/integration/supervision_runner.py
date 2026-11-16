@@ -7,12 +7,13 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from rss_aggregator import private_access, recovery, runtime, supervision
+from rss_aggregator import supervision
 
 from .replacement_support import (
     checked_application,
     checked_volume,
     owned_runtime,
+    redirect_fixture_names,
     replacement_names,
 )
 from .support import expect
@@ -21,7 +22,7 @@ from .support import expect
 def run():
     request = json.load(sys.stdin)
     token, port = request["token"], request["port"]
-    app, volume, check = replacement_names(token)
+    app, _volume, check = replacement_names(token)
     controller, owner = owned_runtime()
     checked_volume(controller, owner, token, request["volume"])
     checked_application(controller, owner, token, port, require_test_label=True)
@@ -33,13 +34,7 @@ def run():
     podman = shutil.which("podman")
     expect(podman is not None, "Podman unavailable")
     prefix = "test-" + token + "-"
-    runtime.APP, runtime.VOLUME, runtime.CHECK = app, volume, check
-    runtime.SELECTION = prefix + "selection.json"
-    recovery.RECOVERY_RECORD = prefix + "recovery.json"
-    private_access.SERVE_RECORD = prefix + "serve.json"
-    supervision.INTENT = prefix + "operator-intent.json"
-    supervision.REGISTRATION = prefix + "supervision.json"
-    supervision.RECOVERY_STATE = prefix + "supervision-recovery.json"
+    redirect_fixture_names(token)
     supervision.JOB_LABEL = "io.rss-aggregator.test-" + token
     # Keep the REAL command.lock and maintenance hold. Nothing uses real launchd,
     # the user's LaunchAgents directory, intent or forwarding records.

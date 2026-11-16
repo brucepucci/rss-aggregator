@@ -4,11 +4,11 @@ import copy
 import errno
 import io
 import json
+import os
 import socket
 import subprocess
 from http.client import BadStatusLine
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from threading import Thread
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
@@ -651,16 +651,16 @@ def test_rejected_start_does_not_authorize_identical_foreign_route(
         engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
     )
     monkeypatch.setattr(engine, "write", client.write)
-    write_text = Path.write_text
+    open_file = os.open
 
-    def write_with_full_storage(path, *args, **kwargs):
+    def open_with_full_storage(path, *args, **kwargs):
         if restoration_fails and path == record_path.with_suffix(".tmp") and statuses:
             raise OSError(errno.ENOSPC, "Fixture full filesystem")
-        return write_text(path, *args, **kwargs)
+        return open_file(path, *args, **kwargs)
 
-    # Keep production _save intact; fail only the post-rejection temporary write.
+    # Keep production durable _save intact; fail only its post-rejection file I/O.
     with monkeypatch.context() as storage:
-        storage.setattr(Path, "write_text", write_with_full_storage)
+        storage.setattr(os, "open", open_with_full_storage)
         with pytest.raises(
             RuntimeFailure,
             match="concurrent|authorization|unknown|could not be restored",

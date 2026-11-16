@@ -11,12 +11,13 @@ import sys
 
 import click
 
-from rss_aggregator import private_access, recovery, runtime, supervision
+from rss_aggregator import runtime
 
 from .replacement_support import (
     checked_application,
     checked_volume,
     owned_runtime,
+    redirect_fixture_names,
     replacement_names,
 )
 from .support import IMAGE, expect
@@ -27,7 +28,7 @@ def run():
     expect(os.environ.get("RSS_STATE_DIR"), "Select the existing RSS_STATE_DIR")
     request = json.load(sys.stdin)
     token, port = request["token"], request["port"]
-    app, volume, check = replacement_names(token)
+    app, _volume, check = replacement_names(token)
     expect(
         type(port) is int
         and 1024 <= port <= 65535
@@ -52,13 +53,7 @@ def run():
 
     # This is the entire runtime seam. MACHINE, LABEL, ownership checks,
     # subprocess execution, locking and replacement behavior stay unchanged.
-    runtime.APP, runtime.VOLUME, runtime.CHECK = app, volume, check
-    runtime.SELECTION = "test-" + token + "-selection.json"
-    recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
-    private_access.SERVE_RECORD = "test-" + token + "-serve.json"
-    supervision.INTENT = "test-" + token + "-operator-intent.json"
-    supervision.REGISTRATION = "test-" + token + "-supervision.json"
-    supervision.RECOVERY_STATE = "test-" + token + "-supervision-recovery.json"
+    redirect_fixture_names(token)
     os.environ["RSS_TAILSCALE"] = "0"
     from rss_aggregator.cli import main
 
