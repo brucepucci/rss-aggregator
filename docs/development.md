@@ -400,11 +400,12 @@ Maintain cross-feature assertions at the public command/callable boundary:
   invocation is proof of unattended daily work or healthy remote availability.
 
 These checks exercise controlled command/process/filesystem boundaries, not real
-launchd compatibility or live Podman descriptor behavior. Real-Podman validation
-of the VM-launcher descriptor exception and guarded cold recreation remains
-outstanding; earlier manual failures are not superseded by controlled regressions
-or fixture preparation changes. Separately selected Mac integration requires
-owner coordination and a verified pre-change backup;
+launchd compatibility or live Podman descriptor behavior. Controlled daemon and
+stale-PID regressions do not replace native verification of the VM-launcher
+descriptor exception and guarded cold recreation. Record revision-specific native
+results and limitations in the issue/PR handoff, not as a blanket platform pass.
+Separately selected Mac integration requires owner coordination and a verified
+pre-change backup;
 actual registration/removal, reboot/login, intentional-stop persistence across
 reboot, sleep/power behavior, natural unattended daily timing, trusted reader
 availability, Time Machine retrieval and host-loss recovery remain separate live
