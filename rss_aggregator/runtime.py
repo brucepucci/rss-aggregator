@@ -42,6 +42,9 @@ Operation = Literal[
     "backup-enable",
     "backup-disable",
     "backup-due",
+    "remove-vm",
+    "remove-package",
+    "delete-volume",
 ]
 
 MACHINE = "rss-aggregator"
@@ -118,6 +121,9 @@ class Runtime:
         now: datetime | None = None,
         hour: int = 3,
         minute: int = 0,
+        confirm: str | None = None,
+        package: str | None = None,
+        unused_elsewhere: bool = False,
     ) -> dict[str, Any]:
         """Execute one public operation under the nonblocking project lock.
 
@@ -132,9 +138,16 @@ class Runtime:
             If the operation is unknown, another command holds the lock, or a
             resource safety guard fails. OS and configuration errors propagate.
         """
+        from rss_aggregator.cleanup import Cleanup
+
         recovery = Recovery(self)
         backups = BackupSchedule(self, now)
         handlers = {
+            "remove-vm": lambda: Cleanup(self).remove_vm(confirm),
+            "remove-package": lambda: self._remove_package(
+                package, confirm, unused_elsewhere
+            ),
+            "delete-volume": lambda: Cleanup(self).delete_volume(volume, confirm),
             "backup": backups.backup,
             "backup-status": backups.status,
             "backup-reconcile": backups.reconcile,
@@ -190,6 +203,7 @@ class Runtime:
                     "supervision-status",
                     "supervision-tick",
                     "supervision-remove",
+                    "remove-vm",
                 ):
                     raise RuntimeFailure(
                         "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
@@ -199,6 +213,16 @@ class Runtime:
                 return handlers[operation]()
             finally:
                 self._command_lock_fd = None
+
+    def _remove_package(
+        self, package: str | None, confirm: str | None, unused_elsewhere: bool
+    ) -> dict[str, Any]:
+        """Dispatch optional host-package removal independently of VM deletion."""
+        from rss_aggregator.package_cleanup import PackageCleanup
+
+        if package is None:
+            raise ValueError("Remove-package requires an explicit formula name.")
+        return PackageCleanup(self).remove(package, confirm, unused_elsewhere)
 
     def _diagnostic(self, message: str) -> None:
         """Send human-readable progress or captured command chatter to stderr."""
@@ -210,6 +234,7 @@ class Runtime:
         check: bool = True,
         input: str | None = None,
         inherit_lock: bool = True,
+        dependency_checks: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Capture an external command with Homebrew mutation safeguards.
 
@@ -226,6 +251,8 @@ class Runtime:
             HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK="1",
             HOMEBREW_NO_INSTALL_CLEANUP="1",
         )
+        if dependency_checks:
+            env.pop("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", None)
         try:
             result = subprocess.run(
                 args,
@@ -427,7 +454,10 @@ class Runtime:
 
     def _setup(self) -> dict[str, Any]:
         """Create a rootless project VM without starting or adopting resources."""
+        from rss_aggregator.cleanup import Cleanup
+
         snapshot = self._inventory(resources=True)
+        Cleanup(self).prepare_setup(snapshot)
         if not (self.state_dir / "owner.json").exists():
             if any(m["Name"] == MACHINE for m in snapshot["machines"]):
                 raise RuntimeFailure(

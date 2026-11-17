@@ -287,6 +287,71 @@ daily work or actual unattended evidence. An available local archive is not proo
 of Time Machine inclusion/retrieval or host-loss recovery. Existing full-state
 live tests remain explicit selections, not default-suite proof of infrastructure.
 
+## Preview-first removal and generation retirement
+
+Issue #5 adds three operations to the existing thin CLI/`Runtime.run` boundary,
+sharing `command.lock` and maintenance admission rather than a parallel teardown
+engine. `cleanup.py` handles VM removal/inactive-volume deletion and
+`package_cleanup.py` handles per-formula eligibility. No new runtime settings,
+background service or automatic sweep is introduced. Native read-only preview
+binds explicit consent to the current private plan; it does not export, stop,
+create a destination or rewrite records (the existing lock is opened for writing).
+
+VM removal requires a running accessible owned machine, exactly the selected
+labelled volume, only reserved owner-labelled app/preflight containers and pinned
+images, and an entirely empty rootful engine, including stopped containers/volumes/
+images. Machine/rootless and derived-root connection identities are validated.
+Foreign connections/defaults remain unchanged; a project default among other
+connections refuses instead of letting native removal select another default.
+Captured jobs must first be removed by supervision-remove/backup-disable. Confirmation
+binds ownership, immutable resource/image identity, destination and connection
+inventory; changes require a newly reviewed preview, not implicit adoption.
+
+Apply reuses lifecycle quiescing and exact owned-forwarding cleanup, durable stop
+maintenance and the existing full-instance snapshot engine. It independently
+revalidates fresh external archive bytes/checksum and content, then rechecks the
+plan before stopping the VM and native `machine rm` with confirmation stdin. No
+old archive, `no_data`, force, global reset/prune or unavailable-source override
+permits deletion. Export/validation failure before deletion preserves source and
+prior archives; interrupted/partial removal retains maintenance for inspection.
+
+Private `removed-vm.json` version 1 records `status: removing`/`removed`, exact
+`owner`, `plan`, fresh `backup` and `foreign_connections` before native stop/rm.
+Completion requires absent exact machine/connections and unchanged foreign
+identities/defaults. If Python dies after rm, the same operation may finalize only
+the exact owned receipt and matching `stopping_vm` hold after independently verifying
+the recorded archive. Other absent/partial/mismatched states are not authority to
+clear records or broaden deletion. Ordinary repeated absence reports absent only.
+
+After successful removal, setup retires **only the exact old generation**: owner,
+selection/provenance, security, Serve, operator intent and supervision recovery
+records move to private `retired-<hash>/`. Baseline/additions, backup locators/evidence,
+receipt and checkout remain. Absent resource names then receive fresh ownership;
+reappearing names refuse adoption. Restore to a fresh explicit volume **before any
+empty app start**: setup, restore (may start only the owned VM), select-volume, start
+with the recorded compatible image. Use a fresh name, not the initial selected
+`rss-aggregator-data` even when absent, and verify the old original volume is absent.
+Retirement is not ownership fabrication or a cache sweep.
+
+Permanent volume deletion is a distinct irreversible consent boundary: one explicit
+labelled **unselected** volume, zero mounts and no attachments even to stopped
+containers. It creates no backup and invokes nonforce native removal, preserving
+all other resources/archives. Package removal similarly targets one plain formula:
+initial baseline plus additions ledger, unchanged installed version, fresh recursive
+installed formula/cask optional/build/test reverse dependencies and no Podman
+machines/connections. Apply requires both the exact current-plan digest and operator
+unused-elsewhere attestation; metadata cannot prove external adoption. Normal native
+`brew uninstall --formula` retains dependent checks, without force/ignore-dependencies/
+autoremove/cleanup. Podman goes first; each remaining addition needs a fresh preview.
+
+Backups/audits remain private; manual exact-file double review is the only archive
+removal procedure. No recursive directory/cache cleanup is provided. See
+[operations](operations.md#safe-cleanup) for unavailable-VM preservation/provider
+recovery and interrupted-removal handling, and [configuration](configuration.md#managed-local-records)
+for records. Deterministic guards are not real disposable VM remove/recreate/
+authenticated-state acceptance, native host uninstall or sentinel-preservation proof;
+these remain [unrun native evidence](development.md#cleanup-verification-and-remaining-native-evidence).
+
 ## Decisions
 
 - [ADR 0001: isolate local development with Podman](adr/0001-isolate-local-development-with-podman.md)

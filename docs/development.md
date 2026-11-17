@@ -123,8 +123,9 @@ typechecker or coverage percentage is required/configured.
 
 `.venv` and uv's Python/package caches are development tooling, not FreshRSS data
 or backups. Normal runtime stop leaves them alone. Do not confuse them with the
-protected ownership directory. No package-uninstall/cache-prune convenience
-command is provided.
+protected ownership directory. Optional `remove-package` removes only one confirmed,
+unchanged, unused project addition; it is not a cache prune or blanket uninstall.
+See [cleanup verification](#cleanup-verification-and-remaining-native-evidence).
 
 ## Managed pre-push hooks
 
@@ -347,11 +348,12 @@ working directory. Defaults are resolved per instance, not an import-time single
 Construction itself does not inspect or change native resources.
 
 `run(operation, *, archive=None, volume=None, username=None, api_password=None,
-loopback=False, now=None, hour=3, minute=0)` returns the same JSON-compatible
+loopback=False, now=None, hour=3, minute=0, confirm=None, package=None,
+unused_elsewhere=False)` returns the same JSON-compatible
 operation dictionaries and sends diagnostics to stderr. It serializes callable as well as CLI callers under the
 same nonblocking project lock. Unknown operations/ownership/lock failures raise
 `RuntimeFailure`; OS/configuration errors propagate for the caller to handle.
-There are twenty public operations, not a command for every helper. Optional
+There are twenty-three public operations (cleanup adds three), not a command for every helper. Optional
 `now` is an aware `datetime` controlling backup eligibility/freshness tests only;
 there is no CLI clock override. Omit it in production. `hour`/`minute` apply only
 to explicit `backup-enable` and use UTC.
@@ -363,6 +365,9 @@ to explicit `backup-enable` and use UTC.
 | `run("restore", archive=Path(...), volume="fresh-name")` | Requires archive path and fresh target name; missing values raise `ValueError`. Shares archive validation, ownership and no-activation safeguards. |
 | `run("select-volume", volume="owned-name")` | Requires volume name; omission raises `ValueError`. Same stopped-app/running-VM and provenance checks. |
 | `run("backup-enable", hour=3, minute=0)`, `run("backup-disable")`, `run("backup-due")`, `run("backup-status")`, `run("backup-reconcile")` | Same opt-in, captured-setting, daily retry, status and maintenance semantics as the [CLI](cli.md#daily-backup-status-results). Status returns `protected` for callable checks; CLI `--check` translates false into exit 1. Busy status alone may return an atomic read-only view without the operation lock. |
+| `run("remove-vm", confirm=None)` | Default native inspection-only preview; `confirm` must be the current plan SHA-256 to apply. Same fresh full external backup, ownership/resource/connection guards, durable receipt/maintenance and narrowly scoped absent-resource completion as the [CLI](cli.md#cleanup-commands). |
+| `run("delete-volume", volume="inactive-owned-name", confirm=None)` | Explicit unselected/unmounted/unattached labelled volume only; missing name raises `ValueError`. Preview by default, irreversible nonforce deletion with matching digest; no automatic backup. |
+| `run("remove-package", package="plain-formula", confirm=None, unused_elsewhere=False)` | Missing package raises `ValueError`. Default preview; apply requires current digest plus `unused_elsewhere=True` for each installed eligible candidate. Fresh baseline/additions/version/dependent/Podman checks and normal native uninstall semantics match CLI; never a sweep. |
 | `run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")` | No prompts; supply credentials only in local process memory, never source/shell arguments. Same owned/running/security-checked app and active-forwarding guards; only sanitized counts/diagnostics/transport returned. Optional `loopback=True` selects the verified owned HTTP publication and returns `https_verified: false`; omitted/false retains trusted HTTPS. |
 
 `Operation`, `Runtime` and `RuntimeFailure` are exported by `rss_aggregator`.
@@ -550,6 +555,83 @@ startup gates. Do not kill helpers or remove the lock to obtain a pass. Do not
 infer live acceptance from the default suite or simulate it against production
 merely to fill evidence gaps.
 
+## Cleanup verification and remaining native evidence
+
+Issue #5 uses the existing public CLI/`Runtime.run` seam and default test workflow,
+not private-helper acceptance or a separate test entrypoint:
+
+```sh
+uv run --locked pytest tests/test_cleanup.py tests/test_package_cleanup.py
+uv run --locked rss-dev check
+```
+
+Deterministic regressions use private temporary state/destinations, synthetic
+archives and controlled Podman/Homebrew executables; they do not remove a real VM,
+uninstall host packages or consume production data. Maintain coverage for:
+
+- Native inspection-only previews (except the existing lock), exact targets,
+  retained resources and no preview destination creation; stale confirmations
+  after resource/ownership/image/directory/connection changes must refuse.
+- Running owned source, exactly selected labelled volume, only labelled reserved
+  containers/pinned images, empty rootful engine including stopped resources,
+  derived-root/default-connection validation and removed captured jobs.
+- Fresh export plus independent archive/checksum validation before VM deletion,
+  backup/inspection/stop/rm failures, unavailable/absent/partially initialized
+  sources, resources arriving during export, prior archive preservation and no
+  force/reset/prune. A previous archive or `no_data` never permits removal.
+- Private versioned removing/removed receipt, maintenance retention after
+  interruption/partial removal, and absent-resource completion only for the exact
+  owned `stopping_vm` hold/receipt with verified archive/foreign connections.
+  Unknown/mismatched state must refuse, not delete records or broaden authority.
+- Successful generation retirement during `setup`, preserving baseline/additions,
+  locators/evidence/checkout and refusing reappearing collisions. Setup then restore
+  to a fresh name before any empty app start; selection/compatible-image gates remain.
+- Separate nonforce irreversible deletion only for explicit unselected labelled
+  volumes with zero mounts/no stopped-container attachment; no automatic backup,
+  other resources/archives retained and already-absent behavior.
+- One plain formula per preview/apply; initial baseline and additions ledgers,
+  unchanged installed versions, fresh recursive formula/cask optional/build/test
+  dependents and no Podman machines/connections. Require both per-candidate external
+  adoption attestation and current full-plan digest; recheck immediately before
+  uninstall, retain native dependent checks and preserve ledgers/other packages on
+  refusal. Removing Podman first does not authorize a dependency sweep.
+
+**NOT RUN / not established by these deterministic checks:** actual disposable VM
+remove/recreate/restore with authenticated original user, subscriptions, article
+content and read/unread plus starred/unstarred state; real host Homebrew uninstall;
+or native unrelated-sentinel preservation. Earlier source-absent recovery and
+ordinary VM-restart evidence do not prove VM teardown/generation retirement. Default
+fixture passes must not be described as these native acceptance results.
+
+A future real check requires explicit owner approval, an independent verified backup,
+exclusively disposable resources, a private expected-state record and a preservation
+inventory. Follow [the operator runbook](operations.md#safe-cleanup), including job
+removal, fresh removal-time capture, setup/restore-before-start and authenticated
+comparison. Do not delete the only real instance or uninstall real host formulae just
+to demonstrate a preview. Preserve sensitive archives/audits and record exact revision,
+commands, sanitized results and all unrun checks in the issue/PR handoff. Do not infer
+real sentinel preservation from substitute inventories. Manual residual/backup review
+is not automatic pruning or secure-erasure evidence. No new settings are introduced.
+
+The explicitly selected native drill is available but **NOT RUN**:
+
+```sh
+uv run --locked pytest tests/integration/test_live_cleanup.py::test_disposable_vm_remove_recreate_restore_preserves_authenticated_state -m live -q
+```
+
+It requires macOS/Apple Silicon virtualization, preinstalled Homebrew Podman, the
+reviewed compatible image configuration, internet/public-feed access and an approved
+idle-host window with **no running Podman machine**. Unlike ordinary FreshRSS live
+tests, it creates a uniquely named fresh owned VM with private temporary ownership,
+backup destination and synthetic user; it never borrows the owner's existing VM or
+fabricates its owner record. It uses loopback/namespaced job labels without real
+job activation, removes/recreates its disposable VM, restores before empty startup,
+and compares authenticated article/read/star state and retained connection/machine
+inventories. Failed drills retain namespaced resources/state for inspection, not
+forced fallback cleanup. Keep any retained artifacts private. This is not a real
+host-uninstall test, unrelated-sentinel proof, cross-host recovery or permission to
+run against production; coordinate prerequisites and preservation before selection.
+
 ## Verification and adoption status
 
 The repository implements uv/lockfile management, deterministic default pytest
@@ -630,10 +712,13 @@ Remaining limits:
 - Physical second-host recovery and cross-architecture recovery are unverified.
   Verification archives in temporary private directories do not establish a
   durable user backup configuration; VM-native storage itself is not a backup.
-- Private/paid-feed authorization acceptance and destructive cleanup are not
-  implemented/verified project capabilities; Linux server deployment remains a
-  later phase. No VM/volume deletion, global prune/reset or package-uninstall
-  convenience command exists.
+- Private/paid-feed authorization acceptance remains unverified; Linux server
+  deployment remains a later phase. Preview-first owned VM removal, separate
+  inactive-volume deletion and per-formula removal are implemented with deterministic
+  guards; real disposable removal/recreation/authenticated recovery and real host
+  uninstall/sentinel proof remain unperformed as described in
+  [cleanup verification](#cleanup-verification-and-remaining-native-evidence).
+  Global prune/reset, automatic backup pruning and cache/directory sweeps remain unsupported.
 - [Issue #7](https://github.com/brucepucci/rss-aggregator/issues/7) owns broader
   controlled publisher/error cases, interruption-safe fixtures, a coverage matrix,
   Markdown/local-reference automation and Linux/Mac integration responsibilities.

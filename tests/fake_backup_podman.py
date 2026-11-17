@@ -29,11 +29,37 @@ if args == ["machine", "inspect", "rss-aggregator"]:
 elif args == ["machine", "list", "--format", "json"]:
     print(
         json.dumps(
-            [{"Name": "rss-aggregator", "Running": machine["State"] == "running"}]
+            (
+                [{"Name": "rss-aggregator", "Running": machine["State"] == "running"}]
+                if machine
+                else []
+            )
+            + state.get("other_machines", [])
         )
     )
 elif args == ["system", "connection", "list", "--format", "json"]:
-    print(json.dumps([connection]))
+    print(
+        json.dumps(
+            ([connection] if connection else []) + state.get("other_connections", [])
+        )
+    )
+elif args[:2] == ["machine", "init"]:
+    if machine is not None:
+        fail("machine already exists")
+    state["machine"] = {
+        "Name": "rss-aggregator",
+        "Created": "recreated",
+        "ConfigDir": {"Path": "/new-fixture"},
+        "Rootful": False,
+        "SSHConfig": {"Port": 12346, "IdentityPath": "/new-fixture/key"},
+        "State": "stopped",
+    }
+    state["connection"] = {
+        "Name": "rss-aggregator",
+        "URI": "ssh://new-fixture",
+        "Identity": "/new-fixture/key",
+    }
+    save()
 elif args[:2] == ["machine", "start"]:
     machine["State"] = "running"
     save()
@@ -42,8 +68,26 @@ elif args == ["machine", "stop", "rss-aggregator"]:
         fail("VM stopped with writers running")
     machine["State"] = "stopped"
     save()
+elif args == ["machine", "rm", "rss-aggregator"]:
+    if machine["State"] != "stopped" or sys.stdin.read() != "y\n":
+        fail("unsafe machine removal")
+    if state.get("fail_rm"):
+        fail("injected removal failure")
+    state["machine"] = state["connection"] = None
+    state["volumes"] = {}
+    state["containers"] = {}
+    save()
 elif args[:3] == ["machine", "ssh", "rss-aggregator"]:
-    print(json.dumps(state.get("rootful", [])))
+    if machine["State"] != "running" or state.get("unresponsive"):
+        fail("source unavailable with sensitive diagnostics")
+    kind = (
+        "rootful_volumes"
+        if "volume" in args
+        else "rootful_images"
+        if "images" in args
+        else "rootful"
+    )
+    print(json.dumps(state.get(kind, [])))
 elif args[:2] == ["--connection", "rss-aggregator"]:
     if machine["State"] != "running":
         fail("engine unavailable")
@@ -87,6 +131,12 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         print(json.dumps([state["containers"][args[2]]]))
     elif args[0] == "stop":
         state["containers"][args[-1]]["State"]["Running"] = False
+        for mount in state["containers"][args[-1]]["Mounts"]:
+            if (
+                mount.get("Name") in state["volumes"]
+                and "MountCount" in state["volumes"][mount["Name"]]
+            ):
+                state["volumes"][mount["Name"]]["MountCount"] = 0
         save()
     elif args[0] == "rm":
         del state["containers"][args[-1]]
@@ -94,10 +144,24 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     elif args[0] == "start":
         state["containers"][args[-1]]["State"]["Running"] = True
         save()
+    elif args[:2] == ["volume", "ls"]:
+        print(json.dumps([{"Name": name} for name in state["volumes"]]))
+    elif args[0] == "images":
+        print(json.dumps(state.get("images", [{"Id": "fixture-image"}])))
     elif args[:2] == ["volume", "exists"]:
         raise SystemExit(0 if args[2] in state["volumes"] else 1)
     elif args[:2] == ["volume", "inspect"]:
         print(json.dumps([state["volumes"][args[2]]]))
+    elif args[:2] == ["volume", "rm"]:
+        name = args[-1]
+        if any(
+            m.get("Name") == name
+            for c in state["containers"].values()
+            for m in c["Mounts"]
+        ):
+            fail("volume in use")
+        del state["volumes"][name]
+        save()
     elif args[:2] == ["volume", "create"]:
         name = args[-1]
         if name in state["volumes"]:
@@ -118,6 +182,9 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
             output.write_bytes(b"partial archive")
             fail("injected interrupted export with sensitive filename")
         shutil.copyfile(state["payload"], output)
+        if state.get("add_volume_during_export"):
+            state["volumes"]["appeared-during-export"] = {"Labels": {}}
+            save()
     elif args[:2] == ["volume", "import"]:
         if state.get("fail_import"):
             fail("injected import failure with sensitive filename")

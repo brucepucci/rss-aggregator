@@ -97,6 +97,48 @@ def stop() -> None:
     _execute("stop")
 
 
+@main.command("remove-vm")
+@click.option(
+    "--confirm",
+    help="Apply only the current preview's SHA-256 confirmation. Default: preview only.",
+)
+def remove_vm(confirm: str | None) -> None:
+    """Preview removal of the dedicated VM; applying first makes a fresh backup."""
+    _execute("remove-vm", confirm=confirm)
+
+
+@main.command("delete-volume")
+@click.argument("volume")
+@click.option(
+    "--confirm",
+    help="Irreversibly delete only the current preview's target. Default: preview only.",
+)
+def delete_volume(volume: str, confirm: str | None) -> None:
+    """Preview permanent deletion of one inactive, owned VOLUME; preserve backups."""
+    _execute("delete-volume", volume=volume, confirm=confirm)
+
+
+@main.command("remove-package")
+@click.argument("package")
+@click.option(
+    "--confirm",
+    help="Apply only the current preview's SHA-256 confirmation. Default: preview only.",
+)
+@click.option(
+    "--unused-elsewhere",
+    is_flag=True,
+    help="Attest that this exact package is unused by other projects; required to apply.",
+)
+def remove_package(package: str, confirm: str | None, unused_elsewhere: bool) -> None:
+    """Preview removal of one project-added Homebrew formula, never a sweep."""
+    _execute(
+        "remove-package",
+        package=package,
+        confirm=confirm,
+        unused_elsewhere=unused_elsewhere,
+    )
+
+
 @main.command("api-check")
 @click.option(
     "--loopback",

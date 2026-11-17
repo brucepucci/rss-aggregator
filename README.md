@@ -21,8 +21,9 @@ checks without container restart; the owner then confirmed
 [ReadKit availability](https://github.com/brucepucci/rss-aggregator/issues/26#issuecomment-6937683728).
 Intentional-stop across reboot, detailed client-state checks, natural daily backup
 timing, power/outage behavior and overall production acceptance remain outstanding;
-no pre-unlock availability is promised. Always-on Linux deployment,
-destructive cleanup and paid-feed authorization remain future/unverified work.
+no pre-unlock availability is promised. Preview-first [safe cleanup and recreation](docs/operations.md#safe-cleanup)
+is available; real disposable-VM removal/recreation and authenticated recovery remain
+unverified. Always-on Linux deployment and paid-feed authorization remain future/unverified work.
 Readers cannot synchronize while the instance is stopped; explicit stop persists
 until explicit start.
 
@@ -42,6 +43,7 @@ until explicit start.
   - [How do I back up and restore the complete FreshRSS instance?](#how-do-i-back-up-and-restore-the-complete-freshrss-instance)
   - [How do I deploy, start, stop, and update the service?](#how-do-i-deploy-start-stop-and-update-the-service)
   - [How do I enable automatic Mac startup and check recovery?](#how-do-i-enable-automatic-mac-startup-and-check-recovery)
+  - [How do I safely remove and recreate the environment?](#how-do-i-safely-remove-and-recreate-the-environment)
   - [How do I move the aggregator to another machine?](#how-do-i-move-the-aggregator-to-another-machine)
   - [How do I connect a reading app or access the instance from another device?](#how-do-i-connect-a-reading-app-or-access-the-instance-from-another-device)
   - [Why are articles missing or feeds no longer updating?](#why-are-articles-missing-or-feeds-no-longer-updating)
@@ -121,8 +123,8 @@ After `start` succeeds:
 
 Keep `RSS_BACKUP_DIR` set for shutdown. `stop` creates a verified backup before
 stopping the VM. This releases VM memory and stops serving/fetching; it preserves
-application data. **Do not delete the VM, prune Podman, or remove `.local/` to clean
-up.** See [safe cleanup](docs/operations.md#safe-cleanup).
+application data. **Do not manually delete the VM, prune Podman, or remove `.local/`
+to clean up.** Use the separate preview-first [safe cleanup runbook](docs/operations.md#safe-cleanup).
 
 ## Routine CLI commands
 
@@ -139,6 +141,7 @@ to stderr and failures return nonzero. `./scripts/rss` is an equivalent launcher
 | `uv run --locked rss stop` | Persist stopped intent, back up, remove owned forwarding and stop only the project VM. |
 | `uv run --locked rss supervision-status` | Check optional supervision, intent, observed health and recovery failures without restarting anything. |
 | `uv run --locked rss api-check` | Prompt for separate API credentials and check private HTTPS/API access. |
+| `uv run --locked rss remove-vm` | Preview exact owned VM removal; does not delete without the current confirmation digest and a fresh verified backup. |
 | `uv run --locked rss --help` | Show commands; append `--help` to any subcommand for its syntax. |
 
 When `start` itself starts a stopped owned VM, it can recreate a matching stopped
@@ -158,7 +161,7 @@ new shells. The CLI does not load a `.env` file automatically.
 
 | Setting | Default and ordinary use |
 | --- | --- |
-| `RSS_BACKUP_DIR` | **No default; required for backups and shutdown with data.** Absolute private directory outside Git. Permissions are not encryption; keep durable independent copies. |
+| `RSS_BACKUP_DIR` | **No default; required for backups, shutdown with data and VM removal.** Absolute private directory outside Git. Permissions are not encryption; keep durable independent copies. |
 | `RSS_PORT` | Optional, `8080`. Choose an unused port in `1024–65535` consistently. For installed instances, follow the [guarded port-change procedure](docs/configuration.md#changing-the-loopback-port): verified backup and captured-job removal/disablement must precede base-URL/replacement changes. |
 | `RSS_TAILSCALE` | Optional, `0` (local browser only). Use the [guarded private-HTTPS activation procedure](docs/tailscale-readkit.md#connect-and-verify-the-server): verified backup and captured-job removal/disablement precede setting `1`; verify private access before explicit optional recapture. |
 | `RSS_STATE_DIR` | Optional, `<checkout>/.local`. Private ownership records, **not the database**. Keep one controlling checkout; another worktree must explicitly use the original directory, not copy/fabricate it. |
@@ -266,6 +269,24 @@ have a bounded retry budget. `rss stop` remains stopped across ticks/login/reboo
 until `rss start`; backups never undo that intent. Safe removal preserves the app,
 data, backups and unrelated jobs. Actual reboot/login/security/power limitations
 require separately recorded owner acceptance; automated tests are not that evidence.
+
+### How do I safely remove and recreate the environment?
+
+Use the [cleanup and recovery runbook](docs/operations.md#safe-cleanup), not a global
+Podman reset or directory sweep. `stop` retains data; `replace` retains its volume.
+`remove-vm` defaults to inspection and requires explicit current-plan confirmation,
+removed captured jobs and a fresh independently validated external backup before
+VM deletion. Packages and archives remain. Optional `remove-package` is separately
+previewed/confirmed per project-added formula and requires an unused-elsewhere
+attestation; `delete-volume` is separate **irreversible**, unselected-volume deletion
+with **no automatic backup**. Backup deletion is manual exact-file review only.
+
+To recover after successful removal: `setup`, then `restore ARCHIVE --volume NEW`
+**before any empty `start`**, then `select-volume NEW` and `start`, using the recorded
+compatible image. Verify fresh login, subscriptions, article content and read/star
+state. Unavailable or partially removed VMs require inspection/recovery, never a
+data-loss override or fabricated ownership records. Real remove/recreate/full-state
+acceptance and real host-uninstall/sentinel preservation are not yet demonstrated.
 
 ### How do I move the aggregator to another machine?
 
