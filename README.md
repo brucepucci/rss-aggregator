@@ -151,7 +151,7 @@ new shells. The CLI does not load a `.env` file automatically.
 | --- | --- |
 | `RSS_BACKUP_DIR` | **No default; required for backups and shutdown with data.** Absolute private directory outside Git. Permissions are not encryption; keep durable independent copies. |
 | `RSS_PORT` | Optional, `8080`. Choose an unused port in `1024–65535` consistently. For installed instances, follow the [guarded port-change procedure](docs/configuration.md#changing-the-loopback-port): verified backup and captured-job removal/disablement must precede base-URL/replacement changes. |
-| `RSS_TAILSCALE` | Optional, `0` (local browser only). Set `1` for private HTTPS after the [ReadKit prerequisites](docs/tailscale-readkit.md#prerequisites-and-ownership). |
+| `RSS_TAILSCALE` | Optional, `0` (local browser only). Use the [guarded private-HTTPS activation procedure](docs/tailscale-readkit.md#connect-and-verify-the-server): verified backup and captured-job removal/disablement precede setting `1`; verify private access before explicit optional recapture. |
 | `RSS_STATE_DIR` | Optional, `<checkout>/.local`. Private ownership records, **not the database**. Keep one controlling checkout; another worktree must explicitly use the original directory, not copy/fabricate it. |
 
 Enter passwords and private feed URLs only locally: in FreshRSS, or the hidden
@@ -233,11 +233,12 @@ Use [Getting started](#getting-started) for the supported Mac deployment, and
 Always-on Linux deployment is not implemented. A sleeping/stopped host cannot
 provide reliable fetching or synchronization.
 
-There is no automatic image update. Back up first, review the official image's
-security advisories and exact platform/digest, update the checked-in pin deliberately,
-then use `rss replace` and verify persisted state. Follow
-[image updates and rollback](docs/backup-restore.md#image-updates-and-rollback);
-never assume an older image can open a newer database.
+There is no automatic image update. Follow
+[image updates and rollback](docs/backup-restore.md#image-updates-and-rollback):
+verified backup and successful owned-supervision removal must precede a reviewed
+pin change. Guarded replacement and application/state verification precede explicit
+optional reinstallation with the new configuration; manual-only use stays disabled.
+Never assume an older image can open a newer database.
 
 ### How do I enable automatic Mac startup and check recovery?
 
@@ -263,10 +264,12 @@ unverified; the automated recovery drill uses isolated state on one Mac.
 
 ### How do I connect a reading app or access the instance from another device?
 
-Follow the [private HTTPS/ReadKit runbook](docs/tailscale-readkit.md). It uses the
-existing Tailscale installation on all devices, approved DNS/HTTPS and narrow
-TCP 443 access; port 8080 remains loopback-only. Set `RSS_TAILSCALE=1`, run `start`,
-and use its private HTTPS URL in a browser.
+Follow the [guarded private-HTTPS activation runbook](docs/tailscale-readkit.md#connect-and-verify-the-server).
+It uses the existing Tailscale installation on all devices, approved DNS/HTTPS and
+narrow TCP 443 access; port 8080 remains loopback-only. Obtain a verified backup
+and successfully remove/disable captured jobs **before** setting `RSS_TAILSCALE=1`.
+Verify private HTTPS/authentication before explicitly recapturing any wanted jobs;
+changing the shell alone can leave later recovery in loopback mode.
 
 In ReadKit choose **FreshRSS**, the **instance origin without `/api/greader.php`**,
 the same FreshRSS user on both devices, and a separate API password set locally

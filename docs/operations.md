@@ -89,7 +89,10 @@ installer until you choose SQLite and authenticated web login locally.
 stopped application or restarts/rechecks a running one. `replace` removes only
 the owned application container and recreates it with the same selected named
 volume and current configuration. Use it for reviewed container/image/port changes;
-it is not data deletion. For port changes, first follow the
+it is not data deletion. For image changes, follow the
+[backup, supervision-removal and recapture procedure](backup-restore.md#image-updates-and-rollback)
+**before** changing the pin; an installed supervisor retains the old configuration
+hash even after a successful replacement. For port changes, first follow the
 [verified-backup, job removal and recapture procedure](configuration.md#changing-the-loopback-port);
 installed jobs retain the old port unless explicitly reconfigured. Browser sessions can expire after replacement; sign in
 again and verify subscriptions, articles and reading state. For a restored volume,

@@ -352,12 +352,85 @@ not start it or create another archive. There is no bypass to delete data.
 ## Image updates and rollback
 
 First complete the initial recovery activation with its recorded matching pin.
-After that, deliberate image updates remain supported. Create a verified pre-update
-backup. Review the replacement official image's current
-advisories, digest, platform and actual PHP configuration, update the pin explicitly,
-then run `uv run --locked rss replace` and verify security, login, fetching and
-persisted reading state. See [image configuration](configuration.md) and the
-[security policy](architecture.md#image-and-php-security-policy). No unattended image
-update is supported. If rollback is required after a database migration, restore
-the pre-update archive into a fresh volume with the matching image/configuration;
-never point an older release at an arbitrarily newer database.
+After that, deliberate, owner-coordinated image updates remain supported; no
+unattended image update is supported.
+
+1. Work from the stable, synchronized controlling checkout in the normal Mac user's
+   session. Retain the **original** `RSS_STATE_DIR`, `RSS_PORT`, `RSS_TAILSCALE` mode
+   and private `RSS_BACKUP_DIR`; do not move ownership records or change deployment
+   settings as part of this pin-only operation. Record whether supervision was
+   enabled and its intended captured checkout, Python/dependency paths, ownership
+   directory, port, forwarding mode and backup destination. Retain the original
+   `config/image.json` privately outside Git alongside the recovery evidence.
+2. Create a private, verified pre-change instance backup before changing the pin:
+
+   ```sh
+   uv run --locked rss backup &&
+     uv run --locked rss backup-status &&
+     uv run --locked rss supervision-status
+   ```
+
+   Retain the archive (for example, `/absolute/private/path/pre-update.zip`),
+   checksum and original pin. Confirm successful resumption of the prior service/
+   forwarding state and no maintenance hold; archive publication alone is not
+   enough. Status commands can exit successfully while reporting an unhealthy
+   state: inspect their JSON. Stop on failure or uncertainty and use the
+   [failure/reconciliation procedure](#interrupted-maintenance-and-reconciliation)
+   with the owner; never delete locks, maintenance markers or ownership records.
+3. **Before any pin mutation**, successfully remove only owned supervision:
+
+   ```sh
+   uv run --locked rss supervision-remove &&
+     uv run --locked rss supervision-status
+   ```
+
+   Removal is repeatable when supervision is already absent. Require successful
+   removal and confirm `enabled: false`, `state: "disabled"` before proceeding.
+   Stop on any refusal, partial result or uncertain removal; resolve with the owner,
+   not by manually deleting managed jobs or registration files. Supervision captures
+   the image-configuration hash: changing the pin while installed leaves it
+   `configuration_unavailable`, not ready to supervise the replacement. Daily backup
+   scheduling captures the environment, not this image hash; with those settings
+   unchanged, do not disable/re-enable backups solely for this pin change.
+4. Review the replacement **official** image's current advisories, digest, platform
+   and effective Apache PHP policy. See [image configuration](configuration.md) and
+   the [security policy](architecture.md#image-and-php-security-policy). Only after
+   the removal gate above, explicitly update `config/image.json` to the reviewed
+   pin. Then perform guarded replacement and verification:
+
+   ```sh
+   uv run --locked rss replace &&
+     uv run --locked rss verify &&
+     uv run --locked rss status
+   ```
+
+   Require the effective PHP/security gate, HTTP readiness, scheduler and initial
+   feed-fetching checks to pass. Verify authenticated login, subscriptions, article
+   content, persisted read/unread and starred state, and intended private HTTPS/
+   reader synchronization where applicable. On any failure, stop and preserve the
+   original archive, pin and volumes for owner-led recovery; do not bypass security,
+   weaken TLS or force a database downgrade.
+5. **Manual operation remains the default.** Only after all checks pass and explicit
+   owner approval, optionally reinstall supervision with the intended captured
+   settings and available dependencies from step 1:
+
+   ```sh
+   uv run --locked rss supervision-install &&
+     uv run --locked rss supervision-status
+   ```
+
+   Require `state: "healthy"`; installation alone is not health evidence. Do not
+   automatically enable a formerly disabled job. Removal/replacement preserves
+   persisted intent: if stopped intent must become running, use owner-approved
+   `rss start` and repeat the checks before installation, not a hand-edited record.
+
+For rollback, use the retained **pre-update archive** and matching reviewed image/
+configuration through [fresh-volume recovery and first activation](#recovery-on-this-or-a-clean-host).
+Any rollback pin change likewise requires successful owned `supervision-remove`
+**before** mutation and confirmation of disabled status as above, even if removal
+is an already-absent no-op. Reassess current advisories; an old archive does not
+permit a security bypass. Preserve the original and updated volumes until recovery
+is verified. Never point an older release directly at a database migrated by a
+newer release; rollback is fresh-volume restore and matching activation, not a
+database downgrade. Keep supervision disabled unless explicitly approved and all
+recovery checks pass before optional reinstallation.
