@@ -260,6 +260,66 @@ Production-cadence observation is a separate one-off acceptance/soak check, not 
 routine test/publication requirement. Manual cron-command execution is not timing
 evidence. See [historical evidence](#historical-evidence-and-remaining-limits).
 
+### Time Machine staged-archive verification
+
+The [owner-assisted recovery runbook](backup-restore.md#time-machine-copy-recovery-drill)
+is the canonical procedure. Actual destination inclusion, encryption/access
+assessment, completed-copy availability/retrieval and restored-application checks
+are mandatory separate evidence for #24; default tests must not depend on Time
+Machine availability, mount disks, alter exclusions or request privileged access.
+
+Focused deterministic preparation:
+
+```sh
+uv run --locked pytest tests/test_backups.py tests/test_fixture_namespaces.py
+uv run --locked rss-dev check
+```
+
+`test_recovery_runner_restores_independently_staged_archive_without_source` passes
+an independently staged private archive to the existing production-command runner,
+removes only the fixture's original archive/source engine state, and asserts import
+without activation plus preservation of production selection, locator, intent,
+backup-success and forwarding records. It also checks that staged bytes remain
+unchanged. This models copy independence, **not a Time Machine retrieval**; the
+substitute engine cannot prove a working database or authenticated application.
+Existing command tests cover malformed archives, existing targets and incomplete
+imports; the explicitly selected source-absent HTTP regression remains:
+
+```sh
+uv run --locked pytest tests/integration/test_live_backup.py::test_backup_recovers_http_state_after_source_volume_is_removed -m live -q
+```
+
+That live regression creates its own **manual** synthetic backups; it does not
+consume an actual Time Machine copy or prove daily timing. It can interrupt the
+working application and requires owner coordination, a verified pre-change backup
+and all [live prerequisites](#explicit-liveplatform-checks). Do not run the complete
+live suite merely to fill #24's Time Machine evidence gap.
+
+For an actual already-retrieved archive, `tests.integration.backup_runner` already
+accepts stdin JSON containing `token`, `operation` and (for restore) `archive`.
+Use a fresh 16-lowercase-hex token, absent reserved resources/records, the original
+`RSS_STATE_DIR`, a free fixture `RSS_PORT` and the running owned VM. Separate
+`restore`, `select-volume` and `start` requests invoke unchanged production Click
+behavior against namespaced resources. There is no new project CLI/configuration
+interface. Never use arbitrary production resource names, copy ownership records,
+redirect the command lock/maintenance guard, or bypass the recorded-image/security
+gates. Loopback mode prevents real Serve mutations, **not outbound feed fetching**.
+Before using real data, obtain consent and establish protection against unauthorized
+publisher requests; otherwise activation and application acceptance remain blocked.
+
+The runner is an operation adapter, not a standalone application verifier or an
+automatic cleanup tool. Existing `InstanceFixture.login()` expects synthetic
+`testreader` credentials from its in-memory fixture; an unrelated production archive
+cannot simply be passed to the live test and called verified. Use owner-assisted
+fresh login/state comparisons with expectations retained privately, not database
+queries/file presence. Verify both read/unread and starred/unstarred examples and
+representative settings/users. Retain exact target identity/provenance for any
+owner-approved identity-checked cleanup; do not delete archives or shared holds.
+`security.json` is shared, as in existing live fixtures; a clone audit is not proof
+of the working application's effective runtime. Coordinate production API checks.
+Record revision-specific outcomes/unrun checks in the issue, not as permanent
+platform-pass claims here.
+
 ## Callable Python interface
 
 Click is a thin adapter; Python callers use the same guarded operations:
