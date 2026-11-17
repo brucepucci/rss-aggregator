@@ -82,9 +82,10 @@ def native_vm_service(command, tmp_path):
                 time.sleep(0.01)
 
 
-def run_captured_job(job, *, interrupt=None):
-    """Model only the job-owned process group; observe after the parent has exited."""
-    definition = plistlib.loads(job.read_bytes())
+def run_captured_job(job, *, interrupt=None, definition=None):
+    """Execute the loaded snapshot when supplied, not a possibly changed disk file."""
+    if definition is None:
+        definition = plistlib.loads(job.read_bytes())
     # A surviving native export can retain stdout/stderr as well as its lease.
     # Files allow observing parent exit without waiting for descendant pipe EOF.
     output = job.with_suffix(".stdout")
@@ -132,7 +133,10 @@ def available(port):
         return False
 
 
-def test_recovery_remains_available_after_captured_job_exits(request, tmp_path):
+@pytest.mark.parametrize("missing_loaded_policy", [None, "legacy", "fixed", "unloaded"])
+def test_recovery_remains_available_after_captured_job_exits(
+    request, tmp_path, missing_loaded_policy
+):
     command, engine = request.getfixturevalue("supervised")
     assert invoke(command, "supervision-remove").returncode == 0
     with native_vm_service(command, tmp_path) as (port, ready):
@@ -145,7 +149,39 @@ def test_recovery_remains_available_after_captured_job_exits(request, tmp_path):
         installed = invoke(command, "supervision-install")
         assert installed.returncode == 0, installed.stderr
         job = Path(json.loads(installed.stdout)["job"])
-        result = run_captured_job(job)
+        loaded_path = command.state / "loaded-job.json"
+        if missing_loaded_policy == "unloaded":
+            job.unlink()
+            loaded_path.unlink()
+            installed = invoke(command, "supervision-install")
+            assert installed.returncode == 0, installed.stderr
+        elif missing_loaded_policy is not None:
+            loaded = json.loads(loaded_path.read_text())
+            if missing_loaded_policy == "legacy":
+                del loaded["definition"]["AbandonProcessGroup"]
+            loaded_path.write_text(json.dumps(loaded))
+            job.unlink()
+            before_loaded = loaded_path.read_bytes()
+            ledger = command.state / "supervision.json"
+            before_ledger = ledger.read_bytes()
+            refused = invoke(command, "supervision-install")
+            assert refused.returncode == 1, (
+                "Must not silently retain a loaded job's old policy"
+            )
+            assert "supervision-remove" in refused.stderr
+            assert not job.exists()
+            assert loaded_path.read_bytes() == before_loaded
+            assert ledger.read_bytes() == before_ledger
+            assert json.loads(engine.read_text())["app"] == state["app"]
+            assert command.run("supervision-tick").returncode == 1
+            removed = invoke(command, "supervision-remove")
+            assert removed.returncode == 0, removed.stderr
+            assert not loaded_path.exists()
+            installed = invoke(command, "supervision-install")
+            assert installed.returncode == 0, installed.stderr
+            assert ledger.read_bytes() == before_ledger
+        definition = json.loads(loaded_path.read_text())["definition"]
+        result = run_captured_job(job, definition=definition)
         assert result["state"] == "recovered"
         assert ready.exists()
         # Parent exit and the cleanup policy have already happened. In-job health
@@ -153,7 +189,7 @@ def test_recovery_remains_available_after_captured_job_exits(request, tmp_path):
         assert available(port), "Recovered service died after the job exited"
         before = json.loads(engine.read_text())
         for _ in range(2):
-            assert run_captured_job(job)["state"] == "healthy"
+            assert run_captured_job(job, definition=definition)["state"] == "healthy"
             assert available(port)
         after = json.loads(engine.read_text())
         assert after["app"] == before["app"]
@@ -230,6 +266,10 @@ def test_pre_fix_supervision_can_only_be_removed_then_deliberately_recaptured(
     del definition["AbandonProcessGroup"]
     legacy = plistlib.dumps(definition, sort_keys=True)
     job.write_bytes(legacy)
+    loaded_path = command.state / "loaded-job.json"
+    loaded = json.loads(loaded_path.read_text())
+    loaded["definition"] = definition
+    loaded_path.write_text(json.dumps(loaded))
     ledger = command.state / "supervision.json"
     old_record = ledger.read_bytes()
     owner = (command.state / "owner.json").read_bytes()
@@ -276,6 +316,10 @@ def test_pre_fix_backup_removal_and_recapture_preserve_policy_settings_and_histo
     del definition["AbandonProcessGroup"]
     legacy = plistlib.dumps(definition, sort_keys=True)
     job.write_bytes(legacy)
+    loaded_path = command.state / "loaded-backup-job.json"
+    loaded = json.loads(loaded_path.read_text())
+    loaded["definition"] = definition
+    loaded_path.write_text(json.dumps(loaded))
     ledger = command.state / "backup-schedule.json"
     config = json.loads(ledger.read_text())
     config["job_sha256"] = hashlib.sha256(legacy).hexdigest()

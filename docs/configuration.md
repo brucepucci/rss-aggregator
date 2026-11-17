@@ -105,6 +105,9 @@ are not rewritten automatically. Use the [safe job upgrade procedure](operations
 remove with matching old code before update, or use the fixed ownership-validated
 removal path, then deliberately recapture only wanted jobs. Supervision recognizes
 the exact pre-fix definition only for removal, never recovery/installation.
+If its plist is missing while the job is loaded, install refuses without recreating
+it: writing a new file cannot update launchd's retained policy. Remove the owned
+registration, then reinstall; missing-file recreation is allowed only when unloaded.
 
 ## Daily backup configuration
 

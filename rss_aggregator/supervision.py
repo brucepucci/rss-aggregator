@@ -582,6 +582,10 @@ class Supervision:
             )
         if record:
             self._check_job(record, missing=True)
+        if loaded and not job.exists():
+            raise ValueError(
+                "Loaded supervision job definition is missing; use supervision-remove then supervision-install. Recreating the file cannot update launchd's loaded policy. Registration retained."
+            )
         self.runtime._save(REGISTRATION, captured)
         if not job.exists():
             job.parent.mkdir(parents=True, exist_ok=True)

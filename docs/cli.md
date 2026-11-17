@@ -182,7 +182,11 @@ are never silently rewritten: follow [safe job upgrade](operations.md#upgrade-in
 The exact legacy owned supervision definition is removal-only; install/tick refuse
 it. `backup-disable` accepts an unchanged pre-fix definition matching its ledger's
 digest/loaded identity; re-enable captures the new policy identity and needs new
-daily evidence. Failures preserve registration, not permission to hand-edit it.
+daily evidence. `supervision-install` also refuses a missing plist while that
+owned job remains loaded, preserving the ledger and loaded job without recreating
+the file; use `supervision-remove` then reinstall. It may recreate a missing file
+only when the job is confirmed unloaded. Failures preserve registration, not
+permission to hand-edit it.
 
 ### Daily backup status results
 

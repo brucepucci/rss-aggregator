@@ -43,13 +43,13 @@ if args[0] == 'print':
  if '/' not in args[1].removeprefix('gui/'): pass
  elif path.exists():
   loaded = json.loads(path.read_text()); job = Path(loaded['path'])
-  definition = plistlib.loads(job.read_bytes())
+  definition = loaded['definition']
   print('path = ' + str(job))
   print('program = ' + loaded.get('program', definition['ProgramArguments'][0]))
   print('arguments = {\\n' + '\\n'.join(loaded.get('arguments', definition['ProgramArguments'])) + '\\n}')
   print('environment = {\\n' + '\\n'.join(key + ' => ' + value for key,value in loaded.get('environment', definition['EnvironmentVariables']).items()) + '\\n}')
  else: raise SystemExit(113)
-elif args[0] == 'bootstrap': path.write_text(json.dumps({'path': args[2]}))
+elif args[0] == 'bootstrap': path.write_text(json.dumps({'path': args[2], 'definition': plistlib.loads(Path(args[2]).read_bytes())}))
 elif args[0] == 'bootout': path.unlink(missing_ok=True)
 else: raise SystemExit('unexpected launchctl call')
 """,

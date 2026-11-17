@@ -193,7 +193,11 @@ fallback until owner-assisted post-exit/reboot acceptance succeeds.
    `supervision-remove` also recognizes **only the exact owned pre-fix definition**
    for removal, not installation/recovery. `backup-disable` validates the old
    definition against its recorded digest and loaded identity. Neither overwrites
-   changed/unowned files. Missing/unsafe/conflicting definitions or failed native
+   changed/unowned files. A still-loaded supervisor with a missing plist refuses
+   installation without recreating the file: its in-memory lifetime policy may
+   still be old. Use ownership-validated `supervision-remove`, then explicitly
+   reinstall. A missing definition can be recreated by install only when the job
+   is confirmed unloaded. Unsafe/conflicting definitions or failed native
    inspection/removal require owner resolution; never hand-edit plists/ledgers,
    clear holds/locks, or adopt a job to force progress.
 5. Deliberately reinstall **only the jobs still wanted**, with the recorded settings

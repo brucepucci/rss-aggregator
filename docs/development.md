@@ -362,7 +362,12 @@ and release the command lease. A captured backup is SIGKILLed while a native exp
 survives; competing recovery/start/reconciliation must remain locked until it exits.
 Other cases cover originally stopped VM/application restoration and exact legacy
 registration removal, partial removal failure and deliberate settings-preserving
-recapture with new daily policy evidence. No real jobs, credentials or VM are used.
+recapture with new daily policy evidence. Launchctl fixtures retain the definition
+snapshot captured at bootstrap, independently of later disk changes. Missing-plist
+cases verify that still-loaded legacy/fixed jobs refuse install without changing
+ledger, loaded state or application; owned removal and reinstallation must restore
+post-exit availability using the newly loaded snapshot. Confirmed-unloaded missing
+jobs remain repairable. No real jobs, credentials or VM are used.
 
 The separately selected native control requires only macOS, `launchctl`, and the
 normal user's GUI session, **not** Podman/FreshRSS or a production ownership directory:

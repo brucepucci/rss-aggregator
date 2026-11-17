@@ -81,7 +81,11 @@ only the byte-exact prior definition (the current definition without abandonment
 under the same registration/loaded identity guards; install and recovery require
 the new definition. Backup removal uses the stored job digest, including for old
 registrations. Deliberate recapture changes backup policy identity without erasing
-evidence/history. See [safe upgrade](operations.md#upgrade-installed-mac-jobs-safely).
+evidence/history. Installation refuses missing-plist recreation while the job is
+still loaded: launchd retains its in-memory definition, so a newly written file
+would not establish the intended policy. Owned removal/reinstallation is required;
+confirmed-unloaded missing definitions remain repairable. See
+[safe upgrade](operations.md#upgrade-installed-mac-jobs-safely).
 
 Status distinguishes registration, session, intent, unknown/unhealthy availability,
 maintenance and exhausted/failed recovery. It does not claim remote trusted HTTPS
