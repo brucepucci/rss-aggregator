@@ -162,6 +162,54 @@ erase running/stopped intent, delete data/backups, or stop Tailscale. Use `rss s
 for an intentional backed-up shutdown. Removal is repeatable; changed/unowned jobs
 remain intact for manual resolution.
 
+### Upgrade installed Mac jobs safely
+
+Both owned jobs use `AbandonProcessGroup=true`: launchd must not kill VM helpers
+or consistency-critical native work merely because a short invocation exits.
+This does not keep FreshRSS running against stopped intent, remove explicit VM
+shutdown, or change descriptor/command-lock rules. Old installed definitions are
+**not updated by checkout or dependency sync**. Keep manual operation as the
+fallback until owner-assisted post-exit/reboot acceptance succeeds.
+
+1. Coordinate with the owner in the normal GUI session. Use the **stable controlling
+   checkout and original ownership directory**, with the existing port, image,
+   forwarding mode and backup destination exported. Record privately whether each
+   job was enabled, its captured paths/dependencies/settings, and the backup's
+   intended UTC hour/minute. Disabled jobs must remain disabled.
+2. Obtain a fresh `uv run --locked rss backup`; confirm `verified: true`, checksum,
+   safe service resumption and no maintenance hold. Preserve the archive privately.
+   Inspect `rss supervision-status` and `rss backup-status`; successful queries
+   alone do not mean healthy service/protection. If busy or uncertain, stop this
+   procedure and use the [backup failure response](backup-restore.md#daily-check-and-failure-response).
+3. **Prefer removal with the matching old code before updating.** For each job
+   previously enabled, run its removal command (`rss supervision-remove` or
+   `rss backup-disable`) with those same selectors. Confirm removal succeeded;
+   do not update/reinstall on partial failure. Removal preserves the running app,
+   intent, ownership, evidence, archives and unrelated jobs.
+4. Update/synchronize the same checkout using the separately approved revision
+   (`uv sync --locked`); do not introduce another production worktree or change
+   the selected volume, image, host login/security/power settings or dependencies
+   merely to obtain recovery. If code was already updated, the fixed
+   `supervision-remove` also recognizes **only the exact owned pre-fix definition**
+   for removal, not installation/recovery. `backup-disable` validates the old
+   definition against its recorded digest and loaded identity. Neither overwrites
+   changed/unowned files. Missing/unsafe/conflicting definitions or failed native
+   inspection/removal require owner resolution; never hand-edit plists/ledgers,
+   clear holds/locks, or adopt a job to force progress.
+5. Deliberately reinstall **only the jobs still wanted**, with the recorded settings
+   and existing dependencies. Use `rss supervision-install` and/or
+   `rss backup-enable --hour H --minute M`, substituting the recorded UTC values,
+   not silently accepting defaults. Inspect status and capture before relying on
+   them. Activation failure retains registration: inspect/retry or remove, not
+   automatic overwrite. Fixed registration repetition is safe.
+6. The backup definition changes policy identity. Old archives and attempt/success
+   history remain, but new policy-specific daily evidence is required; recapture,
+   manual backup or a manual `backup-due` is not unattended protection. Follow
+   [daily backup checks](backup-restore.md#daily-check-and-failure-response).
+   Coordinate the [native acceptance below](#owner-assisted-mac-acceptance-not-automated-evidence)
+   before relying on automatic recovery. No extra reboot or production activation
+   is authorized merely by a deterministic test pass.
+
 ### Daily check and failure response
 
 Run `rss supervision-status`; use `rss status` for the existing detailed runtime
@@ -216,8 +264,10 @@ helpers cannot retain the lease indefinitely. The Python parent holds the lock
 through the launcher; durable maintenance remains mandatory. Never unlink a busy
 lock or kill real helpers to make a check pass: inspect locally with the owner.
 Backup quiescing does not change intent, and a backup never resumes an intentionally
-stopped application. Independent external writers are
-not serialized by this lock.
+stopped application. Separately, both installed jobs abandon their completed
+process groups so launchd does not destroy legitimate surviving native work.
+Abandonment grants no ownership/startup authority and does not donate the lock to
+VM helpers. Independent external writers are not serialized by this lock.
 
 ### Owner-assisted Mac acceptance (not automated evidence)
 
@@ -231,9 +281,15 @@ reboot, login/unlock, outage, power-recovery or trusted-client behavior. Before
 2. Owner acceptance of the existing FileVault/unlock/login, sleep and power-recovery
    limitations. Verify the mini's actual settings/behavior without changing them;
    do not silently enable automatic login or simulate physical power loss.
-3. A real coordinated reboot, its time and normal-session availability time, then
-   successful startup/status and trusted HTTPS/actual reader checks. Locked disks,
-   login prerequisites and any unperformed power/outage scenarios stay explicit.
+3. A real coordinated reboot and normal login, recording changed host boot time,
+   login/unlock prerequisites and automatic job execution. Do **not** manually start
+   FreshRSS or invoke a recovery tick. Independently confirm the recovery invocation
+   has exited, then check service availability and subsequent healthy automatic
+   checks **without a container restart**. An in-job `recovered` result or zero
+   parent exit is insufficient: launchd cleanup happens afterward. Confirm the same
+   owned selected volume/image pin and intended private/authenticated access, then
+   have the owner verify trusted browser/ReadKit availability and preserved reading
+   state. Unperformed power/outage scenarios stay explicit.
 4. A coordinated disposable application-failure recovery check and a healthy-check
    noninterruption check, preserving subscriptions/articles/read/star state and
    unrelated VM/forwarding resources.

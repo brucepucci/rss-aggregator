@@ -166,13 +166,15 @@ for their recorded revisions, not a current run or branch protection.
 
 ## Explicit live/platform checks
 
-Only after starting the owned instance and satisfying the operational prerequisites:
+For the FreshRSS integration tests, only after starting the owned instance and
+satisfying the operational prerequisites (the [native launchd control](#post-exit-process-lifetime-regression-and-native-control)
+is separately selectable without FreshRSS):
 
 ```sh
 uv run --locked pytest -m live
 ```
 
-**These tests interrupt the project session.** They require macOS, Podman, the
+**The FreshRSS tests below interrupt the project session.** They require macOS, Podman, the
 running owned project VM, the cached pinned image, internet access to the public
 GitHub feed and the correct existing ownership directory. Missing/wrong
 platform/services fail explicitly when selected, not skip as if fully covered.
@@ -348,6 +350,37 @@ passes. Use the combined verification guidance below whenever changing either
 supervision or backup orchestration. Keep revision-specific command results and
 unrun checks in the issue handoff, not as an implied platform pass here.
 
+### Post-exit process-lifetime regression and native control
+
+`tests/test_launchd_lifetime.py` executes the actual captured job command/environment
+in an exclusively disposable process group, waits for its parent to exit, then
+models launchd's documented default cleanup unless the definition abandons the
+group. A finite HTTP helper checks application availability independently **after**
+cleanup: the pre-fix policy can return `recovered` successfully while this assertion
+fails. Subsequent healthy invocations must preserve availability/container identity
+and release the command lease. A captured backup is SIGKILLed while a native export
+survives; competing recovery/start/reconciliation must remain locked until it exits.
+Other cases cover originally stopped VM/application restoration and exact legacy
+registration removal, partial removal failure and deliberate settings-preserving
+recapture with new daily policy evidence. No real jobs, credentials or VM are used.
+
+The separately selected native control requires only macOS, `launchctl`, and the
+normal user's GUI session, **not** Podman/FreshRSS or a production ownership directory:
+
+```sh
+uv run --locked pytest tests/integration/test_launchd_process_group.py -m live -q
+```
+
+It installs uniquely labelled **nonrecurring** diagnostic jobs with finite harmless
+loopback HTTP helpers. The default/control pair checks availability only after
+native launchd reports the parent exited successfully. It unloads only the exact
+diagnostic labels and lets finite helpers exit; never target a real VM/helper or
+unrelated job. Missing platform/session prerequisites fail when selected. This is
+an opt-in native policy check, not reboot acceptance or production activation.
+The default model and even this native control do not prove actual Podman behavior.
+Owner-coordinated backup/upgrade/reboot/login and trusted-client checks remain
+[separate acceptance](operations.md#owner-assisted-mac-acceptance-not-automated-evidence).
+
 ## Combined supervision and backup verification
 
 Use the existing CLI/`Runtime.run` boundary for deterministic integration regressions,
@@ -361,7 +394,7 @@ Cross-feature regressions live in `tests/test_supervised_backups.py`, alongside
 both feature suites. A focused iteration command is:
 
 ```sh
-uv run --locked pytest tests/test_supervised_backups.py \
+uv run --locked pytest tests/test_launchd_lifetime.py tests/test_supervised_backups.py \
   tests/test_vm_start_lock.py tests/test_runtime_cold_start.py \
   tests/test_fixture_namespaces.py tests/test_supervision.py \
   tests/test_supervision_forwarding.py tests/test_backup_schedule.py \

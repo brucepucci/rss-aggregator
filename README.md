@@ -12,6 +12,8 @@ The deployment is an **Apple Silicon Mac instance**, with manual operation by
 default and optional [normal-user-session startup/recovery](docs/operations.md#opt-in-mac-startup-and-recovery)
 and [daily backups](docs/backup-restore.md#opt-in-daily-mac-backups). Neither job is
 installed by default; backup scheduling does not enable application supervision.
+Already installed jobs require [safe removal/update/recapture](docs/operations.md#upgrade-installed-mac-jobs-safely)
+to apply the native process-lifetime repair; checkout alone does not update them.
 ReadKit on macOS and iOS has been verified with shared read/unread and starred state.
 Real reboot/login recovery, unattended daily backups and owner acceptance remain
 unverified; no pre-unlock availability is promised. Always-on Linux deployment,
@@ -25,6 +27,7 @@ until explicit start.
 - [Getting started](#getting-started)
 - [Routine CLI commands](#routine-cli-commands)
 - [Daily backup setup and checks](docs/backup-restore.md#opt-in-daily-mac-backups)
+- [Safe upgrades for installed Mac jobs](docs/operations.md#upgrade-installed-mac-jobs-safely)
 - [Essential configuration](#essential-configuration)
 - [Common troubleshooting](#common-troubleshooting)
 - [FAQ](#faq)
