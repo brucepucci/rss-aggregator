@@ -460,20 +460,28 @@ class Supervision:
                 "RunAtLoad": True,
                 "StartInterval": 60,
                 "ProcessType": "Background",
+                # VM helpers outlive this bounded invocation. Descriptor inheritance
+                # remains independently restricted at the VM launcher boundary.
+                "AbandonProcessGroup": True,
                 "StandardOutPath": "/dev/null",
                 "StandardErrorPath": "/dev/null",
             },
             sort_keys=True,
         )
 
-    def _check_job(self, record: dict[str, Any], *, missing: bool = False) -> None:
-        """Preserve changed, foreign or symlinked job definitions byte-for-byte."""
+    def _check_job(
+        self, record: dict[str, Any], *, missing: bool = False, removal: bool = False
+    ) -> None:
+        """Accept the exact pre-lifetime-policy definition only for owned removal."""
         job = Path(record["job"])
-        if job.is_symlink() or (
-            job.exists() and job.read_bytes() != self._definition(record)
-        ):
+        definitions = [self._definition(record)]
+        if removal:
+            legacy = plistlib.loads(definitions[0])
+            del legacy["AbandonProcessGroup"]
+            definitions.append(plistlib.dumps(legacy, sort_keys=True))
+        if job.is_symlink() or (job.exists() and job.read_bytes() not in definitions):
             raise ValueError(
-                "Refusing changed/unowned supervision job; resolve locally without overwriting it."
+                "Refusing changed/unowned supervision job. An unchanged pre-fix owned job may be removed with supervision-remove, then explicitly reinstalled; never overwrite or hand-edit it."
             )
         if not missing and not job.exists():
             raise ValueError(
@@ -574,6 +582,10 @@ class Supervision:
             )
         if record:
             self._check_job(record, missing=True)
+        if loaded and not job.exists():
+            raise ValueError(
+                "Loaded supervision job definition is missing; use supervision-remove then supervision-install. Recreating the file cannot update launchd's loaded policy. Registration retained."
+            )
         self.runtime._save(REGISTRATION, captured)
         if not job.exists():
             job.parent.mkdir(parents=True, exist_ok=True)
@@ -599,7 +611,7 @@ class Supervision:
                     "Refusing unowned supervision job; no resources were removed."
                 )
             return self.status()
-        self._check_job(record, missing=True)
+        self._check_job(record, missing=True, removal=True)
         executable = record["dependencies"]["launchctl"]
         if self._loaded(executable, Path(record["job"]), record):
             result = self.runtime._run(

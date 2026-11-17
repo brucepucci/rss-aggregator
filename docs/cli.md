@@ -102,7 +102,7 @@ procedure](operations.md#opt-in-mac-startup-and-recovery) before real activation
 | Command | Purpose/defaults and failure behavior | JSON result |
 | --- | --- | --- |
 | `rss supervision-install` | Explicitly capture the selected stable checkout, its `.venv/bin/python`, existing ownership and non-secret configuration; write/activate the owned user LaunchAgent. Requires macOS, non-root user, normal GUI session, owned Podman VM and available captured dependencies. Tailscale is required/captured for private mode or retained forwarding state, even inactive state in loopback mode. Does not create running intent. Repeated identical installation is safe; changed configuration requires explicit removal/reinstallation. Foreign/changed/symlinked jobs and loaded-label conflicts are preserved/refused. Partial activation retains registration for retry/removal. | Same supervision-status shape below; `enabled: true` means a registration ledger exists, not that the app is healthy or session available. |
-| `rss supervision-remove` | Unload/remove only the unchanged owned job; repeatable if absent. Preserve app, VM, data, backups and intent. Failures preserve registration for inspection/retry; changed/unowned jobs are never overwritten/deleted. | Supervision-status shape with `enabled: false`, `state: "disabled"`. |
+| `rss supervision-remove` | Unload/remove only the unchanged owned job (including the exact pre-fix definition without process-group abandonment); repeatable if absent. Preserve app, VM, data, backups and intent. Failures preserve registration for inspection/retry; changed/unowned jobs are never overwritten/deleted. | Supervision-status shape with `enabled: false`, `state: "disabled"`. |
 | `rss supervision-status` | Read registration, captured dependency availability, normal user session, intent and observed service readiness without starting/restarting it. An unavailable/unhealthy state is a successful **query**, not recovery success. Malformed/foreign ownership/state and lock failures still exit 1. | `enabled`, `intent` (`"unset"`, `"running"`, `"stopped"`), `maintenance`, `session` (`"not_checked"`, `"available"`, `"unavailable"`), `observed`, `state`, `action`, `recovery`; registered results add absolute `job`, `root`, `state_dir`. |
 | `rss supervision-tick` | One serialized reconciliation. Disabled/stopped/unset intent is a no-op. Healthy observations do not restart service. Otherwise at most three consecutive normal guarded starts, with minimum 60s and 300s backoff. Maintenance, unavailable/inactive registration, backoff, failed/exhausted recovery and lock contention exit 1 with no result JSON; inspect status for response. No shell/.env assumptions or insecure TLS fallback. | Status shape; successful recovery has `state: "recovered"` and updated `observed`/`recovery`. |
 
@@ -172,6 +172,21 @@ passwords, tokens, feed URLs or article content. See the
   guarantee; see [architecture](architecture.md).
 - Backup/restore `manifest`: the [versioned archive metadata](backup-restore.md#format-version-1).
   `sha256` is the whole ZIP checksum, not just the payload checksum.
+
+Both Mac job definitions set `AbandonProcessGroup=true`, without a new flag or
+command, so required native descendants survive launchd parent-exit cleanup.
+Explicit stop, ownership and inherited native-work leases remain enforced. A
+`supervision-tick` returning `recovered` establishes only its in-invocation check,
+not sustained post-exit availability or reboot acceptance. Existing definitions
+are never silently rewritten: follow [safe job upgrade](operations.md#upgrade-installed-mac-jobs-safely).
+The exact legacy owned supervision definition is removal-only; install/tick refuse
+it. `backup-disable` accepts an unchanged pre-fix definition matching its ledger's
+digest/loaded identity; re-enable captures the new policy identity and needs new
+daily evidence. `supervision-install` also refuses a missing plist while that
+owned job remains loaded, preserving the ledger and loaded job without recreating
+the file; use `supervision-remove` then reinstall. It may recreate a missing file
+only when the job is confirmed unloaded. Failures preserve registration, not
+permission to hand-edit it.
 
 ### Daily backup status results
 
@@ -299,7 +314,7 @@ explicit paths/node IDs narrow a direct run, **not** the required full baseline.
 | Argument/option | Purpose and default | Example |
 | --- | --- | --- |
 | `[file_or_dir ...]` | Optional paths/node IDs; omit for the complete configured suite. | `uv run --locked pytest tests/test_commands.py` |
-| `-m EXPRESSION` | Marker expression; project default `not live`. Explicit `live` requires real-service prerequisites. | `uv run --locked pytest -m live` |
+| `-m EXPRESSION` | Marker expression; project default `not live`. Explicit `live` requires the selected test's documented platform/service prerequisites. | `uv run --locked pytest -m live` |
 | `-s` | Disable normally enabled output capture. | `uv run --locked pytest -m live -s` |
 | `-p no:cacheprovider` | Disable pytest's cache plugin; the baseline does this automatically. | `uv run --locked pytest -p no:cacheprovider` |
 | `-q`, `--quiet` | Reduce report verbosity; absent by default. | `uv run --locked pytest -q` |

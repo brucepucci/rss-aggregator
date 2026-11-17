@@ -66,6 +66,27 @@ lease. Exports/imports and all other short-lived native work retain inheritance;
 durable maintenance still blocks writer recovery after interruption. Independent
 Podman/Tailscale clients remain outside this lock.
 
+Both bounded LaunchAgents set `AbandonProcessGroup=true`. By default launchd kills
+remaining members of a completed job's process group, including VM helpers after a
+successful in-job recovery check. Abandonment preserves the intended native lifetime,
+not ownership or startup authority; explicit shutdown and guarded stopped-VM backup
+restoration remain unchanged. It also lets consistency-critical native work retain
+its inherited lease after orchestration death. Process-group cleanup and descriptor
+inheritance are separate policies: neither replaces the other or durable maintenance.
+Post-exit independent availability is the regression boundary, not the parent's exit
+code. No general subprocess/session policy or foreign-process management is added.
+
+Job identity checks are not weakened for upgrade. Supervision removal recognizes
+only the byte-exact prior definition (the current definition without abandonment),
+under the same registration/loaded identity guards; install and recovery require
+the new definition. Backup removal uses the stored job digest, including for old
+registrations. Deliberate recapture changes backup policy identity without erasing
+evidence/history. Installation refuses missing-plist recreation while the job is
+still loaded: launchd retains its in-memory definition, so a newly written file
+would not establish the intended policy. Owned removal/reinstallation is required;
+confirmed-unloaded missing definitions remain repairable. See
+[safe upgrade](operations.md#upgrade-installed-mac-jobs-safely).
+
 Status distinguishes registration, session, intent, unknown/unhealthy availability,
 maintenance and exhausted/failed recovery. It does not claim remote trusted HTTPS
 from loopback readiness or establish reboot/power evidence. [Operations](operations.md#opt-in-mac-startup-and-recovery)

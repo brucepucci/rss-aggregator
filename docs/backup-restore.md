@@ -77,6 +77,13 @@ captured environment before reserving a daily attempt or touching runtime resour
 Missing, conflicting, unowned or changed registration is refused, never adopted.
 Unexpected launchd inspection errors fail closed during enable, disable and work:
 registration is retained for inspection/retry, not treated as confirmed absence.
+Both Mac jobs set `AbandonProcessGroup=true` so launchd's parent-exit cleanup does
+not interrupt native export/import leases or destroy safe VM resumption. Explicit
+shutdown still stops the VM, including restoring an originally stopped VM after
+backup; stopped application intent remains authoritative. For already-installed
+jobs, use the [safe removal/update/recapture procedure](operations.md#upgrade-installed-mac-jobs-safely),
+retaining independent opt-in, destination and intended UTC policy. Recapture changes
+backup policy identity and requires fresh daily evidence, not deletion of history.
 
 Policy is **03:00 UTC daily** by default, adjustable with `--hour`/`--minute`, not
 local daylight-saving time. launchd wakes every **15 minutes** and at load. Actual
@@ -139,6 +146,9 @@ Disable uses the same nonblocking lock: it does not interrupt an active backup,
 and refuses changed/unowned definitions. Manual and normal-stop backups remain.
 Record a real unattended mini run after owner-approved activation, with sanitized
 scheduled/attempt/completion times, archive verification/checksum and status.
+Independently observe safe application/VM/forwarding state **after the invocation
+exits**, not only its in-job resumption result. Assess interrupted native-work
+lifetime through disposable tests, not production fault injection.
 Registration, fake clocks or a manually invoked job are not that evidence.
 
 ### Interrupted maintenance and reconciliation

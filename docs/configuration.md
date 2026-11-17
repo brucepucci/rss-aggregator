@@ -97,6 +97,17 @@ directory and non-secret environment. Job stdout/stderr go to `/dev/null`; use
 sanitized `supervision-status` and persisted recovery outcomes, not raw sensitive
 application logs. Changed/foreign/symlinked job definitions are preserved/refused.
 Removal preserves app, ownership, intent, backup copies and all unrelated jobs.
+Both job definitions set fixed `AbandonProcessGroup=true` (no CLI/environment
+override). This prevents launchd from killing legitimate descendants when the
+bounded parent exits; it is separate from command-lock descriptor inheritance and
+does not authorize startup or adoption. Definitions installed before this policy
+are not rewritten automatically. Use the [safe job upgrade procedure](operations.md#upgrade-installed-mac-jobs-safely):
+remove with matching old code before update, or use the fixed ownership-validated
+removal path, then deliberately recapture only wanted jobs. Supervision recognizes
+the exact pre-fix definition only for removal, never recovery/installation.
+If its plist is missing while the job is loaded, install refuses without recreating
+it: writing a new file cannot update launchd's retained policy. Remove the owned
+registration, then reinstall; missing-file recreation is allowed only when unloaded.
 
 ## Daily backup configuration
 
@@ -122,6 +133,10 @@ managed records or move archives/ownership implicitly. Follow the
 Linux scheduling, pre-login availability, wake/power changes and external alerts
 are unsupported. Installed configuration is not successful unattended protection.
 The backup job and supervision job are separately opt-in; neither installs the other.
+The same fixed process-group abandonment policy applies to backups. Its changed
+job digest changes `policy_id`; existing evidence and archives are retained but
+new policy-specific daily evidence is required. Re-enable with the previously
+selected destination and UTC hour/minute, not unintentionally reset defaults.
 
 ## Checked-in application configuration
 

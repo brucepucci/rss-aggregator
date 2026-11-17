@@ -329,6 +329,9 @@ class BackupSchedule:
             "StartInterval": RETRY_SECONDS,
             "RunAtLoad": True,
             "ProcessType": "Background",
+            # Safe resumption and surviving exports retain their intended native
+            # lifetimes even if this short-lived orchestration process exits.
+            "AbandonProcessGroup": True,
             "Umask": 0o077,
         }
         encoded = plistlib.dumps(definition, sort_keys=True)

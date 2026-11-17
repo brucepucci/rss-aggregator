@@ -37,14 +37,15 @@ loaded = home / ('loaded-job.json' if label == 'io.rss-aggregator.supervision' e
 if args[0] == 'print':
  if args[1].count('/') == 1: pass
  elif loaded.exists():
-  job = Path(json.loads(loaded.read_text())['path'])
-  definition = plistlib.loads(job.read_bytes())
+  record = json.loads(loaded.read_text())
+  job = Path(record['path'])
+  definition = record['definition']
   print('path = ' + str(job))
   print('program = ' + definition['ProgramArguments'][0])
   print('arguments = {\\n' + '\\n'.join(definition['ProgramArguments']) + '\\n}')
   print('environment = {\\n' + '\\n'.join(k + ' => ' + v for k,v in definition['EnvironmentVariables'].items()) + '\\n}')
  else: raise SystemExit(113)
-elif args[0] == 'bootstrap': loaded.write_text(json.dumps({'path': args[2]}))
+elif args[0] == 'bootstrap': loaded.write_text(json.dumps({'path': args[2], 'definition': plistlib.loads(Path(args[2]).read_bytes())}))
 elif args[0] == 'bootout': loaded.unlink()
 else: raise SystemExit(99)
 """,
