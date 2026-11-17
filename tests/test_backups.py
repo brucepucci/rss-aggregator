@@ -160,6 +160,16 @@ def test_recovery_runner_preserves_real_backup_locator(project, has_locator):
     state["containers"][app] = container
     state["volumes"][source] = state["volumes"].pop(VOLUME)
     project.update(**state)
+    evidence = {
+        name: project.state_dir / name
+        for name in (
+            "backup-attempt.json",
+            "backup-success.json",
+            "operator-intent.json",
+        )
+    }
+    for path in evidence.values():
+        path.write_bytes(b'{"preserve":"real owner evidence"}\n')
     locator = project.state_dir / "last-backup.json"
     original = b'{"archive":"/private/durable/user-backup.zip","sha256":"original"}\n'
     if has_locator:
@@ -178,6 +188,8 @@ def test_recovery_runner_preserves_real_backup_locator(project, has_locator):
         assert locator.read_bytes() == original
     else:
         assert not locator.exists()
+    for path in evidence.values():
+        assert path.read_bytes() == b'{"preserve":"real owner evidence"}\n'
     fixture_locator = project.state_dir / ("test-" + token + "-last-backup.json")
     assert (
         json.loads(fixture_locator.read_text())["archive"]

@@ -6,16 +6,20 @@ import sys
 
 import click
 
-from rss_aggregator import private_access, recovery, runtime
+from rss_aggregator import runtime
 
-from .replacement_support import owned_runtime, replacement_names
+from .replacement_support import (
+    owned_runtime,
+    redirect_fixture_names,
+    replacement_names,
+)
 from .support import expect
 
 
 def run():
     request = json.load(sys.stdin)
     token = request["token"]
-    app, source, check = replacement_names(token)
+    _app, source, _check = replacement_names(token)
     target = source + "-recovered"
     controller, _owner = owned_runtime()
     expect(
@@ -23,16 +27,13 @@ def run():
         "Use the real existing owner directory",
     )
     expect(
-        request["operation"] in {"backup", "restore", "select-volume", "start"},
+        request["operation"]
+        in {"backup", "backup-status", "restore", "select-volume", "start"},
         "Unsupported recovery test operation",
     )
-    runtime.APP, runtime.VOLUME, runtime.CHECK = app, source, check
-    # Keep ownership/lock/security enforcement real, but never change the user's
-    # selected volume, recovery records or backup locator. No method is replaced.
-    runtime.SELECTION = "test-" + token + "-selection.json"
-    recovery.RECOVERY_RECORD = "test-" + token + "-recovery.json"
-    recovery.BACKUP_RECORD = "test-" + token + "-last-backup.json"
-    private_access.SERVE_RECORD = "test-" + token + "-serve.json"
+    # Ownership, locking, security and the global maintenance hold stay real.
+    # All fixture evidence/intent aliases match the replacement/supervision runners.
+    redirect_fixture_names(token)
     os.environ["RSS_TAILSCALE"] = "0"
     operation = request["operation"]
     args = [operation]

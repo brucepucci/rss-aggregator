@@ -106,6 +106,11 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
         state["volumes"][name] = {"Labels": {label[0]: label[1]}}
         save()
     elif args[:2] == ["volume", "export"]:
+        if os.environ.get("BACKUP_TEST_GATE"):
+            gate = Path(os.environ["BACKUP_TEST_GATE"])
+            gate.with_suffix(".ready").write_text(str(os.getpid()))
+            with gate.open("rb") as barrier:
+                barrier.read(1)
         if any(c["State"]["Running"] for c in state["containers"].values()):
             fail("export attempted with writers running")
         output = Path(args[args.index("--output") + 1])

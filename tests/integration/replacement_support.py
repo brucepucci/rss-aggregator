@@ -6,7 +6,13 @@ import re
 import subprocess
 import sys
 
-from rss_aggregator import runtime
+from rss_aggregator import (
+    backup_schedule,
+    private_access,
+    recovery,
+    runtime,
+    supervision,
+)
 
 from .support import LABEL, ROOT, InstanceFixture, expect
 
@@ -23,6 +29,42 @@ def replacement_names(token):
         "Refusing production replacement resource names",
     )
     return names
+
+
+FIXTURE_RECORD_SUFFIXES = (
+    "selection.json",
+    "recovery.json",
+    "last-backup.json",
+    "serve.json",
+    "operator-intent.json",
+    "supervision.json",
+    "supervision-recovery.json",
+    "backup-attempt.json",
+    "backup-success.json",
+    "backup-daily.json",
+    "backup-schedule.json",
+    "backup-defer.json",
+)
+
+
+def redirect_fixture_names(token):
+    """Share one fixture namespace without redirecting ownership or maintenance."""
+    runtime.APP, runtime.VOLUME, runtime.CHECK = replacement_names(token)
+    prefix = "test-" + token + "-"
+    runtime.SELECTION = prefix + "selection.json"
+    recovery.RECOVERY_RECORD = prefix + "recovery.json"
+    recovery.BACKUP_RECORD = prefix + "last-backup.json"
+    private_access.SERVE_RECORD = prefix + "serve.json"
+    for name in ("ATTEMPT", "SUCCESS", "DAILY", "SCHEDULE", "DEFER", "INTENT"):
+        setattr(backup_schedule, name, prefix + getattr(backup_schedule, name))
+    recovery.SUCCESS = backup_schedule.SUCCESS
+    supervision.INTENT = backup_schedule.INTENT
+    supervision.REGISTRATION = prefix + "supervision.json"
+    supervision.RECOVERY_STATE = prefix + "supervision-recovery.json"
+    # Keep BOTH maintenance aliases real, like owner.json and command.lock.
+    # Runtime's existing under-lock guard must see holds from real and fixture
+    # operations alike. Interrupted fixtures require coordinated reconciliation;
+    # cleanup must never unlink maintenance.json to restore service.
 
 
 def owned_runtime():
@@ -207,12 +249,7 @@ class ReplacementInstanceFixture(InstanceFixture):
             self.podman("rm", *(["--volumes"] if name == self.check else []), name)
         checked_volume(controller, owner, self.token, self.volume_record)
         self.podman("volume", "rm", self.volume)
-        for suffix in (
-            "selection.json",
-            "recovery.json",
-            "last-backup.json",
-            "serve.json",
-        ):
+        for suffix in FIXTURE_RECORD_SUFFIXES:
             (controller.state_dir / ("test-" + self.token + "-" + suffix)).unlink(
                 missing_ok=True
             )

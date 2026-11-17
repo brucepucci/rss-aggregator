@@ -49,12 +49,36 @@ Changing the directory is not migration. A new host needs fresh ownership and an
 ## Start, verify and replace
 
 `start` explicitly targets the owned rootless `rss-aggregator` connection. It starts
-the VM if needed, stops/reuses or creates the application container, copies both
-checked-in new-user templates while stopped, checks effective Apache PHP security,
-then verifies HTTP readiness, cron and immediate feed fetching. Repeated starts
+the VM if needed, reuses/restarts or creates the application container (with the
+cold-start exception below), copies both checked-in new-user templates while
+stopped, checks effective Apache PHP security, then verifies HTTP readiness, cron
+and immediate feed fetching. Repeated starts
 briefly interrupt service but do not duplicate the VM, users, subscriptions or
 volume. Existing users' settings/subscriptions are not rewritten by the templates.
 A failed template copy stops startup; retry repeats both copies.
+
+**Cold startup:** only when this start call starts a stopped owned VM, a matching
+stopped application container is removed and recreated on the **same selected
+named data volume**. Ownership, port, pinned image and disposable effective-PHP
+preflight must pass, followed by all existing application image, binding,
+entrypoint, default-command, internal-`LISTEN` and selected-volume checks. A final
+owned inspection must confirm no state/configuration change and that it is still
+stopped. Removal uses neither force nor volume deletion. Foreign, mismatching,
+changed or running containers never qualify; a running app follows the existing
+restart path. Do not use cold startup to migrate a volume or bypass a configuration
+refusal: inspect locally and use explicit `replace` only after reviewing the change.
+Warm starts (VM already running) retain reuse and partial-copy retry behavior.
+
+Recreation discards container-layer diagnostics/customizations and may expire web
+sessions. It preserves subscriptions, articles and read/star state in the named
+data volume; sign in again and verify them. Preserve needed diagnostics before a
+planned cold start and obtain a verified instance backup before significant live
+changes. A fresh container layer avoids carrying disposable runtime files through
+VM shutdown, but the precise failure mechanism is not established. There is no
+automatic replacement fallback after arbitrary security/readiness failures; every
+post-create security, probe-cleanup, readiness, authentication and forwarding gate
+still applies. Real-Podman cold-start acceptance remains an
+[explicit live check](development.md#combined-supervision-and-backup-verification).
 
 The security gate checks the effective web runtime, not just PHP CLI. See
 [the gate design](architecture.md#startup-security-gate). Only enter real
@@ -65,7 +89,12 @@ installer until you choose SQLite and authenticated web login locally.
 stopped application or restarts/rechecks a running one. `replace` removes only
 the owned application container and recreates it with the same selected named
 volume and current configuration. Use it for reviewed container/image/port changes;
-it is not data deletion. Browser sessions can expire after replacement; sign in
+it is not data deletion. For image changes, follow the
+[backup, supervision-removal and recapture procedure](backup-restore.md#image-updates-and-rollback)
+**before** changing the pin; an installed supervisor retains the old configuration
+hash even after a successful replacement. For port changes, first follow the
+[verified-backup, job removal and recapture procedure](configuration.md#changing-the-loopback-port);
+installed jobs retain the old port unless explicitly reconfigured. Browser sessions can expire after replacement; sign in
 again and verify subscriptions, articles and reading state. For a restored volume,
 [matching first activation](backup-restore.md#format-version-1) is required before
 an intentional image update.
@@ -75,6 +104,146 @@ to close the ownership-checked application. If cleanup cannot be confirmed, the
 error warns that exposure may remain. Initial preflight refusals leave existing
 state untouched. General loopback startup failures may leave the application and
 VM running for diagnosis; failure is not proof HTTP is closed. Inspect `status`.
+
+## Opt-in Mac startup and recovery
+
+Manual operation remains the default: `setup`, `start` and code checkout never
+register a host service. After the maintenance guard passes, `start` persists
+**running intent**, even if subsequent startup fails. `stop` persists **stopped
+intent** before checking maintenance or attempting shutdown, even if already
+stopped or shutdown subsequently fails. Only explicit `start` re-enables running intent.
+`verify`, `replace`, temporary backup quiescing and login/reboot do not change it.
+An older instance without an intent record is **unset**, not implicitly running.
+
+### Enable or remove supervision
+
+**Before real installation:** obtain and verify a private instance backup, coordinate
+with the owner, and choose one stable checkout and the existing ownership directory.
+Do not use a temporary worktree that will be deleted. Finish the loopback installer
+and verify the intended private HTTPS/authentication configuration first. Keep all
+existing FileVault, login, power and Tailscale settings unchanged.
+
+From that synchronized checkout, with the instance's existing settings exported:
+
+```sh
+export RSS_STATE_DIR="/absolute/private/existing-ownership-directory"
+# Explicit owner-selected production destination, not a global default:
+export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
+# Keep RSS_PORT and RSS_TAILSCALE consistent with the verified deployment.
+uv run --locked rss backup
+# Confirm verified:true and retain the private archive/checksum before continuing.
+uv run --locked rss supervision-install
+uv run --locked rss supervision-status
+```
+
+Installation is explicit and activates `io.rss-aggregator.supervision` in the normal
+user's `gui/<uid>` launchd domain. It writes only its owned LaunchAgent; no root
+service, login/power change, dependency installation or unrelated job modification.
+Repetition with the same captured configuration is safe. Changed/unowned job files,
+symlinks, loaded-label collisions and ownership ambiguity are refused, not adopted.
+Partial activation retains the registration for inspection and safe retry/removal.
+
+The job uses the selected checkout's `.venv/bin/python`, absolute checkout/state
+paths, captured non-secret runtime settings and explicit dependency search paths;
+it does not invoke uv, source a shell or read `.env`. Keep that checkout, environment
+and ownership directory available. Moving them, changing the image pin or losing a
+captured dependency requires local correction or explicit removal/reinstallation;
+there is no fallback to another installation. Take a verified backup before
+significant changes and remove supervision before intentionally reconfiguring it.
+
+To disable startup/recovery safely:
+
+```sh
+uv run --locked rss supervision-remove
+```
+
+Removal unloads/removes only the unchanged owned job. It **does not stop FreshRSS**,
+erase running/stopped intent, delete data/backups, or stop Tailscale. Use `rss stop`
+for an intentional backed-up shutdown. Removal is repeatable; changed/unowned jobs
+remain intact for manual resolution.
+
+### Daily check and failure response
+
+Run `rss supervision-status`; use `rss status` for the existing detailed runtime
+check. Supervision status separates registration, user session, intent, observed
+availability, maintenance and recent recovery outcomes. A successful status query
+is not a healthy-service assertion: inspect `state`, `observed`, `recovery` and
+`action`. Missing prerequisites are visible, not treated as successful recovery.
+No raw FreshRSS/Podman logs are needed for this first response.
+
+- **disabled / inactive / configuration_unavailable:** verify the selected checkout,
+  `.venv`, captured dependencies and unchanged owned job. Reinstall explicitly only
+  after resolving ownership/configuration; do not replace foreign jobs.
+- **session_unavailable:** log in/unlock the normal Mac user session. The job is not
+  a pre-login/pre-unlock service. Status cannot run on an unreachable/powered-off
+  host; an earlier healthy result is not current remote availability evidence.
+- **intentionally_stopped / intent_unset:** no automatic start is authorized. After
+  any maintenance inspection, `rss start` explicitly resumes running intent.
+- **maintenance:** recovery and public start/fetch/verify/replace refuse to open
+  writers on any marker presence, including malformed data or dangling links.
+  Preserve the marker and inspect the interrupted operation. `backup-reconcile`
+  validates its owner/schema and confirms owned engines are idle
+  before clearing a hold; reconciliation does not itself resume writers or change
+  intent, but retained running intent permits a later supervisor tick to recover.
+  To keep the app stopped, explicitly `rss stop` **before** reconciliation (stopped
+  intent persists even if shutdown is refused). If reconciliation refuses, coordinate
+  with the owner rather than deleting a marker to bypass the boundary.
+- **unhealthy / recovery_failed / retry_exhausted:** inspect dependencies, ownership,
+  readiness/security and private forwarding locally. Never bypass TLS or adopt
+  colliding resources. Correct the cause, then explicit `rss start` resets the
+  retry budget. `observed.reason`/`action` and failed history events distinguish
+  ownership/configuration conflicts, private-access refusal, security/readiness/
+  fetching failures and dependency errors without copying sensitive process output.
+  `stop` remains authoritative even after a failed recovery.
+
+Launchd requests a check at load/login and every **60 seconds** while the session
+and host are available; sleep/missed intervals are not continuous availability or
+an overlapping queue. Healthy checks inspect HTTP, fetching cron and owned
+forwarding without restarting the application. An unhealthy instance gets at most
+**three consecutive guarded recovery attempts**, with at least **60 seconds** then
+**300 seconds** before attempts two and three. Exhaustion requires operator action;
+healthy observation or explicit start resets the budget, retaining the last ten
+sanitized outcomes. An attempt is reserved before mutation, so process death does
+not reset retries. Ordinary startup ownership/image/PHP/authentication/readiness/
+fetching/forwarding gates remain mandatory.
+
+The nonblocking project lock spans each entire check/recovery/backup/lifecycle
+operation; contention fails visibly and is retried on a later tick, not queued.
+Short-lived native children inherit the lock so orphaned exports/imports keep
+serialization after a Python process dies. Only the VM launcher (`podman machine
+start`) omits inheritance, in both start and recovery, so long-lived gvproxy/krunkit
+helpers cannot retain the lease indefinitely. The Python parent holds the lock
+through the launcher; durable maintenance remains mandatory. Never unlink a busy
+lock or kill real helpers to make a check pass: inspect locally with the owner.
+Backup quiescing does not change intent, and a backup never resumes an intentionally
+stopped application. Independent external writers are
+not serialized by this lock.
+
+### Owner-assisted Mac acceptance (not automated evidence)
+
+The implementation and controlled tests do **not** establish actual launchd,
+reboot, login/unlock, outage, power-recovery or trusted-client behavior. Before
+#21's production trial, coordinate and record separately:
+
+1. A fresh verified private backup, selected revision/checkout/settings and a
+   preservation inventory of unrelated jobs/resources; never publish credentials,
+   private URLs or raw application logs.
+2. Owner acceptance of the existing FileVault/unlock/login, sleep and power-recovery
+   limitations. Verify the mini's actual settings/behavior without changing them;
+   do not silently enable automatic login or simulate physical power loss.
+3. A real coordinated reboot, its time and normal-session availability time, then
+   successful startup/status and trusted HTTPS/actual reader checks. Locked disks,
+   login prerequisites and any unperformed power/outage scenarios stay explicit.
+4. A coordinated disposable application-failure recovery check and a healthy-check
+   noninterruption check, preserving subscriptions/articles/read/star state and
+   unrelated VM/forwarding resources.
+5. Explicit `stop`, ticks and another coordinated reboot/login remaining stopped;
+   explicit `start` alone resumes service. Record backup quiescing interaction and
+   persistent-error response separately from application availability.
+
+The mini's existing self-HTTPS diagnostic limitation is not permission for insecure
+TLS. Trusted client checks and loopback diagnostics remain distinct. See the
+[private-access runbook](tailscale-readkit.md).
 
 ## Scheduling and reading state
 
@@ -125,8 +294,47 @@ rolled back or deleted. No backups are pruned or uploaded automatically.
 
 Stopping the VM releases its memory allocations and stops fetching/serving. Idle
 guest memory is not guaranteed to return to macOS while it remains up. Nothing
-starts automatically at login or reboot. Tailscale itself is not stopped by project
+starts the application automatically at login or reboot unless the owner explicitly
+installs [session supervision](#opt-in-mac-startup-and-recovery); persisted stopped
+intent still prevents recovery. Enabling daily backups alone does not enable
+application supervision. Tailscale itself is not stopped by project
 shutdown; clients cannot synchronize with a stopped FreshRSS instance.
+
+## Daily backup checks
+
+Daily full-instance protection is separate from container feed-fetch cron and
+application supervision. It is disabled until the owner explicitly enables the
+Mac backup LaunchAgent; ordinary start/manual backup/stop never enable it. Follow
+[the coordinated setup procedure](backup-restore.md#opt-in-daily-mac-backups), with
+a verified pre-change backup, stable checkout/dependencies, original ownership
+path and the explicitly approved private `~/FreshRSS-Backups` destination.
+Never install a test schedule or change login/power settings against production.
+
+Routine check: `uv run --locked rss backup-status --check`. JSON is emitted even
+when protection is unhealthy and `--check` exits 1. Registration alone is not a
+successful backup. Inspect daily target/attempt, missed/deferred/failed work,
+latest verified archive age/availability and separate resumption/maintenance
+outcomes. Daily targets are UTC (default 03:00), not the local zone; wakeups may
+lag up to 15 minutes and sleep/logout can miss work. Three actual failures per
+target exhaust automatic retry until the next day. No backlog/pruning is created.
+See [failure response](backup-restore.md#daily-check-and-failure-response).
+
+After interruption, do not force writer restart or remove records/locks. Native
+subprocesses may survive their parent while retaining the command lock. Coordinate
+with the owner, inspect status and processes, then use
+[`backup-reconcile`](backup-restore.md#interrupted-maintenance-and-reconciliation)
+to confirm owned writers idle before releasing maintenance. It never itself
+resumes or changes intent; separately enabled supervision may subsequently
+honor running intent. Run `rss stop` before reconciliation if stopped state should
+persist; it records stopped intent even when the hold refuses shutdown. Preserve prior good archives,
+source data and sensitive temporary remnants until inspection. A verified archive
+and a successfully resumed service are separate outcomes.
+
+A real unattended mini attempt and sanitized verification/status evidence remain
+required before the production trial. Manually invoking `backup-due`, registering
+a job or passing isolated tests does not supply that evidence. Local publication
+does not prove Time Machine protection; actual copy retrieval and isolated restore
+are separately owner-coordinated (#24).
 
 ## Safe cleanup
 
@@ -204,7 +412,7 @@ This is source verification, not a new live session; see
   do not delete, relabel or edit JSON to force adoption. Recovery is a deliberate
   decision, not a reason to rerun setup with a new identity.
 - **Port occupied / wrong container configuration:** choose an unused `RSS_PORT`
-  consistently and follow [port changes](configuration.md). Apply reviewed container
+  consistently and follow [port changes](configuration.md#changing-the-loopback-port). Apply reviewed container
   changes with `replace`; do not terminate foreign listeners or remove the data volume.
 - **Homebrew upgrade approval required:** inspect private `install-preview.json`.
   This invocation has not installed anything; resolve the dependency plan explicitly.
@@ -218,8 +426,17 @@ This is source verification, not a new live session; see
 - **Backup destination/export failure:** check private external directory permissions,
   free space and engine availability. Follow [failure handling](backup-restore.md#consistency-and-failure-behavior);
   never delete the VM/data as a workaround.
+- **Missed/stale daily backup or maintenance hold:** run `backup-status --check`;
+  follow [daily response and reconciliation](backup-restore.md#daily-check-and-failure-response).
+  Do not mistake a last-archive locator, enabled job or manual backup for daily
+  protection, or force supervision/start through a hold.
 - **Restore target/image refusal:** use a fresh target and exact reviewed matching
   image configuration. Failed imports stay unselected; choose another fresh name.
+- **Cold-start failure:** guarded recreation applies only when `start` itself
+  starts a stopped owned VM and the existing app is matching, unchanged and stopped.
+  A warm retry does not force recreation or bypass security/readiness errors.
+  Preserve diagnostics and follow [startup safeguards](#start-verify-and-replace);
+  never delete the selected volume or lock as a workaround.
 - **Registry, virtualization or network failure:** restore prerequisites and retry.
   Startup failure need not stop the VM. Other machines are not stopped for you.
 - **PHP/image/security mismatch:** do not enter credentials or bypass the gate.

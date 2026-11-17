@@ -564,6 +564,11 @@ def create_archive(
         destination = directory / f"backup-{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}.zip"
         os.link(temporary, destination)
         published = destination
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         temporary.unlink()
         temporary = None
         complete = True

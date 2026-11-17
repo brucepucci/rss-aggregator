@@ -16,8 +16,10 @@ from typing import Any, Literal
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.recovery import Recovery, volume_name
+from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
     "setup",
@@ -31,6 +33,15 @@ Operation = Literal[
     "restore",
     "select-volume",
     "api-check",
+    "supervision-status",
+    "supervision-install",
+    "supervision-remove",
+    "supervision-tick",
+    "backup-status",
+    "backup-reconcile",
+    "backup-enable",
+    "backup-disable",
+    "backup-due",
 ]
 
 MACHINE = "rss-aggregator"
@@ -69,6 +80,7 @@ class Runtime:
             .expanduser()
             .resolve()
         )
+        self._command_lock_fd: int | None = None
         self.state_dir = (
             Path(
                 state_dir
@@ -103,6 +115,9 @@ class Runtime:
         username: str | None = None,
         api_password: str | None = None,
         loopback: bool = False,
+        now: datetime | None = None,
+        hour: int = 3,
+        minute: int = 0,
     ) -> dict[str, Any]:
         """Execute one public operation under the nonblocking project lock.
 
@@ -118,8 +133,14 @@ class Runtime:
             resource safety guard fails. OS and configuration errors propagate.
         """
         recovery = Recovery(self)
+        backups = BackupSchedule(self, now)
         handlers = {
-            "backup": recovery.backup,
+            "backup": backups.backup,
+            "backup-status": backups.status,
+            "backup-reconcile": backups.reconcile,
+            "backup-enable": lambda: backups.enable(hour, minute),
+            "backup-disable": backups.disable,
+            "backup-due": backups.due,
             "restore": lambda: recovery.restore(archive, volume),
             "select-volume": lambda: recovery.select_volume(volume),
             "api-check": lambda: self._api_check(
@@ -131,7 +152,11 @@ class Runtime:
             "fetch": self._fetch,
             "verify": self._verify,
             "replace": self._replace,
-            "stop": self._stop,
+            "stop": backups.shutdown,
+            "supervision-status": Supervision(self).status,
+            "supervision-install": Supervision(self).install,
+            "supervision-remove": Supervision(self).remove,
+            "supervision-tick": Supervision(self).tick,
         }
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
@@ -146,22 +171,53 @@ class Runtime:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
+                if operation == "backup-status":
+                    return backups.status(busy=True)
+                if operation == "backup-due":
+                    backups.deferred()
                 raise RuntimeFailure(
                     "Another project command is running; wait for it to finish."
                 ) from error
-            return handlers[operation]()
+            self._command_lock_fd = lock.fileno()
+            try:
+                if operation == "stop":
+                    Supervision(self).set_intent("stopped")
+                if backups.pending() and operation not in (
+                    "status",
+                    "backup-status",
+                    "backup-reconcile",
+                    "backup-disable",
+                    "supervision-status",
+                    "supervision-tick",
+                    "supervision-remove",
+                ):
+                    raise RuntimeFailure(
+                        "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
+                    )
+                if operation == "start":
+                    Supervision(self).set_intent("running")
+                return handlers[operation]()
+            finally:
+                self._command_lock_fd = None
 
     def _diagnostic(self, message: str) -> None:
         """Send human-readable progress or captured command chatter to stderr."""
         print(message, file=sys.stderr)
 
     def _run(
-        self, *args: str, check: bool = True, input: str | None = None
+        self,
+        *args: str,
+        check: bool = True,
+        input: str | None = None,
+        inherit_lock: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Capture an external command with Homebrew mutation safeguards.
 
         Captured stdout remains available for parsing; callers explicitly send
         informational output to diagnostics rather than the JSON result stream.
+        Short-lived native work inherits the lease by default. VM launchers must
+        disable inheritance so their long-lived helpers cannot retain it; the
+        Python caller still holds the lock throughout VM startup.
         """
         env = dict(
             os.environ,
@@ -172,7 +228,16 @@ class Runtime:
         )
         try:
             result = subprocess.run(
-                args, text=True, capture_output=True, env=env, input=input, check=False
+                args,
+                text=True,
+                capture_output=True,
+                env=env,
+                input=input,
+                check=False,
+                # Native work retains serialization if its Python parent dies.
+                pass_fds=(self._command_lock_fd,)
+                if inherit_lock and self._command_lock_fd is not None
+                else (),
             )
         except OSError as error:
             raise RuntimeFailure(f"{args[0]} unavailable: {error}") from error
@@ -187,9 +252,18 @@ class Runtime:
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         target = self.state_dir / name
         temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, indent=2) + "\n")
-        temporary.chmod(0o600)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(json.dumps(value, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
         temporary.replace(target)
+        descriptor = os.open(self.state_dir, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _image(self) -> dict[str, Any]:
         """Read this checkout's pinned image configuration only when needed."""
@@ -451,6 +525,7 @@ class Runtime:
     def _start(self, *, private_https: bool | None = None) -> dict[str, Any]:
         """Start serving only after ownership, image, and effective PHP gates."""
         owner, machine = self._owned()
+        cold_start = machine["State"] == "stopped"
         if machine["State"] not in ("stopped", "running"):
             raise RuntimeFailure(
                 "Project VM is "
@@ -484,9 +559,15 @@ class Runtime:
                 )
             self._diagnostic(
                 self._run(
-                    "podman", "machine", "start", "--update-connection=false", MACHINE
+                    "podman",
+                    "machine",
+                    "start",
+                    "--update-connection=false",
+                    MACHINE,
+                    inherit_lock=False,
                 ).stdout
             )
+            self._owned()
         # Collisions must be checked before touching the image or application.
         app = (
             self._check_label("container", APP, owner)
@@ -529,9 +610,20 @@ class Runtime:
                 raise RuntimeFailure(
                     "Existing application image/port/entrypoint differs; use replace after checking configuration."
                 )
-            if app["State"]["Running"]:
+            if cold_start and not app["State"]["Running"]:
+                # A stopped VM can leave stale Apache PID/runtime files in the
+                # container layer. Recreate only after all configuration gates;
+                # the named data volume is never removed or implicitly migrated.
+                current = self._check_label("container", APP, owner)
+                if current != app or current["State"]["Running"]:
+                    raise RuntimeFailure(
+                        "Application changed during cold-start inspection; preserve it and inspect locally."
+                    )
+                self._podman("rm", APP)
+                app = None
+            elif app["State"]["Running"]:
                 self._podman("stop", "--time", "60", APP)
-        else:
+        if app is None:
             image = self._image()
             self._podman(
                 "create",

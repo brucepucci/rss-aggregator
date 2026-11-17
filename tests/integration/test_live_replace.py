@@ -1,13 +1,16 @@
 """Installed-state persistence through the actual Click replacement command."""
 
 import json
+import os
 import re
+import subprocess
+import sys
 from html.parser import HTMLParser
 
 import pytest
 
 from .replacement_support import ReplacementInstanceFixture, volume_identity
-from .support import Browser, expect
+from .support import ROOT, Browser, expect
 
 pytestmark = pytest.mark.live
 
@@ -147,5 +150,79 @@ def test_click_replace_preserves_installed_subscription_article_and_read_star(
         "Replacement changed the named data volume",
     )
     # login() discards the old cookie jar and authenticates a fresh HTTP session.
+    fixture.login()
+    assert_persisted_http(fixture, entry_id, snapshot)
+
+
+def test_supervision_recovers_only_disposable_application_and_preserves_reading_state(
+    replacement_instance,
+):
+    fixture = replacement_instance
+    # Prepare the installed fixture through the production guarded CLI so its
+    # container satisfies Runtime.start's listener and security requirements.
+    replaced = fixture.replace()
+    expect(
+        replaced.returncode == 0,
+        "Could not prepare production-gated fixture: " + replaced.stderr,
+    )
+    fixture.login()
+    fixture.podman(
+        "exec", "--user", "www-data", fixture.name, "php", "app/actualize_script.php"
+    )
+    page = fixture.browser.request("/i/?a=normal&get=a&state=3")
+    match = re.search(r'id="flux_(\d+)"', page)
+    expect(match is not None, "Public article missing")
+    entry_id = match[1]
+    snapshot = Article(page, entry_id).snapshot
+    csrf = Browser.csrf(page)
+    fixture.browser.request(
+        "/i/?c=entry&a=bookmark", {"id": entry_id, "is_favorite": "1", "_csrf": csrf}
+    )
+    fixture.browser.request(
+        "/i/?c=entry&a=read", {"id": entry_id, "is_read": "1", "_csrf": csrf}
+    )
+    before_app, before_volume = fixture.resources()
+    production_intent = fixture.controller.state_dir / "operator-intent.json"
+    original = production_intent.read_bytes() if production_intent.exists() else None
+    result = subprocess.run(
+        [sys.executable, "-m", "tests.integration.supervision_runner"],
+        cwd=ROOT,
+        env=dict(
+            os.environ,
+            RSS_STATE_DIR=str(fixture.controller.state_dir),
+            RSS_PORT=str(fixture.port),
+        ),
+        input=json.dumps(
+            {
+                "token": fixture.token,
+                "port": fixture.port,
+                "volume": fixture.volume_record,
+            }
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    expect(
+        result.returncode == 0,
+        "Disposable supervision recovery failed; inspect sanitized local diagnostics",
+    )
+    expect(
+        json.loads(result.stdout) == {"healthy": "healthy", "recovery": "recovered"},
+        "Unexpected recovery outcome",
+    )
+    after_app, after_volume = fixture.resources()
+    expect(
+        before_app["Id"] == after_app["Id"], "Recovery replaced the fixture container"
+    )
+    expect(
+        volume_identity(before_volume) == volume_identity(after_volume),
+        "Recovery changed the fixture volume",
+    )
+    expect(
+        (production_intent.read_bytes() if production_intent.exists() else None)
+        == original,
+        "Production intent changed",
+    )
     fixture.login()
     assert_persisted_http(fixture, entry_id, snapshot)

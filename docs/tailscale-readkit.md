@@ -33,13 +33,68 @@ never copy or fabricate `owner.json`/`serve.json` to adopt resources.
 
 ## Connect and verify the server
 
-Keep a private external `RSS_BACKUP_DIR` configured for backup/shutdown.
+**Coordinate activation before changing mode.** Supervision captures
+`RSS_TAILSCALE`: a job installed in loopback mode can appear healthy after a manual
+private start, then remove forwarding and restore the loopback base URL on later
+recovery. Daily backups also capture the mode and executable directories; a
+never-private job can lack the Tailscale dependency needed to resume private access.
+Remove/disable both owned jobs before the transition, even if currently healthy.
+Neither job is automatically rewritten by changing this shell.
 
-```sh
-export RSS_TAILSCALE=1
-./scripts/rss start
-./scripts/rss status
-```
+1. Use the same synchronized **stable controlling checkout**, existing
+   `RSS_STATE_DIR`, `RSS_PORT`, current mode and explicitly chosen private external
+   `RSS_BACKUP_DIR` throughout preparation. From another worktree, export the
+   original ownership directory, never copy its records. Preserve these selectors
+   privately and note which jobs were enabled and their intended captured settings.
+   If daily backups will be re-enabled, retain their destination and intended UTC
+   hour/minute from the private `backup-schedule.json` (`hour`, `minute`, `timezone`)
+   or retained enable result. Set `SAVED_UTC_HOUR`/`SAVED_UTC_MINUTE` to those numeric
+   values for later recapture; do not silently substitute the default schedule.
+   Keep the current mode selected; **do not export `RSS_TAILSCALE=1` yet**:
+
+   ```sh
+   ./scripts/rss status && ./scripts/rss supervision-status &&
+     ./scripts/rss backup && ./scripts/rss status && ./scripts/rss backup-status
+   ```
+
+   Require a successful backup with `verified: true`, retain its private archive
+   and checksum, and confirm any previously running app resumed normally with no
+   resumption/maintenance failure. Plain status commands can exit 0 when unhealthy;
+   inspect their JSON. A manual archive is a recovery point, not daily or host-loss
+   protection. On failure, preserve archives/holds and follow the
+   [backup failure response](backup-restore.md#daily-check-and-failure-response).
+2. Still with the old selectors, successfully remove/disable both captured jobs
+   (safe no-ops if absent):
+
+   ```sh
+   ./scripts/rss supervision-remove && ./scripts/rss backup-disable &&
+     ./scripts/rss supervision-status && ./scripts/rss backup-status
+   ```
+
+   Require supervision `enabled: false`, `state: "disabled"` and backup
+   `enabled: false`, `registered: false`. Removal preserves the app, VM, intent,
+   data, ownership and archives. **Stop on refusal, contention or uncertain/partial
+   removal**; leave any successfully removed job disabled and resolve the other
+   before changing mode. Do not overwrite foreign/changed jobs or delete records,
+   locks or maintenance holds. See the [supervision safeguards](operations.md#enable-or-remove-supervision)
+   and [daily-backup safeguards](backup-restore.md#opt-in-daily-mac-backups).
+3. Only after both removals succeed, keep checkout/state/port/destination unchanged
+   and activate private access through the guarded startup path:
+
+   ```sh
+   export RSS_TAILSCALE=1
+   ./scripts/rss start && ./scripts/rss verify && ./scripts/rss status
+   ```
+
+   Require successful `start`/`verify` with the same private HTTPS `url`, and status
+   with a running application, `http_ready: true` and `forwarding.status: "running"`.
+   Confirm the intended owned 443 route with `tailscale serve status` locally,
+   preserving unrelated routes. Guarded verification restarts/rechecks the app;
+   neither a successful initial start nor an HTTP-ready loopback listener proves
+   remote HTTPS/authentication. Complete the browser/API and intended client checks
+   below before optional job recapture. On failure leave jobs disabled, inspect
+   locally with the [failure safeguards](#troubleshooting), and never bypass TLS or
+   edit `serve.json` to force success. Failure is not proof access is closed.
 
 Use the private HTTPS `url` returned locally by `start`. Open it and sign in with
 the web password. In **Profile**, set a strong, separate **API password**. Enter
@@ -99,6 +154,43 @@ No certificate-warning bypass should be needed. Other reader integrations are no
 verified here; consult [FreshRSS mobile access](https://freshrss.github.io/FreshRSS/en/users/06_Mobile_access.html)
 and the [ReadKit FAQ](https://readkit.app/faq).
 
+## Optionally recapture the Mac jobs
+
+Leave both jobs disabled for manual operation. **Only if explicitly wanted**, and
+only after successful guarded startup, private browser/API access and the intended
+[client checks](#connect-readkit), reinstall the desired jobs separately. Do not
+activate a previously disabled job merely because the access mode changed. Use the
+same stable checkout, original `RSS_STATE_DIR`, unchanged `RSS_PORT`, preserved
+private `RSS_BACKUP_DIR` and **`RSS_TAILSCALE=1`**, with the intended Tailscale CLI
+and LocalAPI available. Review [captured supervision](configuration.md#captured-mac-supervision-configuration)
+and [backup configuration](configuration.md#daily-backup-configuration).
+
+For explicitly wanted supervision:
+
+```sh
+./scripts/rss supervision-install && ./scripts/rss supervision-status
+```
+
+Require healthy observation with the newly captured private settings/dependencies.
+On partial activation/error, stop and inspect the retained registration; do not
+claim success or hand-edit it. Installation is not a native recovery test.
+
+Independently, for explicitly wanted daily backups, use the saved UTC policy:
+
+```sh
+./scripts/rss backup-enable --hour "$SAVED_UTC_HOUR" --minute "$SAVED_UTC_MINUTE" &&
+  ./scripts/rss backup-status --check
+```
+
+Compare the returned `daily_utc` with the intended schedule. Registration is not
+protection: `backup-status --check` emits JSON and exits 1 until `protected` is true.
+The changed captured mode/dependencies require new eligible daily success; an old
+archive or fresh manual capture cannot substitute. Preserve prior archives and
+inspect daily evidence, age/availability, resumption and maintenance using the
+[daily failure response](backup-restore.md#daily-check-and-failure-response).
+Partial activation retains registration for inspection, not overwrite. Neither
+installation nor a manually invoked check proves an actual unattended run.
+
 ## Stop, resume and return to local-only use
 
 Normal `stop` removes only matching project-owned forwarding, creates a verified
@@ -116,10 +208,58 @@ forwarding stopped with the VM running. Preflight refusal can leave existing
 serving state untouched; failed resumption can leave the application stopped.
 See [backup failure behavior](backup-restore.md#consistency-and-failure-behavior).
 
-To deliberately return to browser-only operation, set `RSS_TAILSCALE=0` and run
-`start`. Recorded owned forwarding is removed and an installed instance's base URL
-returns to loopback; API enablement and API passwords are not erased. Preserve the
-same ownership directory, including after stop.
+To deliberately return to local-only browser operation, **remove owned supervision
+before changing mode**. An installed job retains its captured `RSS_TAILSCALE=1`;
+changing this shell alone can let the next recovery tick reopen forwarding.
+
+1. Coordinate the change with the owner and obtain a verified private instance
+   backup, following the [supervision safeguards](operations.md#enable-or-remove-supervision).
+   Use the same synchronized stable controlling checkout, existing `RSS_STATE_DIR`
+   and `RSS_PORT` throughout, including after stop. From another worktree, explicitly
+   export the original ownership directory; never copy or fabricate its records.
+   With the existing mode still selected:
+
+   ```sh
+   ./scripts/rss supervision-status
+   ./scripts/rss supervision-remove
+   ```
+
+   Continue only after removal succeeds with `enabled: false`, `state: "disabled"`.
+   Removal is repeatable if absent and does not stop FreshRSS or Tailscale, erase
+   intent or delete data/backups. On contention or changed/unowned-job refusal,
+   resolve it locally before continuing; never hand-edit or delete managed records/jobs.
+2. Keep those checkout/ownership/port selectors unchanged, then apply the new mode
+   through the guarded startup and verification path:
+
+   ```sh
+   export RSS_TAILSCALE=0
+   ./scripts/rss start && ./scripts/rss verify && ./scripts/rss status
+   ```
+
+   Require successful results: `start`/`verify` return
+   `url: "http://127.0.0.1:<RSS_PORT>"`, and `status` reports the application running,
+   `http_ready: true` and `forwarding.status: "stopped"` (or `"unconfigured"` if never recorded).
+   Inspect `tailscale serve status` locally to confirm the owned 443 route is gone,
+   preserving unrelated routes. Open the returned loopback URL and confirm sign-in
+   and loopback links/redirects. Recorded owned forwarding is removed and the
+   installed instance's base URL returns to loopback; API enablement and API
+   passwords are not erased. A failed command is not proof access is closed;
+   inspect locally using the [failure safeguards](#troubleshooting) before retrying.
+3. Leave supervision removed for manual operation. If automatic recovery is still
+   wanted, explicitly reinstall only after successful loopback verification, from
+   the same stable checkout with `RSS_TAILSCALE=0` and all intended settings exported:
+
+   ```sh
+   ./scripts/rss supervision-install && ./scripts/rss supervision-status
+   ```
+
+   Follow the [captured-configuration instructions](configuration.md#captured-mac-supervision-configuration)
+   and [installation safeguards](operations.md#enable-or-remove-supervision).
+   Keep Tailscale available: the retained inactive `serve.json` still makes health
+   inspection and guarded cleanup depend on its CLI/LocalAPI. Reinstallation captures
+   its executable directory even in loopback mode; never delete ownership evidence
+   to avoid that dependency. Require healthy observation after installation.
+   Reinstallation captures the intended settings; it is not a live recovery test.
 
 ## Troubleshooting
 
