@@ -538,6 +538,18 @@ This is source verification, not a new live session; see
   user configurations without publishing names or changing credentials. Preserve
   backups and seek owner approval before any correction; see the
   [isolated recovery diagnostic safeguards](backup-restore.md#4-restore-and-deliberately-activate-only-isolated-owned-resources).
+  For a separately approved **production** default-user correction, first obtain
+  a fresh verified `rss backup` and confirm resumption. Identify the existing
+  readable user locally, serialize upstream `cli/reconfigure.php --default-user`
+  under the real command lock, and retain the matching image/port/forwarding/job
+  settings. Never create a replacement user or reset credentials. Check that the
+  existing user configuration is unchanged and that all other effective system
+  settings remain identical. Use normal guarded `rss start` with the original
+  captured settings, then check fresh-session login and have the owner authenticate
+  at the normal trusted production URL. Confirm the original container/data-volume
+  identity, intent and private forwarding, and the refreshed production security
+  audit. Keep the pre-repair archive; record its known defective setting instead
+  of treating verified archive bytes as proof of usable application configuration.
 - **Cold-start failure:** guarded recreation applies only when `start` itself
   starts a stopped owned VM and the existing app is matching, unchanged and stopped.
   A warm retry does not force recreation or bypass security/readiness errors.
