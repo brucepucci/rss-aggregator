@@ -354,6 +354,20 @@ record as the cleanup lease. On invalid/missing/corrupt archives, target collisi
 or incomplete import, stop; never overwrite, relabel or delete a conflicting target.
 Check that the real selection/intent/backup/forwarding records remain unchanged.
 
+Before activation, check the restored instance's base URL. Changing only the
+runner's port does **not** rewrite an archived production URL. Adjust only the
+leased recovered volume to its fixture localhost origin using upstream
+`php cli/reconfigure.php --base-url URL`; do not change production's URL or copy
+its forwarding records. For a stopped clone, a uniquely named, owner-labelled,
+network-disabled one-shot helper can use the exact recorded image, run as
+`www-data` in `/var/www/FreshRSS`, and mount **only** that recovered volume at
+`/var/www/FreshRSS/data`. Check the retained volume identity and helper-name
+absence first, retain the real command lock through this writer, and confirm the
+helper exits and is removed before startup. Do not run another image or bypass
+first-activation compatibility. Verify the effective URL and same-origin login
+navigation afterward; record this deliberate host-setting adjustment separately
+from preserved application settings.
+
 Only after the agreed outbound/content safeguards are established, make separate
 private requests with the **same token**, `"operation": "select-volume"`, then
 `"operation": "start"`, using that runner and fixture port. Each invocation must
@@ -376,7 +390,18 @@ user settings, subscriptions, stable article identity **and content**, read and
 unread examples, starred and unstarred examples. Check state before deliberately
 editing it; opening an article can itself mark it read. An empty installer, a
 successful import, file existence or subscription count alone is failure to prove
-full recovery. Verify absence of unauthorized outbound requests under the agreed
+full recovery. In particular, HTTP 200 can contain the fixed FreshRSS diagnostic
+`Error during context user init!` rather than a login form. Check a fresh session:
+remembered client access and project HTTP readiness cannot substitute. If the
+effective default user does not match an existing readable user configuration,
+preserve the archive and compare source/clone read-only before assuming restore
+lost the account. Do not create users, reset passwords or correct production
+settings implicitly. An owner-approved clone-only `cli/reconfigure.php --default-user`
+experiment can distinguish a configuration mismatch, but must be recorded as a
+repair, not proof the untouched archive was application-ready. Source repair and
+any remaining acceptance gaps require explicit owner coordination.
+
+Verify absence of unauthorized outbound requests under the agreed
 protection and unchanged working-instance selection/data/forwarding and unrelated
 resources. Same-host restoration is not physical second-host/cross-architecture
 recovery, paid-feed acceptance or ReadKit acceptance.
@@ -407,6 +432,17 @@ failure is reported separately from recovery success. Preserve the shared
 `maintenance.json` and command lock; interrupted work requires the
 [owner-coordinated reconciliation procedure](#interrupted-maintenance-and-reconciliation).
 Keep the original working instance and every previous good archive intact.
+
+Stop the identity/owner/mount/port-checked test clone after the comparison, retaining
+its volume and copies until cleanup is approved. An extra running clone in the
+shared VM is intentionally considered an unrelated workload by production's
+backup idle-engine guards and can block subsequent backups. Do not leave it running
+unattended or relax those guards to obtain a backup. Stopping the test container
+is not production `rss stop` and must not stop the VM or alter production intent.
+The shared security audit still describes the last checked fixture; do not present
+it as a fresh production audit or hand-edit it to force diagnostics to pass. A
+subsequent owner-coordinated normal production verification/start restores that
+context through the existing gates.
 
 ## Format version 1
 

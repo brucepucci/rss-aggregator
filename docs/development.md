@@ -320,6 +320,15 @@ of the working application's effective runtime. Coordinate production API checks
 Record revision-specific outcomes/unrun checks in the issue, not as permanent
 platform-pass claims here.
 
+For real staged archives, adapt only the clone's archived base URL to the fixture
+origin before activation, using the retained target lease, real lock and matching
+image. Verify fresh unauthenticated login navigation in addition to HTTP readiness:
+a 200 response can carry `Error during context user init!`. Diagnose a mismatching
+default user read-only before proposing any repair; owner-approved configuration
+correction is separate evidence, not an untouched-archive pass. Stop only the
+identity-checked test clone after comparison so it does not block production's
+idle-engine backup guards; retain data/copies and never bypass those guards.
+
 ## Callable Python interface
 
 Click is a thin adapter; Python callers use the same guarded operations:

@@ -532,6 +532,12 @@ This is source verification, not a new live session; see
   protection, or force supervision/start through a hold.
 - **Restore target/image refusal:** use a fresh target and exact reviewed matching
   image configuration. Failed imports stay unselected; choose another fresh name.
+- **HTTP ready but fresh login fails:** a 200 response can contain FreshRSS's
+  `Error during context user init!`. Readiness is not authenticated acceptance.
+  Compare source/clone effective default-user consistency against existing readable
+  user configurations without publishing names or changing credentials. Preserve
+  backups and seek owner approval before any correction; see the
+  [isolated recovery diagnostic safeguards](backup-restore.md#4-restore-and-deliberately-activate-only-isolated-owned-resources).
 - **Cold-start failure:** guarded recreation applies only when `start` itself
   starts a stopped owned VM and the existing app is matching, unchanged and stopped.
   A warm retry does not force recreation or bypass security/readiness errors.

@@ -183,6 +183,9 @@ service is closed.
   have resumed serving. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
 - **Missed/stale daily backups or interrupted maintenance:** inspect
   `rss backup-status --check`; follow [daily failure/reconciliation procedures](docs/backup-restore.md#daily-check-and-failure-response), not a forced restart or deleted lock.
+- **HTTP ready but fresh login fails:** a successful readiness response is not an
+  authenticated check. Preserve backups and follow the [login troubleshooting safeguards](docs/operations.md#common-troubleshooting);
+  do not recreate users or reset passwords just to make a restore pass.
 - **Missing articles:** check the [fetching FAQ](#why-are-articles-missing-or-feeds-no-longer-updating)
   and [logs](#how-do-i-view-service-logs-and-investigate-feed-fetching-errors).
 - **ReadKit/certificate/API failure:** use the separate API password; check Tailscale
