@@ -32,6 +32,7 @@ until explicit start.
 - [Getting started](#getting-started)
 - [Routine CLI commands](#routine-cli-commands)
 - [Daily backup setup and checks](docs/backup-restore.md#opt-in-daily-mac-backups)
+- [Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill)
 - [Safe upgrades for installed Mac jobs](docs/operations.md#upgrade-installed-mac-jobs-safely)
 - [Essential configuration](#essential-configuration)
 - [Common troubleshooting](#common-troubleshooting)
@@ -182,6 +183,9 @@ service is closed.
   have resumed serving. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
 - **Missed/stale daily backups or interrupted maintenance:** inspect
   `rss backup-status --check`; follow [daily failure/reconciliation procedures](docs/backup-restore.md#daily-check-and-failure-response), not a forced restart or deleted lock.
+- **HTTP ready but fresh login fails:** a successful readiness response is not an
+  authenticated check. Preserve backups and follow the [login troubleshooting safeguards](docs/operations.md#common-troubleshooting);
+  do not recreate users or reset passwords just to make a restore pass.
 - **Missing articles:** check the [fetching FAQ](#why-are-articles-missing-or-feeds-no-longer-updating)
   and [logs](#how-do-i-view-service-logs-and-investigate-feed-fetching-errors).
 - **ReadKit/certificate/API failure:** use the separate API password; check Tailscale
@@ -224,8 +228,11 @@ and verifies an external archive before attempting to resume the prior state.
 [owner-coordinated setup and daily checks](docs/backup-restore.md#opt-in-daily-mac-backups),
 with a verified pre-change backup and this deployment's explicit private
 `~/FreshRSS-Backups` destination. No schedule is enabled by ordinary manual use.
-An actual unattended run and separate Time Machine recovery evidence are still
-required; a registered job or fresh manual archive is not that proof.
+An actual unattended run and the [owner-assisted Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill)
+are still required: verify destination protection, retrieve a scheduled archive
+from a completed copy into private staging, then check full state in an isolated
+restored application. Inclusion settings or a fresh local archive are not that
+proof. This drill does not authorize overwriting or selecting production data.
 Copy successful archives to independent durable storage;
 there is no automatic pruning, encryption or upload.
 

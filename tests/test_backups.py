@@ -197,6 +197,62 @@ def test_recovery_runner_preserves_real_backup_locator(project, has_locator):
     )
 
 
+def test_recovery_runner_restores_independently_staged_archive_without_source(
+    project, tmp_path
+):
+    from tests.integration.replacement_support import replacement_names
+
+    backup = project.run("backup")
+    assert backup.returncode == 0, backup.stderr
+    report = json.loads(backup.stdout)
+    original = Path(report["archive"])
+    staging = tmp_path / "private-retrieval"
+    staging.mkdir(mode=0o700)
+    recovered = staging / "recovered.zip"
+    recovered.write_bytes(original.read_bytes())
+    recovered.chmod(0o600)
+    original.unlink()
+    Path(project.engine()["payload"]).unlink()
+    # Disposable source removal models independence, NOT Time Machine retrieval.
+    project.update(volumes={}, containers={}, calls=[])
+    token = "0123456789abcdef"
+    _app, source, _check = replacement_names(token)
+    records = {
+        name: project.state_dir / name
+        for name in (
+            "selected-volume.json",
+            "last-backup.json",
+            "backup-success.json",
+            "operator-intent.json",
+            "serve.json",
+        )
+    }
+    for path in records.values():
+        path.write_text('{"preserve":"production evidence"}\n')
+    result = subprocess.run(
+        [sys.executable, "-m", "tests.integration.backup_runner"],
+        input=json.dumps(
+            {"token": token, "operation": "restore", "archive": str(recovered)}
+        ),
+        env=project.env,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    restored = json.loads(result.stdout)
+    assert restored["restored"] is True
+    assert restored["selected"] is False
+    assert restored["manifest"] == report["manifest"]
+    assert set(project.engine()["volumes"]) == {source + "-recovered"}
+    assert not project.engine()["containers"]
+    for path in records.values():
+        assert path.read_text() == '{"preserve":"production evidence"}\n'
+    assert hashlib.sha256(recovered.read_bytes()).hexdigest() == report["sha256"]
+    assert "synthetic database" not in result.stdout + result.stderr
+
+
 def test_failed_restore_target_cannot_be_selected(project):
     backup = project.run("backup")
     assert backup.returncode == 0, backup.stderr

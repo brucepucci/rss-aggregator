@@ -200,6 +200,250 @@ host-loss protection. #24 separately verifies actual Time Machine inclusion,
 access/encryption assessment, retrieval and isolated full-instance recovery of a
 scheduled copy. Local publication and private permissions are not that evidence.
 
+## Time Machine copy recovery drill
+
+This is the owner-assisted procedure for [issue #24](https://github.com/brucepucci/rss-aggregator/issues/24),
+not a claim that this deployment has passed it. A local verified archive, an
+included directory, and a completed Time Machine copy are three different facts.
+The drill is incomplete until an archive retrieved from an actual completed copy
+passes guarded restoration **and authenticated application checks**. Record the
+revision-specific evidence in the issue; do not commit private recovery artifacts.
+See [operational gates](operations.md#time-machine-recovery-coordination) before
+performing platform work.
+
+### 1. Agree the recovery point and preservation boundary
+
+Work in the normal mini user's session with the stable synchronized checkout and
+original `RSS_STATE_DIR`. Retain the reviewed matching `config/image.json`.
+Inventory the working application's container identity/running state, selected
+volume, operator intent, backup evidence, owned forwarding and unrelated resources
+privately. Obtain a fresh verified backup before any significant change or drill
+that interrupts production; confirm safe resumption and no maintenance hold.
+Do not install/recapture jobs, change exclusions, start a Time Machine backup,
+mount/unlock storage, change permissions/security settings or incur costs merely
+to make verification pass without owner approval.
+
+Select a **completed daily archive** from `~/FreshRSS-Backups`, correlating the
+private `backup-daily.json` success/target/policy with `backup-attempt.json` and
+`backup-success.json` publication time, volume, archive and whole-ZIP checksum.
+These records can be superseded by later manual/stop backups: preserve a private
+record of the correlation before it is lost. Obtain independent evidence that the
+job ran unattended; manually running `backup-due` is not scheduled-run evidence.
+If that correlation or unattended evidence is unavailable, stop final acceptance
+and obtain the next naturally scheduled artifact. Do not relabel a manual archive.
+A manual synthetic drill can prepare the procedure but does not satisfy this gate.
+
+Prefer synthetic users, controlled/public feeds, nonfunctional credentials and
+known read/unread and starred/unstarred examples carried through the **same**
+archive/copy/retrieval path. Keep expected usernames/settings, subscription counts,
+article identities/content and reading state in a private comparison record.
+For a real archive, get explicit owner consent and agree how unauthorized publisher
+requests and content exposure will be prevented **before activation**. Startup
+performs fetching and enables cron; loopback binding alone does not block outbound
+requests. Do not activate a real-data clone until that protection is established;
+a restore-only pass is not the completed drill. Never publish the comparison record.
+
+### 2. Verify inclusion, destination protection and completed copies
+
+Run these read-only upstream commands **locally**; output may identify private
+storage, hosts and usernames. Retain it privately, reporting only sanitized results:
+
+```sh
+tmutil isexcluded "$HOME/FreshRSS-Backups"
+tmutil destinationinfo
+tmutil listbackups
+```
+
+`isexcluded` must report `[Included]`; also check the selected archive itself.
+This reports current policy, not historical inclusion or actual recoverability.
+Use Time Machine settings/Finder with the owner to assess the selected destination:
+local versus network storage, encryption at rest, who can read/unlock it, key/password
+availability after losing the mini, and physical/access limitations. Local archive
+permissions and FileVault on the mini do not prove backup-destination encryption.
+For network storage, assess both share access and the backup image's encryption;
+a share password alone is not encrypted storage. Record unknowns explicitly. A
+serious unresolved protection problem blocks the production trial, not an implicit
+waiver or permission to reconfigure the destination.
+
+`listbackups` lists completed destination copies; `latestbackup` can identify the
+latest but does not prove that it contains the chosen archive. Local APFS source
+snapshots (`listlocalsnapshots`) are not independent host-loss copies. Browse an
+actual completed destination copy and locate the chosen archive under that copy's
+home-directory hierarchy. Do not assume a fixed HFS+/APFS path layout or substitute
+the current `~/FreshRSS-Backups` file, a symlink to it, or an in-progress copy.
+Record the completed-copy time and selected archive's identity/checksum relationship
+privately. The copy must actually contain the completed archive, not merely have a
+timestamp later than its creation.
+
+Some `tmutil` inspection/retrieval verbs require root and **Full Disk Access** for
+the hosting terminal/app. Permission refusal is **unperformed verification**, not
+an empty backup history. Ask the owner to run the checks or approve the necessary
+access; do not automatically use sudo, grant access, mount/unlock disks or change
+backup configuration. Consult the installed `man tmutil` for this macOS version.
+
+### 3. Retrieve into private staging and validate provenance
+
+Create a new private staging directory outside **every** Git checkout; retain all
+source archives and Time Machine history. For example:
+
+```sh
+umask 077
+stage="$(mktemp -d "$HOME/FreshRSS-Recovery.XXXXXXXX")"
+# Set locally to the actual archive INSIDE the selected completed backup:
+copy_archive="/absolute/path/inside/completed-time-machine-copy/archive.zip"
+# Destination must not exist; never restore over the current backup directory.
+test ! -e "$stage/recovered.zip" &&
+  tmutil restore "$copy_archive" "$stage/recovered.zip"
+```
+
+Alternatively use Time Machine's owner-operated restore-to-another-location UI.
+`tmutil restore` follows copy-like destination semantics; use a new explicit file
+path, no wildcard or verbose output. It may require owner-assisted permissions.
+It can preserve original metadata: check that staging is owned by the normal user
+with mode `0700`, and the retrieved regular file is owned by that user with mode
+`0600`, not a symlink. Stop on unexpected ownership/permissions; obtain approval
+before fixing metadata. Neither permissions nor the ZIP format provide encryption.
+
+Privately compare `shasum -a 256 "$stage/recovered.zip"` against the previously
+recorded **whole-ZIP** checksum of the scheduled artifact. Record separately where
+and when the bytes were retrieved. Matching bytes alone cannot prove Time Machine
+provenance; the actual copy/retrieval sequence supplies that evidence. Do not replace
+the staged file with the current source archive after a mismatch or retrieval
+failure. Preserve good copies and diagnose privately. A checksum is not a signature:
+use only a trusted archive and reviewed matching image configuration.
+
+Full structural/CRC/payload/path/image validation occurs through the existing
+`restore` boundary **before** engine mutation; `unzip -t` or a hash match alone is
+not that validation. Restore does not check staging's privacy for you. No standalone
+project archive-validation command or Time Machine wrapper is provided.
+
+### 4. Restore and deliberately activate only isolated owned resources
+
+**Do not use normal `rss select-volume` on the working instance for this drill.**
+For a real recovery on a new host, use [clean-host recovery](#recovery-on-this-or-a-clean-host).
+For this same-host drill, the existing developer recovery runner redirects only
+reserved fixture app/volume/preflight, selection/provenance, intent, backup-evidence
+and forwarding-record names while retaining the **real** owner, command lock and
+maintenance guard. It requires the already owned running VM. No ownership files are
+copied or fabricated. See [fixture prerequisites and limits](development.md#time-machine-staged-archive-verification).
+
+With owner coordination, choose a new random 16-lowercase-hex fixture token and a
+free high loopback port, verifying that all corresponding reserved resource and
+record names are absent. The target is
+`rss-aggregator-test-<token>-data-recovered`. Keep a private request file in staging:
+
+```json
+{
+  "token": "<new-16-lowercase-hex-token>",
+  "operation": "restore",
+  "archive": "/absolute/private/staging/recovered.zip"
+}
+```
+
+Use real values locally, not the placeholders above. With `RSS_STATE_DIR` pointing
+to the original ownership directory and `RSS_PORT` to that free fixture port:
+
+```sh
+uv run --locked python -m tests.integration.backup_runner \
+  < "$stage/restore-request.json" > "$stage/restore-result.json"
+```
+
+Require `restored: true`, `selected: false`, the intended fresh target and matching
+manifest image. Retain the restored volume's owner/identity and namespaced recovery
+record as the cleanup lease. On invalid/missing/corrupt archives, target collision
+or incomplete import, stop; never overwrite, relabel or delete a conflicting target.
+Check that the real selection/intent/backup/forwarding records remain unchanged.
+
+Before activation, check the restored instance's base URL. Changing only the
+runner's port does **not** rewrite an archived production URL. Adjust only the
+leased recovered volume to its fixture localhost origin using upstream
+`php cli/reconfigure.php --base-url URL`; do not change production's URL or copy
+its forwarding records. For a stopped clone, a uniquely named, owner-labelled,
+network-disabled one-shot helper can use the exact recorded image, run as
+`www-data` in `/var/www/FreshRSS`, and mount **only** that recovered volume at
+`/var/www/FreshRSS/data`. Check the retained volume identity and helper-name
+absence first, retain the real command lock through this writer, and confirm the
+helper exits and is removed before startup. Do not run another image or bypass
+first-activation compatibility. Verify the effective URL and same-origin login
+navigation afterward; record this deliberate host-setting adjustment separately
+from preserved application settings.
+
+Only after the agreed outbound/content safeguards are established, make separate
+private requests with the **same token**, `"operation": "select-volume"`, then
+`"operation": "start"`, using that runner and fixture port. Each invocation must
+succeed before the next. No archive field is needed for these two requests.
+They select/activate only the namespaced target, not production. The runner forces
+loopback mode and retains normal security/readiness/cron/initial-fetch gates; it
+neither proves trusted HTTPS nor disables publisher requests. It writes the shared
+`security.json` audit like the existing live fixture, so coordinate with production
+API diagnostics; do not interpret its audit as a production re-verification.
+
+Inspect the clone's mounts: its only FreshRSS data mount must be the newly restored
+target, never the original source volume. Retain the original source unchanged;
+it is **not necessary or authorized to delete production data** to establish this
+mount/provenance boundary. Separately, the disposable source-absent regression can
+prove recovery after deleting its own leased synthetic source, never the real one.
+
+Log in through a new authenticated loopback browser session and compare against the
+private pre-backup expectations: users/authentication, representative system and
+user settings, subscriptions, stable article identity **and content**, read and
+unread examples, starred and unstarred examples. Check state before deliberately
+editing it; opening an article can itself mark it read. An empty installer, a
+successful import, file existence or subscription count alone is failure to prove
+full recovery. In particular, HTTP 200 can contain the fixed FreshRSS diagnostic
+`Error during context user init!` rather than a login form. Check a fresh session:
+remembered client access and project HTTP readiness cannot substitute. If the
+effective default user does not match an existing readable user configuration,
+preserve the archive and compare source/clone read-only before assuming restore
+lost the account. Do not create users, reset passwords or correct production
+settings implicitly. An owner-approved clone-only `cli/reconfigure.php --default-user`
+experiment can distinguish a configuration mismatch, but must be recorded as a
+repair, not proof the untouched archive was application-ready. Source repair and
+any remaining acceptance gaps require explicit owner coordination.
+
+Verify absence of unauthorized outbound requests under the agreed
+protection and unchanged working-instance selection/data/forwarding and unrelated
+resources. Same-host restoration is not physical second-host/cross-architecture
+recovery, paid-feed acceptance or ReadKit acceptance.
+
+### 5. Retain evidence and clean up only with authority
+
+Record sanitized outcomes: checkout/commit, owner-assisted steps, unattended daily
+target/attempt/publication times, original archive checksum, completed-copy time,
+retrieval method/time, recovered checksum/validation outcome, isolated target and
+activation, each application comparison, preservation checks, destination security
+assessment and all unperformed checks. Keep actual private destination identifiers,
+usernames/credentials, private URLs, article bodies and raw exports outside Git,
+chat and issue attachments. Public evidence can report comparison booleans/counts;
+store the detailed comparison and checksum correlation privately.
+
+Leave the issue open while any mandatory Time Machine or application check remains
+unperformed. Distinguish local daily-archive age from completed-copy age: host loss
+can lose changes since the archive in the **retrievable** copy, not merely since
+the newest host archive. Do not promise a fixed host-loss recovery point.
+
+Do not automatically remove retrieved archives, staging, original exports or Time
+Machine history. Obtain owner approval before deleting real recovery copies.
+Test-resource cleanup requires the retained exact owner/volume identity, namespaced
+recovery lease, expected app data mount and loopback binding; preserve resources on
+any mismatch or interrupted preflight. Use the identity-checked live-fixture cleanup
+pattern, not broad prefix deletion, forced removal or global prune. A cleanup
+failure is reported separately from recovery success. Preserve the shared
+`maintenance.json` and command lock; interrupted work requires the
+[owner-coordinated reconciliation procedure](#interrupted-maintenance-and-reconciliation).
+Keep the original working instance and every previous good archive intact.
+
+Stop the identity/owner/mount/port-checked test clone after the comparison, retaining
+its volume and copies until cleanup is approved. An extra running clone in the
+shared VM is intentionally considered an unrelated workload by production's
+backup idle-engine guards and can block subsequent backups. Do not leave it running
+unattended or relax those guards to obtain a backup. Stopping the test container
+is not production `rss stop` and must not stop the VM or alter production intent.
+The shared security audit still describes the last checked fixture; do not present
+it as a fresh production audit or hand-edit it to force diagnostics to pass. A
+subsequent owner-coordinated normal production verification/start restores that
+context through the existing gates.
+
 ## Format version 1
 
 The outer file is a standard ZIP, with two uncompressed, unencrypted members:

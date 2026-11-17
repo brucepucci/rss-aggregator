@@ -396,6 +396,46 @@ a job or passing isolated tests does not supply that evidence. Local publication
 does not prove Time Machine protection; actual copy retrieval and isolated restore
 are separately owner-coordinated (#24).
 
+## Time Machine recovery coordination
+
+Follow the canonical [Time Machine copy recovery drill](backup-restore.md#time-machine-copy-recovery-drill)
+for inclusion/security assessment, completed-copy retrieval into private staging,
+guarded isolated restoration, authenticated full-state comparison and retention.
+Do not substitute ordinary production volume selection for the namespaced drill.
+
+Before platform work, agree with the owner:
+
+- The actual unattended scheduled artifact and private expected-state record;
+  job registration or a manual backup is insufficient. Preserve its publication
+  checksum/correlation before later backups supersede latest-attempt records.
+- Who will inspect/retrieve the completed copy. `tmutil` may require Full Disk
+  Access/root; access denial is an unavailable check, not proof of no backups.
+  Owner-run Time Machine UI/commands are an alternative to granting agent access.
+- The destination's encryption, read/unlock access and recoverable key material.
+  Do not publish disk/share identifiers, passwords or screenshots with private
+  content. Unknown or serious unresolved protection problems remain blockers.
+- Which isolated resources, free loopback port and real ownership directory will
+  be used; record the working instance's selection/intent/forwarding and unrelated
+  resource inventory privately. Never fabricate ownership or use a real source
+  volume as the restore target. Leave production data present and unchanged.
+- Explicit consent for any real-data archive and the outbound/content protections
+  **before activation**: startup fetches and cron can contact publishers even when
+  the clone is only reachable on loopback. If safe activation is unresolved,
+  stop after validation/import and report application verification unperformed.
+- A verified pre-change backup and service-resumption check before significant
+  changes or any production interruption. Coordinate shared-lock contention with
+  existing jobs; do not disable either job or interrupt production implicitly.
+- Approval before configuration/security/permission changes, costs, mounting or
+  unlocking storage, deleting real exports/staged recovery copies or cleanup.
+  Retaining private artifacts is the default, not automatic pruning.
+
+No power-loss simulation, production volume deletion, Tailscale reset or backup
+history deletion is part of this drill. Record the exact revision/commands and
+sanitized actual results in #24, distinguishing procedure/default-fixture passes,
+real completed-copy retrieval and restored-application acceptance. All mandatory
+checks must pass before #21's trial; same-host recovery proves neither physical
+second-host/cross-architecture portability nor paid-feed/ReadKit acceptance.
+
 ## Safe cleanup
 
 For now, safe cleanup is **`uv run --locked rss stop`**. No VM/volume deletion,
@@ -492,6 +532,24 @@ This is source verification, not a new live session; see
   protection, or force supervision/start through a hold.
 - **Restore target/image refusal:** use a fresh target and exact reviewed matching
   image configuration. Failed imports stay unselected; choose another fresh name.
+- **HTTP ready but fresh login fails:** a 200 response can contain FreshRSS's
+  `Error during context user init!`. Readiness is not authenticated acceptance.
+  Compare source/clone effective default-user consistency against existing readable
+  user configurations without publishing names or changing credentials. Preserve
+  backups and seek owner approval before any correction; see the
+  [isolated recovery diagnostic safeguards](backup-restore.md#4-restore-and-deliberately-activate-only-isolated-owned-resources).
+  For a separately approved **production** default-user correction, first obtain
+  a fresh verified `rss backup` and confirm resumption. Identify the existing
+  readable user locally, serialize upstream `cli/reconfigure.php --default-user`
+  under the real command lock, and retain the matching image/port/forwarding/job
+  settings. Never create a replacement user or reset credentials. Check that the
+  existing user configuration is unchanged and that all other effective system
+  settings remain identical. Use normal guarded `rss start` with the original
+  captured settings, then check fresh-session login and have the owner authenticate
+  at the normal trusted production URL. Confirm the original container/data-volume
+  identity, intent and private forwarding, and the refreshed production security
+  audit. Keep the pre-repair archive; record its known defective setting instead
+  of treating verified archive bytes as proof of usable application configuration.
 - **Cold-start failure:** guarded recreation applies only when `start` itself
   starts a stopped owned VM and the existing app is matching, unchanged and stopped.
   A warm retry does not force recreation or bypass security/readiness errors.
