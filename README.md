@@ -278,10 +278,13 @@ Podman reset or directory sweep. `stop` retains data; `replace` retains its volu
 `remove-vm` defaults to inspection and requires explicit current-plan confirmation,
 removed captured jobs and a fresh independently validated external backup before
 VM deletion. Unbacked secrets, artifacts, pods, custom networks and build caches on
-either inspected engine block removal; only a verified stock network baseline is
-disposable. The audited automatic-removal gate currently requires guest Podman
-6.2.0/Netavark; other versions/backends retain the VM for owner review. Packages and
-archives remain. [Automatic VM removal supports only a project-only VM](docs/operations.md#safe-cleanup),
+either inspected engine block removal. Only a verified synthetic stock network
+baseline is disposable: the selected APIs, fresh local listings and unchanged stock
+service/configuration provenance must agree. The conservative gate requires guest
+Podman 6.2.0/Netavark, Python 3.11+ and Linux service/process inspection tools;
+custom, stale or unavailable proof retains the VM without repair or restart.
+See [prerequisites and safeguards](docs/operations.md#preview-and-remove-the-vm).
+Packages and archives remain. [Automatic VM removal supports only a project-only VM](docs/operations.md#safe-cleanup),
 as approved in issue #5. Establish exclusive project use before applying: a shared
 or repurposed guest, other users' engines, historical/alternate stores, or uncertainty
 means retain the VM and recover/migrate the project instead. Preview does not prove

@@ -330,23 +330,73 @@ cache names are inspected in the effective image-copy temp directory and stock
 `/var/tmp`/`/tmp`; no cache contents are read.
 
 The only disposable networks are verified *synthetic stock defaults*, listed under
-both engine contexts in preview targets. Require the full stock bridge configuration,
-fixed ID, subnet/gateway, disabled DNS/IPv6/internal flags and host-local IPAM, with
-no extra keys. Two independent local listings must show strictly increasing valid
-`created` timestamps: [Netavark 6.2.0](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
+both engine contexts in preview targets. `Cleanup._api` consistently targets the
+actual selected rootless connection or explicit rootful socket for both `info` and
+`network ls --format json`. Each API list and each of two fresh local lists must
+succeed without diagnostics and contain exactly the audited stock shape: `podman`,
+its fixed native ID, bridge/`podman0`, `10.88.0.0/16` with gateway `10.88.0.1`,
+disabled DNS/IPv6/internal flags and host-local IPAM, with no extra keys and a valid
+`created` timestamp. Shape equality alone is not provenance.
+
+`Cleanup._stock_network` uses a strict Python-3.10-compatible RFC3339Nano parser
+validating explicit timezones and calendar/offset fields, retaining the nine-digit
+fraction separately from whole seconds. Two independent **local** listings must
+show strictly increasing timestamps: [Netavark 6.2.0](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
 synthesizes an absent default with `time.Now()` per process, whereas a persisted
 replacement retains its timestamp even if it copies the name/ID/configuration.
-A strict Python-3.10-compatible RFC3339Nano parser validates explicit timezones and
-calendar/offset fields, retaining the nine-digit fraction separately from whole
-seconds. UTC `Z` and fractional precision are native contracts, not reasons to
-reject supported Python 3.10; neither truncation nor float conversion may collapse
-an increasing nanosecond pair into a persisted timestamp.
-Force guest `--log-level=warn` and reject every network warning too: the native
-loader can skip malformed/unreadable configuration files while reporting success,
-and configured logging must not suppress that evidence. This avoids guessing the effective
-network configuration directory. Other guest versions/backends, uncertain clocks,
-custom/persisted defaults and failed/malformed inspection retain the VM; there is
-no override to convert uncertainty into deletion authority.
+Neither truncation nor float conversion may collapse an increasing nanosecond pair.
+The API service caches its synthetic timestamp; a stable API timestamp is valid
+and is **not** required to advance or equal either local timestamp. API-only lists
+omit server-side loader warnings and cannot establish persisted-network provenance.
+Force guest-local `--log-level=warn` and reject every warning: the native loader can
+skip malformed/unreadable configuration files while reporting success.
+
+`Cleanup._network_context` sends the standalone `guest_network.py` helper to the
+guest before and after the actual API list plus both fresh local lists. The helper
+requires guest **Python 3.11+ with `tomllib`**, `systemctl` and readable Linux `/proc`;
+rootless execution runs inside native `podman unshare`, rootful via noninteractive
+sudo. The audited stock success profile requires all of the following:
+
+- `systemctl [--user] show podman.service` supplies `MainPID`; its executable is
+  `/usr/bin/podman` with exactly `/usr/bin/podman --log-level=info system service`
+  argv. Extra startup configuration/remote/storage selectors, modules or custom
+  network-directory flags are not accepted. Service/helper environment selectors
+  must also satisfy the stock selector restrictions, rather than trusting a matching
+  username.
+- The expected selected socket has exactly one listening row in `/proc/net/unix`.
+  That row's **kernel socket inode** must occur in the service process's file
+  descriptors; a filesystem socket inode alone is not listener ownership proof.
+  Service and helper must share filesystem root and mount, user and network
+  namespaces. Native rootless unshare supplies the required user/mount context.
+- Witness `containers.conf` and `storage.conf` main candidates in vendor
+  `/usr/share/containers`, system `/etc/containers` and the selected account's
+  `~/.config/containers`, plus their general, rootful/rootless and rootless-UID
+  drop-in candidates. Hash configuration files locally, include absent-path
+  witnesses and ancestor/directory metadata, and inspect the drop-in tree without
+  silent truncation. Reject unrecognized symlinks; the audited Fedora root-home
+  alias `/root` → `/var/roothome` is the sole exception. Reject TOML
+  `network.network_config_dir` overrides or `engine.env` values, matching native
+  case-insensitive TOML struct keys and refusing ambiguous aliases.
+- Require configuration witnesses' **ctime and mtime** to safely predate service
+  startup, with conservative two-second clearance and agreement between trusted
+  guest boot/start ticks and wall/boot clocks. Invalid/unavailable configuration,
+  fresh or backdated-but-recently-changed files and uncertain clocks refuse.
+  Recheck process start and file metadata while inspecting; the bracketing helper
+  records must match in both configuration fingerprint and service cookie
+  (PID/start ticks/listener inode).
+
+Only fingerprints and the helper protocol version leave the guest from this
+provenance inspection, never configuration payloads, raw names, argv, environment
+or native diagnostics. Configuration files are read/hashed locally; no Podman secret
+payload is requested. `Cleanup._guest_baseline` binds the stable configuration
+fingerprint into the compared engine identity and confirmation. The service cookie
+is only a bracketing guard: an idle stock service restart between complete
+inspections does not itself stale consent; a changed configuration fingerprint does.
+Unknown, custom, stale, changed or unavailable provenance retains the VM without
+restarting the service or correcting configuration. This deliberately conservative
+stock Podman 6.2.0/Netavark profile is not arbitrary service-equivalence detection,
+proof of all effective configuration, or atomic protection against independent
+native/root clients. No override converts uncertainty into deletion authority.
 
 These checks repeat at preview, apply admission and post-capture plan inspection.
 **Approved supported-use boundary:** issue #5 limits automated removal to a
@@ -381,7 +431,12 @@ The project lock does not serialize independent native clients. Successful idle
 inspection precedes VM stop and native `machine rm` with confirmation stdin. No
 old archive, `no_data`, force, global reset/prune or unavailable-source override
 permits deletion. Export/validation failure before deletion preserves source and
-prior archives; interrupted/partial removal retains maintenance for inspection.
+prior archives. The failure handler independently guards its fallback idle inspection:
+if that check also fails (including a post-export disconnect), retain the maintenance
+hold, source and archives and emit only fixed owner-inspection/guarded-reconciliation
+guidance, never the native exception. Clear the hold only after successful idle
+verification; uncertain idleness must not authorize resumption. Interrupted/partial
+removal retains maintenance for inspection.
 
 Private `removed-vm.json` version 1 records `status: removing`/`removed`, exact
 `owner`, `plan`, fresh `backup` and `foreign_connections` before native stop/rm.

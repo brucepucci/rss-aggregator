@@ -1,5 +1,6 @@
 """Destructive cleanup through the command boundary with disposable engines."""
 
+import hashlib
 import io
 import json
 import subprocess
@@ -142,6 +143,54 @@ def test_remove_vm_makes_fresh_backup_and_preserves_unrelated_state_and_repeats(
 
 
 @pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "source unavailable with sensitive diagnostics",
+        "https://synthetic.invalid/feed?token=synthetic-sensitive-token",
+    ],
+)
+def test_post_export_disconnect_retains_hold_and_sanitizes_fallback_failure(
+    project, diagnostic
+):
+    old = preview(project, "backup")
+    old_archive = Path(old["archive"]).read_bytes()
+    plan = preview(project, "remove-vm")
+    before = project.engine()
+    payload = Path(before["payload"]).read_bytes()
+    project.update(
+        guest_state_during_export={
+            "unresponsive": True,
+            "unresponsive_diagnostic": diagnostic,
+        }
+    )
+    result = project.run("remove-vm", "--confirm", plan["confirmation"])
+    assert result.returncode == 1 and result.stdout == ""
+    assert diagnostic not in result.stderr
+    assert "sensitive" not in result.stderr and "Traceback" not in result.stderr
+    assert "maintenance" in result.stderr and "backup-reconcile" in result.stderr
+    assert "Inspect locally" in result.stderr
+    after = project.engine()
+    assert after["machine"] == before["machine"]
+    assert after["volumes"] == before["volumes"]
+    assert Path(after["payload"]).read_bytes() == payload
+    assert Path(old["archive"]).read_bytes() == old_archive
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    hold = json.loads((project.state_dir / "maintenance.json").read_text())
+    assert hold["phase"] == "snapshot" and hold["owner"] == "fixture-owner"
+    locator = json.loads((project.state_dir / "last-backup.json").read_text())
+    assert locator["archive"] != old["archive"]
+    assert (
+        hashlib.sha256(Path(locator["archive"]).read_bytes()).hexdigest()
+        == locator["sha256"]
+    )
+    with zipfile.ZipFile(locator["archive"]) as archive:
+        assert archive.testzip() is None
+    assert not (project.state_dir / "removed-vm.json").exists()
+
+
+@pytest.mark.parametrize(
     "fault",
     [
         "fail_export",
@@ -189,6 +238,10 @@ def test_vm_removal_failures_preserve_all_resources_and_prior_archives(project, 
     assert after["volumes"] == before["volumes"]
     assert set(after["containers"]) == set(before["containers"])
     assert archive.read_bytes() == original
+    if fault == "fail_export":
+        # A successful fallback idle check still retires an ordinary failed
+        # export's hold; only uncertain idleness needs guarded reconciliation.
+        assert not (project.state_dir / "maintenance.json").exists()
     assert "sensitive" not in result.stdout + result.stderr
     assert not any(call[:2] == ["machine", "rm"] for call in after["calls"])
 

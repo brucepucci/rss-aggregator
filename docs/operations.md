@@ -510,13 +510,21 @@ ownership, current selected-service identity, confirmation or backup safeguard.
    merely because its name is familiar. Automatic removal currently requires
    **guest Podman 6.2.0, Netavark and non-transient storage**; other versions/backends,
    persisted/reconfigured default networks or inspection warnings retain the VM.
-   Stock defaults are verified in two independent local inspections; see the
-   [audited inventory boundary](architecture.md#preview-first-removal-and-generation-retirement).
-   Cleanup reads metadata only, never secret payloads or cache contents, and does
-   not report unrelated resource names. Even empty/stale secret databases or driver
-   remnants require separate review rather than trusting native empty-list output.
-   Retain the VM and arrange
-   separate owner-reviewed recovery/migration outside this workflow; do not delete
+   Both the actual selected rootless API and explicit rootful socket API must list
+   the exact stock network shape with valid timestamps and no diagnostics. Two
+   fresh **local** inspections must independently synthesize increasing `created`
+   timestamps; a stable API timestamp is normal because the service caches it.
+   API-only lists omit server loader warnings and persisted provenance, so they
+   cannot replace the local proof. Forced local warning output must be empty,
+   including warnings about skipped configuration files.
+   See the [audited inventory boundary](architecture.md#preview-first-removal-and-generation-retirement).
+   Cleanup never reads Podman secret payloads or cache contents and does not report
+   unrelated resource names. Its provenance helper reads/hashes configuration files
+   only inside the guest; config payloads, raw names, argv, environment and native
+   diagnostics do not leave that helper, only fingerprints. Even empty/stale secret
+   databases or driver remnants require separate review rather than trusting native
+   empty-list output. Retain the VM and arrange separate owner-reviewed
+   recovery/migration outside this workflow; do not delete
    unrelated resources merely to pass cleanup. Failed or malformed inspections also
    refuse, including the repeated inspection after capture. Inventories cover the
    reported matching local/API contexts and effective/stock build-cache paths.
@@ -525,6 +533,23 @@ ownership, current selected-service identity, confirmation or backup safeguard.
    socket service. Missing/mismatched/unavailable API identity retains the VM;
    do not reconfigure or erase a store merely to make inspection pass. The same
    identities are bound to consent and compared again after capture.
+   Network proof also requires guest **Python 3.11+ with `tomllib`**, `systemctl`,
+   readable Linux `/proc` and native `podman unshare` for rootless inspection, plus
+   noninteractive sudo for rootful inspection. The helper brackets the API/local
+   lists with same-service/process/socket-listener and namespace proof, exact stock
+   service argv and stable containers/storage configuration fingerprints. It checks
+   vendor/system/user main and drop-in candidates, absent paths and ancestors;
+   ctime/mtime must safely predate service startup under trusted boot/clock agreement.
+   Startup selectors, custom network-directory overrides, `engine.env` values,
+   unrecognized symlinks and unknown/custom/stale/changed/unavailable provenance
+   retain the VM. The audited Fedora `/root` → `/var/roothome` alias is accepted.
+   This intentionally conservative stock profile is not arbitrary service-equivalence
+   detection. Do not restart a service, rewrite config, install guest tools or erase
+   evidence merely to obtain deletion authority; cleanup makes no such repairs.
+   A configuration fingerprint change requires fresh preview/consent; a stock idle
+   service restart between complete inspections does not itself invalidate consent.
+   Service swaps **during** an inspection refuse. No check is atomic against
+   independent native/root clients: coordinate against concurrent mutations.
    VM-wide discovery of other users' engines or historical/alternate stores/cache
    locations is outside the approved project-only scope, **not permission to delete
    them**. Known or uncertain such use fails the supported-use precondition above:
@@ -565,6 +590,11 @@ ownership, current selected-service identity, confirmation or backup safeguard.
 Before deletion, failed backup/validation leaves source data and prior archives
 intact; writers/owned forwarding may already be stopped while the VM remains running.
 Fix the cause before a new preview/apply. Failure does not prove service is closed.
+If the source disconnects after export or the fallback idle inspection also fails,
+the fixed error retains the VM, source, archives and maintenance without exposing
+native diagnostics. Restore source access and inspect both engines locally before
+using guarded `backup-reconcile`; then obtain a new preview and fresh capture.
+Do not clear a hold based on an earlier archive or assume uncertain writers stopped.
 If writers resumed after capture, the VM/data and maintenance remain: inspect locally
 and use guarded `backup-reconcile` to establish idle engines, then preview/apply again
 for a **fresh quiesced capture including intervening changes**. Stopping the resumed

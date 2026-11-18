@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_backups import VOLUME, BackupProject
-from tests.test_cleanup import preview
+from tests.test_cleanup import preview, stock_network
 
 
 @pytest.fixture
@@ -54,6 +54,108 @@ def api_info(project, engine):
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "export"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "api_only_network",
+        "api_failure",
+        "api_malformed",
+        "api_warning",
+        "unproven_context",
+        "malformed_context",
+        "service_swap",
+    ],
+)
+def test_selected_api_networks_and_provenance_must_be_safe(
+    project, engine, stage, fault
+):
+    plan = preview(project, "remove-vm") if stage != "preview" else None
+    added = {}
+    if fault == "api_only_network":
+        custom = stock_network()
+        custom.update(name="sensitive-current-network", id="f" * 64)
+        added[engine + "_api_networks"] = [stock_network(), custom]
+    else:
+        key = {
+            "api_failure": "fail_api_network_inventory",
+            "api_malformed": "malformed_api_network_inventory",
+            "api_warning": "warn_api_network_inventory",
+            "unproven_context": "fail_network_context",
+            "malformed_context": "malformed_network_context",
+            "service_swap": "flap_network_service",
+        }[fault]
+        added[key] = engine
+    project.update(
+        **({"guest_state_during_export": added} if stage == "export" else added)
+    )
+    result = project.run(
+        "remove-vm", *(["--confirm", plan["confirmation"]] if plan else [])
+    )
+    assert result.returncode == 1 and result.stdout == "", result.stdout + result.stderr
+    assert "sensitive" not in result.stderr and "Traceback" not in result.stderr
+    after = project.engine()
+    assert all(after[key] == value for key, value in added.items())
+    assert after["machine"]["State"] == "running" and VOLUME in after["volumes"]
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    if stage == "export":
+        locator = json.loads((project.state_dir / "last-backup.json").read_text())
+        assert Path(locator["archive"]).is_file()
+    else:
+        assert not project.backups.exists()
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+def test_network_configuration_fingerprint_binds_consent_not_idle_service_pid(
+    project, engine
+):
+    plan = preview(project, "remove-vm")
+    project.update(**{engine + "_network_service": "b" * 64})
+    assert preview(project, "remove-vm")["confirmation"] == plan["confirmation"]
+    project.update(**{engine + "_network_fingerprint": "a" * 64})
+    assert preview(project, "remove-vm")["confirmation"] != plan["confirmation"]
+    assert project.run("remove-vm", "--confirm", plan["confirmation"]).returncode == 1
+    assert not project.backups.exists()
+
+
+def test_both_actual_apis_are_listed_without_requiring_cached_time_to_advance(project):
+    plan = preview(project, "remove-vm")
+    assert preview(project, "remove-vm")["confirmation"] == plan["confirmation"]
+    calls = project.engine()["calls"]
+    rootless = ["--connection", "rss-aggregator", "network", "ls", "--format", "json"]
+    rootful = [
+        "machine",
+        "ssh",
+        "--username",
+        "core",
+        "rss-aggregator",
+        "sudo",
+        "-n",
+        "--",
+        "podman",
+        "--log-level=warn",
+        "--remote",
+        "--url",
+        "unix:///run/podman/podman.sock",
+        "network",
+        "ls",
+        "--format",
+        "json",
+    ]
+    assert calls.count(rootless) == calls.count(rootful) == 2
+    for engine in ("rootless", "rootful"):
+        assert (
+            sum(
+                "python3" in call and ("sudo" in call) == (engine == "rootful")
+                for call in calls
+            )
+            == 4
+        )
 
 
 @pytest.mark.parametrize("engine", ["rootless", "rootful"])

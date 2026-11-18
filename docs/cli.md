@@ -92,13 +92,51 @@ See the [enforcement limits](architecture.md#preview-first-removal-and-generatio
 
 | Command | Purpose, prerequisites and failure behavior | JSON result |
 | --- | --- | --- |
-| `rss remove-vm [--confirm SHA256]` | Preview exact owned VM, connections, labelled app/preflight containers, selected volume and pinned images. Requires removed supervision/daily jobs, accessible running owned VM, exactly the selected owned volume, no other rootless containers/images, and no rootful containers/volumes/images. Both inventories include external/build containers and intermediate images. Both engines must have no secrets, artifacts, pods, build-cache directories or custom networks. Typed storage/backend identities must match between guest-local inspection and the actual selected rootless API service plus explicit rootful socket API; missing/unavailable/mismatching identities refuse, and the identities are bound to confirmation and rechecked after capture. Matching usernames alone never establishes the selected store. Explicit guest-user SSH with local-mode/privilege attestation runs `podman --log-level=warn --remote=false secret ls --quiet` (rootful via noninteractive sudo), never the error-swallowing secret tunnel; success requires exactly empty stdout and no diagnostics. Metadata-only artifact/pod quiet lists and cache/secret-storage name checks also fail closed. Secret metadata/driver remnants, even an empty old secret database, retain the VM for owner review. The audited gate requires guest Podman **6.2.0**, Netavark and non-transient storage. Two independent local network listings must prove the exact freshly synthesized stock baseline, not just a familiar name/ID; persisted replacements, changed defaults, warnings or malformed metadata refuse. No unrelated names or secret payloads are exposed. Validates derived root connection and preserves foreign identities/defaults; refuses a project default among other connections. Requires explicit private external `RSS_BACKUP_DIR`. Apply repeats inspection, quiesces through existing lifecycle/owned-forwarding guards, creates and independently validates a **fresh full** archive, rechecks the plan and both engines' idle state immediately before stopping the VM, then invokes native `machine rm` with confirmation stdin, never force/reset/prune. Missing source, old backup or `no_data` cannot authorize deletion. | Preview: `preview: true`, `targets` (`machine`, `connections`, `containers`, `volumes`, `images`, `networks: {rootless, rootful}`), `ownership`, `backup_directory`, `backup_required`, `packages`, `retained`, `confirmation`. Success: `preview: false`, `removed: true`, `targets`, fresh `backup`, `retained`. Fully absent VM/connections: `machine`, `status: "absent"`, `preview: true`, no wider cleanup. |
+| `rss remove-vm [--confirm SHA256]` | Preview exact owned VM, connections, labelled app/preflight containers, selected volume and pinned images. Requires removed supervision/daily jobs, accessible running owned VM, exactly the selected owned volume, no other rootless containers/images, and no rootful containers/volumes/images. Both inventories include external/build containers and intermediate images. Both engines must have no secrets, artifacts, pods, build-cache directories or custom networks. Typed storage/backend identities must match between guest-local inspection and the actual selected rootless API service plus explicit rootful socket API; missing/unavailable/mismatching identities refuse, and the identities are bound to confirmation and rechecked after capture. Matching usernames alone never establishes the selected store. Explicit guest-user SSH with local-mode/privilege attestation runs `podman --log-level=warn --remote=false secret ls --quiet` (rootful via noninteractive sudo), never the error-swallowing secret tunnel; success requires exactly empty stdout and no diagnostics. Metadata-only artifact/pod quiet lists and cache/secret-storage name checks also fail closed. Secret metadata/driver remnants, even an empty old secret database, retain the VM for owner review. The audited gate requires guest Podman **6.2.0**, Netavark and non-transient storage. The actual selected rootless API and explicit rootful socket API must each list the exact stock network shape with valid time and diagnostic-free success. API results alone cannot prove provenance: bracketing guest helper proof and two fresh local listings are also required, as detailed below. Persisted replacements, custom/stale/changed/unavailable provenance, warnings or malformed metadata refuse. No unrelated names or secret payloads are exposed. Validates derived root connection and preserves foreign identities/defaults; refuses a project default among other connections. Requires explicit private external `RSS_BACKUP_DIR`. Apply repeats inspection, quiesces through existing lifecycle/owned-forwarding guards, creates and independently validates a **fresh full** archive, rechecks the plan and both engines' idle state immediately before stopping the VM, then invokes native `machine rm` with confirmation stdin, never force/reset/prune. Missing source, old backup or `no_data` cannot authorize deletion. | Preview: `preview: true`, `targets` (`machine`, `connections`, `containers`, `volumes`, `images`, `networks: {rootless, rootful}`), `ownership`, `backup_directory`, `backup_required`, `packages`, `retained`, `confirmation`. Success: `preview: false`, `removed: true`, `targets`, fresh `backup`, `retained`. Fully absent VM/connections: `machine`, `status: "absent"`, `preview: true`, no wider cleanup. |
 | `rss delete-volume NAME [--confirm SHA256]` | Separate irreversible deletion of one explicit owner-labelled **unselected** volume on the running owned VM. Requires zero `MountCount` and no attachment to any container, even stopped. No automatic backup. Rechecks before native nonforce `volume rm`; all other resources/backups remain. Selected, mounted, attached, foreign or changed targets refuse. | Preview: `preview: true`, `volume`, `ownership`, `irreversible: true`, `backup_created: false`, `retained`, `confirmation`. Success adds `deleted: true`, sets `preview: false`. Already absent: `preview: true`, `volume`, `status: "absent"`. |
 | `rss remove-package NAME [--confirm SHA256] [--unused-elsewhere]` | Preview one plain Homebrew formula. Fresh baseline/additions/version, recursive installed reverse dependencies (formulae and casks, including optional/build/test) and all Podman machine/connection inventories determine retention. Apply to an installed candidate requires both current digest and per-candidate unused-elsewhere attestation. Pre-existing, unknown, upgraded, shared or externally adopted packages must remain. Uses normal `brew uninstall --formula NAME` with native dependent checks enabled and `HOMEBREW_NO_AUTOREMOVE=1` forced in the subprocess regardless of inherited settings; no force/ignore-dependencies/autoremove/cleanup. Inspection/native refusal fails closed. Remove Podman first, then preview each remaining addition afresh. | `preview`, `status` (`"preview"`, `"absent"`, `"removed"`), `targets: {package, version}`, `ownership: {baseline, addition, recorded_version, version_matches}`, `dependents`, `retain` (reasons), `confirmation`. Ineligible candidates can still return a successful preview with nonempty `retain`; this is not permission to uninstall. |
 
+**VM network proof and prerequisites.**
+
+`remove-vm` additionally requires guest **Python 3.11+ with `tomllib`**, `systemctl`,
+readable Linux `/proc`, native `podman unshare` for rootless inspection and
+noninteractive sudo for rootful inspection. These are inspection prerequisites,
+not host Python changes or new CLI flags/settings; cleanup does not install them.
+The supported success profile is the audited stock Podman 6.2.0/Netavark service,
+not every theoretically equivalent custom service.
+
+Both APIs and both fresh local `network ls --format json` results must contain
+exactly the stock bridge shape with valid RFC3339Nano `created`, with no diagnostics
+or extra fields. Only the **local** timestamps must strictly increase. The API
+service caches synthetic timestamps, so a stable API timestamp is accepted; it
+need not match the local values. API-only lists omit server loader warnings and
+persisted-network provenance. Local commands force `--log-level=warn`; any warning
+refuses even when native exit status is zero.
+
+Before/after those listings, the guest helper must prove the same stock systemd
+service process owns the actual selected socket listener, shares the helper's
+filesystem root and mount/user/network namespaces, and has unchanged configuration
+fingerprints. It requires exact native stock service argv, rejects startup
+configuration/remote/storage/module/custom-network selectors and unsupported
+environment selectors, and inspects vendor/system/user main containers/storage
+configuration and applicable drop-in candidates, including absent paths/ancestors.
+Files are hashed **inside the guest**; ctime/mtime must safely predate service startup
+with trusted boot/clock agreement. Unrecognized symlinks, network-directory overrides
+or `engine.env` values refuse; the audited Fedora `/root` → `/var/roothome` alias is
+accepted. Only fingerprints leave this provenance helper, not config payloads, raw
+names, argv, environment or diagnostics; it never reads Podman secret payloads.
+Unknown/custom/stale/changed/unavailable proof fails exit 1 with no result JSON and
+retains the VM; there is no service restart, corrective mutation or bypass. These
+checks repeat at preview, apply admission and post-capture. They do not serialize
+independent native/root clients or establish every effective configuration input.
+See the [deep algorithm](architecture.md#preview-first-removal-and-generation-retirement).
+
 `confirmation` is a SHA-256 digest of the current plan/private evidence, not a
 password or reusable blanket consent. VM consent binds ownership, native resource
-and image identity, directory and connection/default inventories. Package consent
+and image identity, directory and connection/default inventories, plus the guest
+network configuration fingerprint. A changed fingerprint stales consent. The
+service PID/start/listener cookie is only a bracketing guard; an idle stock service
+restart between complete inspections does not itself stale consent. Package consent
 also binds baseline/additions, current installed version/dependents and executable
 and Podman identities. For present targets, a stale/invalid digest fails with exit 1
 and no JSON; obtain and review a new preview rather than retrying an old digest.
@@ -111,7 +149,12 @@ cannot establish.
 All normal success/usage/failure stream and exit conventions above apply.
 
 VM export/validation failure before deletion retains source data and prior archives;
-writers may already be stopped while the VM runs. A resumed writer or failed final
+writers may already be stopped while the VM runs. If the fallback idle inspection
+also fails (for example, a post-export disconnect), exit 1 with no result JSON and
+only fixed owner-inspection/guarded-reconciliation guidance; preserve the source,
+archives and maintenance rather than exposing native diagnostics or clearing an
+uncertain hold. Restore source access and establish idle engines before guarded
+reconciliation and a new preview/fresh capture. A resumed writer or failed final
 idle-engine inspection refuses before VM stop/removal and retains maintenance;
 it does not stop that writer and reuse the earlier capture. Inspect and reconcile,
 then obtain a new preview and fresh quiesced capture before retrying removal.

@@ -50,7 +50,7 @@ class BackupProject:
         }
         connection = {
             "Name": "rss-aggregator",
-            "URI": "ssh://core@fixture",
+            "URI": "ssh://core@fixture/run/user/1000/podman/podman.sock",
             "Identity": "/fixture/key",
         }
         owner = {"token": "fixture-owner", "machine": machine, "connection": connection}

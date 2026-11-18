@@ -1,5 +1,6 @@
 """Stateful external Podman substitute for backup command-boundary tests."""
 
+import hashlib
 import io
 import json
 import os
@@ -96,7 +97,30 @@ def engine_info(engine, remote=False):
     return state.get(engine + ("_api_info" if remote else "_info"), info)
 
 
-def list_networks(engine):
+def network_context(engine):
+    if state.get("fail_network_context") == engine:
+        fail("sensitive service network provenance diagnostic")
+    if state.get("malformed_network_context") == engine:
+        print(json.dumps({"sensitive": "invalid context"}))
+        return
+    fingerprint = state.get(
+        engine + "_network_fingerprint", hashlib.sha256(engine.encode()).hexdigest()
+    )
+    service = state.get(
+        engine + "_network_service",
+        hashlib.sha256((engine + "service").encode()).hexdigest(),
+    )
+    if state.get("flap_network_service") == engine:
+        reads = sum(
+            "python3" in call
+            for call in state["calls"]
+            if ("sudo" in call) == (engine == "rootful")
+        )
+        service = hashlib.sha256(str(reads).encode()).hexdigest()
+    print(json.dumps({"version": 1, "fingerprint": fingerprint, "service": service}))
+
+
+def list_networks(engine, remote=False):
     # Native v6.2.0 synthesizes an absent default anew per local process;
     # a persisted replacement's Created field remains stable across calls.
     network = {
@@ -113,10 +137,30 @@ def list_networks(engine):
         "dns_enabled": False,
         "ipam_options": {"driver": "host-local"},
     }
+    if remote:
+        # The service caches its synthetic timestamp, unlike fresh local engines.
+        network["created"] = "2026-01-01T00:00:00.123456789Z"
+        if state.get("fail_api_network_inventory") == engine:
+            fail("sensitive API network diagnostic")
+        if state.get("warn_api_network_inventory") == engine:
+            sys.stderr.write("sensitive API network client diagnostic")
+        if state.get("malformed_api_network_inventory") == engine:
+            print(json.dumps({"sensitive": "invalid API network metadata"}))
+        else:
+            print(
+                json.dumps(
+                    state.get(
+                        engine + "_api_networks",
+                        guest_records(engine, "networks", [network]),
+                    )
+                )
+            )
+        return
     times = state.get("network_creation_times", {}).get(engine)
     if times:
         reads = sum(
             call[-4:] == ["network", "ls", "--format", "json"]
+            and "--remote=false" in call
             and ("sudo" in call) == (engine == "rootful")
             for call in state["calls"]
         )
@@ -186,7 +230,7 @@ elif args[:2] == ["machine", "init"]:
     }
     state["connection"] = {
         "Name": "rss-aggregator",
-        "URI": "ssh://core@new-fixture",
+        "URI": "ssh://core@new-fixture/run/user/1000/podman/podman.sock",
         "Identity": "/new-fixture/key",
     }
     save()
@@ -216,6 +260,8 @@ elif args == ["machine", "rm", "rss-aggregator"]:
         "secret_payloads",
         "rootful_secret_payloads",
         "selected_api_secrets",
+        "rootless_api_networks",
+        "rootful_api_networks",
         "artifacts",
         "rootful_artifacts",
         "networks",
@@ -236,7 +282,12 @@ elif args == ["machine", "rm", "rss-aggregator"]:
     save()
 elif args[:2] == ["machine", "ssh"]:
     if machine["State"] != "running" or state.get("unresponsive"):
-        fail("source unavailable with sensitive diagnostics")
+        fail(
+            state.get(
+                "unresponsive_diagnostic",
+                "source unavailable with sensitive diagnostics",
+            )
+        )
     if args[2:4] == ["--username", "core"]:
         assert args[4] == "rss-aggregator"
         command = args[5:]
@@ -250,6 +301,10 @@ elif args[:2] == ["machine", "ssh"]:
     command = shlex.split(" ".join(command))
     if command[:2] == ["podman", "--log-level=warn"]:
         command = ["podman", *command[2:]]
+    if "python3" in command and "-c" in command:
+        assert "Bind API network inspection" in command[command.index("-c") + 1]
+        network_context(engine)
+        raise SystemExit(0)
     if command[:1] == ["find"]:
         assert command[1] == "-H"
         if command[-4:] == ["-name", "buildah-cache-*", "-print", "-quit"]:
@@ -271,6 +326,19 @@ elif args[:2] == ["machine", "ssh"]:
         if command[2:] == ["pod", "ps", "--quiet"]:
             list_guest_quiet(engine, "pods")
             raise SystemExit(0)
+    if command == [
+        "podman",
+        "--remote",
+        "--url",
+        "unix:///run/podman/podman.sock",
+        "network",
+        "ls",
+        "--format",
+        "json",
+    ]:
+        assert rootful
+        list_networks(engine, remote=True)
+        raise SystemExit(0)
     if command == [
         "podman",
         "--remote",
@@ -313,6 +381,8 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     args = args[2:]
     if args == ["info", "--format", "json"]:
         print(json.dumps(engine_info("rootless", remote=True)))
+    elif args == ["network", "ls", "--format", "json"]:
+        list_networks("rootless", remote=True)
     elif args == ["secret", "ls", "--format", "json"]:
         list_secrets("rootless")
     elif args[0] == "ps":

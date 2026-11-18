@@ -65,6 +65,7 @@ class Cleanup:
         self.machine, self.app, self.check = MACHINE, APP, CHECK
         self.failure = RuntimeFailure
         self.guest_user = ""
+        self.api_socket = ""
 
     def _json(
         self, *args: str, object_result: bool = False, quiet: bool = False
@@ -189,9 +190,9 @@ class Cleanup:
                 "Unbacked guest resources or malformed metadata; VM removal refused. Retain the VM for separate owner-reviewed recovery."
             )
 
-    def _api_context(self, rootful: bool, local: dict[str, Any]) -> dict[str, Any]:
-        """Refuse absent or unequal storage identities on the actual API service."""
-        args = (
+    def _api(self, rootful: bool, *args: str) -> tuple[str, ...]:
+        """Target the selected rootless or explicit rootful socket API consistently."""
+        return (
             self._guest(
                 True,
                 "podman",
@@ -199,15 +200,20 @@ class Cleanup:
                 "--remote",
                 "--url",
                 "unix:///run/podman/podman.sock",
-                "info",
-                "--format",
-                "json",
+                *args,
                 native=False,
             )
             if rootful
-            else ("--connection", self.machine, "info", "--format", "json")
+            else ("--connection", self.machine, *args)
         )
-        remote = self._json(*args, object_result=True, quiet=True)
+
+    def _api_context(self, rootful: bool, local: dict[str, Any]) -> dict[str, Any]:
+        """Refuse absent or unequal storage identities on the actual API service."""
+        remote = self._json(
+            *self._api(rootful, "info", "--format", "json"),
+            object_result=True,
+            quiet=True,
+        )
         identities = []
         for info, is_remote in ((local, False), (remote, True)):
             host, store, version = (
@@ -277,8 +283,72 @@ class Cleanup:
             )
         return identities[0]
 
+    def _network_context(
+        self, rootful: bool, identity: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Bind local network proof to the actual stock service's effective context."""
+        from rss_aggregator import guest_network
+
+        socket = "/run/podman/podman.sock" if rootful else self.api_socket
+        if (
+            not rootful
+            and re.fullmatch(r"/run/user/[0-9]+/podman/podman\.sock", socket) is None
+        ):
+            raise self.failure("Unverifiable API network endpoint; resources retained.")
+        source = Path(guest_network.__file__).read_text()
+        engine = (
+            ()
+            if rootful
+            else ("podman", "--log-level=warn", "--remote=false", "unshare")
+        )
+        record = self._json(
+            *self._guest(
+                rootful,
+                *engine,
+                "python3",
+                "-c",
+                source,
+                "rootful" if rootful else "rootless",
+                socket,
+                identity["store"]["graphRoot"],
+                identity["store"]["runRoot"],
+                native=False,
+            ),
+            object_result=True,
+            quiet=True,
+        )
+        if (
+            set(record) != {"version", "fingerprint", "service"}
+            or type(record["version"]) is not int
+            or record["version"] != 1
+            or any(
+                not isinstance(record[key], str)
+                or re.fullmatch("[0-9a-f]{64}", record[key]) is None
+                for key in ("fingerprint", "service")
+            )
+        ):
+            raise self.failure("Unverifiable API network context; resources retained.")
+        return record
+
+    def _stock_network(self, networks: list[dict[str, Any]]) -> tuple[datetime, int]:
+        """Validate full stock shape and time, never infer persistence from API time."""
+        if len(networks) != 1:
+            raise self.failure("Unrelated networks exist; VM removal refused.")
+        network = networks[0].copy()
+        timestamp = network.pop("created", None)
+        if json.dumps(network, sort_keys=True) != json.dumps(
+            STOCK_NETWORK, sort_keys=True
+        ) or not isinstance(timestamp, str):
+            raise self.failure("Unverified network baseline; VM removal refused.")
+        try:
+            return _network_time(timestamp)
+        except ValueError:
+            raise self.failure(
+                "Malformed network metadata; resources retained."
+            ) from None
+
     def _guest_baseline(self, rootful: bool) -> tuple[str, dict[str, Any]]:
-        """Verify local/API storage identities and the synthetic network baseline."""
+        """Verify selected API resources and equivalent fresh-local network proof."""
         info = self._json(
             *self._guest(rootful, "info", "--format", "json"),
             object_result=True,
@@ -326,6 +396,12 @@ class Cleanup:
                 "-quit",
                 native=False,
             )
+        before = self._network_context(rootful, identity)
+        self._stock_network(
+            self._json(
+                *self._api(rootful, "network", "ls", "--format", "json"), quiet=True
+            )
+        )
         created = []
         # v6.2.0 Netavark synthesizes its absent stock default with time.Now()
         # per local process. Persisted replacements retain Created, even with
@@ -335,25 +411,14 @@ class Cleanup:
                 *self._guest(rootful, "network", "ls", "--format", "json"),
                 quiet=True,
             )
-            if len(networks) != 1:
-                raise self.failure("Unrelated networks exist; VM removal refused.")
-            network = networks[0].copy()
-            timestamp = network.pop("created", None)
-            if json.dumps(network, sort_keys=True) != json.dumps(
-                STOCK_NETWORK, sort_keys=True
-            ) or not isinstance(timestamp, str):
-                raise self.failure("Unverified network baseline; VM removal refused.")
-            try:
-                moment = _network_time(timestamp)
-            except ValueError:
-                raise self.failure(
-                    "Malformed network metadata; resources retained."
-                ) from None
-            created.append(moment)
+            created.append(self._stock_network(networks))
         if created[1] <= created[0]:
             raise self.failure(
                 "Persisted or unverified default network; VM removal refused."
             )
+        if self._network_context(rootful, identity) != before:
+            raise self.failure("API network context changed; VM removal refused.")
+        identity["network_context"] = before["fingerprint"]
         return store["graphRoot"], identity
 
     def _resources(self, owner: dict[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -371,6 +436,7 @@ class Cleanup:
                 "Unverified rootless guest identity; resources retained."
             )
         self.guest_user = username
+        self.api_socket = urlsplit(owner["connection"]["URI"]).path
         contexts = {rootful: self._guest_baseline(rootful) for rootful in (True, False)}
         for args in (
             ("ps", "--all", "--external"),
@@ -588,7 +654,12 @@ class Cleanup:
         except Exception:
             # A completed failed export has released its inherited lease. Abrupt
             # parent death instead leaves both the lease and durable hold intact.
-            recovery._engines_idle(owner, stop=False)
+            try:
+                recovery._engines_idle(owner, stop=False)
+            except Exception:
+                raise self.failure(
+                    "VM removal backup/inspection failed and idleness could not be verified; VM, data, archives and maintenance retained. Inspect locally, use guarded backup-reconcile only after the source is accessible and both engines are idle, then obtain a new preview and fresh quiesced capture before removal."
+                ) from None
             maintenance.finish()
             raise self.failure(
                 "VM removal backup/inspection failed; no resources deleted. Writers remain stopped, VM remains running, prior archives retained. Inspect locally and retry."

@@ -561,7 +561,7 @@ Issue #5 uses the existing public CLI/`Runtime.run` seam and default test workfl
 not private-helper acceptance or a separate test entrypoint:
 
 ```sh
-uv run --locked pytest tests/test_cleanup.py tests/test_cleanup_context.py tests/test_package_cleanup.py
+uv run --locked pytest tests/test_cleanup.py tests/test_cleanup_context.py tests/test_guest_network.py tests/test_package_cleanup.py
 uv run --locked rss-dev check
 ```
 
@@ -573,7 +573,7 @@ project dependencies; do not emulate its parser under a newer interpreter:
 PYTHON310=/absolute/path/to/python3.10
 MIN_ENV="$(mktemp -d)/venv"
 UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv sync --locked --python "$PYTHON310"
-UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv run --locked --python "$PYTHON310" pytest tests/test_cleanup_context.py
+UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv run --locked --python "$PYTHON310" pytest tests/test_cleanup_context.py tests/test_guest_network.py
 ```
 
 This does not replace the full default check or establish a complete 3.10 test
@@ -581,6 +581,13 @@ matrix. The controlled executable emits Go-shaped RFC3339Nano (`Z` and nine-digi
 fractions) and itself remains Python-3.10-compatible. Cover zero/one/six/nine-digit
 fractions, numeric offsets, invalid/naive timestamps and exact nanosecond ordering;
 whole-second plus integer-fraction comparison must retain persisted-network refusal.
+This is the **host** parser compatibility contract. The standalone provenance helper
+runs in the Linux **guest** and requires Python 3.11+ with `tomllib`, `systemctl`,
+readable `/proc`, noninteractive sudo for rootful execution and native `podman unshare`
+for rootless execution. It does not raise the host package's Python minimum or add a
+runtime flag/setting. Missing guest prerequisites must refuse, never trigger repair
+or a service restart. The audited native success profile is the stock Podman
+6.2.0/Netavark guest, not arbitrary customized systemd/Podman service equivalence.
 
 Deterministic regressions use private temporary state/destinations, synthetic
 archives and controlled Podman/Homebrew executables; they do not remove a real VM,
@@ -621,13 +628,21 @@ uninstall host packages or consume production data. Maintain coverage for:
 - Network success must require the complete audited stock default, not name/ID.
   Assert refusal for custom subnets, persisted stock-shaped replacements, extra or
   wrongly typed fields, invalid timestamps and warnings from skipped config files.
+  Model selected rootless/rootful **API and local network inventories separately**:
+  a custom API network must refuse even when local lists look stock, at preview,
+  apply admission and post-export inspection, without deleting source/sentinels or
+  prior archives. API failure, malformed shape/time and diagnostics must also refuse.
   Two independent *local* listings must synthesize increasing `created` timestamps;
-  persisted configuration retains its timestamp. Force guest `--log-level=warn` so
-  configuration cannot hide loader warnings. Supported gate: guest Podman 6.2.0,
-  Netavark and non-transient storage; refuse unknown versions/backends/mode/storage.
-  Keep the fixture's dynamic creation distinct from persisted replacement metadata.
+  persisted configuration retains its timestamp. Accept a stable valid **API**
+  timestamp: the service caches its synthetic default, so advancement is not an API
+  requirement. Force guest `--log-level=warn` so configuration cannot hide local
+  loader warnings; remote success cannot substitute for missing server warnings.
+  Supported gate: guest Podman 6.2.0, Netavark and non-transient storage; refuse
+  unknown versions/backends/mode/storage. Keep the fixture's dynamic local creation
+  distinct from persisted replacement and cached API metadata.
   [Native synthesis/loading behavior](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
-  is source-verified, not a live guest acceptance result. Inventories cover current
+  explains the contract; fixture passes do not prove native guest provenance.
+  Inventories cover current
   engine contexts/current and stock cache paths. Issue #5's approved scope requires
   an operator-established **project-only VM**: shared/repurposed guests, other
   users' engines, historical/alternate stores/cache locations and uncertainty mean
@@ -645,10 +660,34 @@ uninstall host packages or consume production data. Maintain coverage for:
   Bind the compared identities to confirmation. Never normalize remote secret
   errors to absence. `info` comparison covers exposed identity fields, not all
   effective service configuration; a same-user match is not storage identity.
+- Bracketing provenance must bind the actual selected listener to systemd MainPID,
+  exact stock executable/argv, its kernel socket inode in process FDs, matching
+  root/mount/user/network namespaces and a stable configuration fingerprint. Cover
+  missing/unavailable helper proof, service/PID/start/listener swaps during the
+  API-plus-two-local-list window and configuration changes. A changed config
+  fingerprint must stale consent; an idle stock-service restart between complete
+  inspections must not do so merely because its PID/start cookie changed. Refusal
+  must leave VM/data intact at preview, apply and post-export, with no corrective
+  mutation or restart. Use synthetic config/name/argv/env/diagnostic sentinels to
+  assert only fingerprints leave the helper; no Podman secret payload reads.
+  Helper controls also need native scrutiny: config main/drop-in candidates and
+  absent-path/ancestor witnesses, startup/environment selectors, custom network
+  directories, `engine.env` (including native case-insensitive TOML table/key aliases),
+  symlinks, config ctime/mtime predating startup and trusted
+  boot/clock agreement. The audited Fedora root-home alias is an allowed exception,
+  not permission to resolve arbitrary symlinks. Substituted helper responses at the
+  public command boundary alone cannot prove these Linux/systemd checks.
 - Fresh export plus independent archive/checksum validation before VM deletion,
   backup/inspection/stop/rm failures, unavailable/absent/partially initialized
   sources, resources arriving during export, prior archive preservation and no
   force/reset/prune. A previous archive or `no_data` never permits removal.
+- Disconnect the source immediately after export so both post-capture inspection
+  and the fallback idle check fail. Assert nonzero exit/empty stdout, fixed
+  owner-inspection and guarded `backup-reconcile` guidance, and no raw native
+  diagnostic (use only synthetic URL/token sentinels). Source bytes, prior and
+  newly verified archive bytes, the owned maintenance hold and running VM must
+  survive without native stop/rm or a removal receipt. Unknown idleness must not
+  clear the hold; an idle fallback may still retire it after an ordinary failure.
 - Resume the unchanged owned writer after export copies its bytes and during the
   final connection inventory (the third post-export connection read: `_vm_plan`
   reads once directly and once through `_owner`). Assert the native-call trace
@@ -681,6 +720,17 @@ uninstall host packages or consume production data. Maintain coverage for:
   settings: both baseline and unconfirmed project-dependency sentinels must survive.
   Native dependent checks must still reject late adoption. Removing Podman first
   does not authorize a dependency sweep.
+
+Native provenance verification is a separate, **read-only** check of the actual
+`Cleanup._guest_baseline` and unmodified guest helper on both rootless and rootful
+engines of a new disposable stock Podman 6.2.0/Netavark guest. Verify exact helper
+success plus custom-network-directory, persisted-default and skipped-loader-warning
+refusals with synthetic fixtures, preserving source/evidence. No secret payloads or
+real credentials are needed. Record exact commands, revision and performed/unrun
+positive and negative cases in the issue/PR, not as permanent branch-status claims
+here. A successful native baseline proof is not VM removal, FreshRSS recovery or
+atomic protection against independent native/root clients; it does not establish
+all effective configuration inputs. The project-only VM policy remains mandatory.
 
 **Not established by these deterministic checks:** actual disposable VM
 remove/recreate/restore with authenticated original user, subscriptions, article
