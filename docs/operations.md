@@ -507,9 +507,12 @@ Keep preview output private: it contains local identities/paths, not backup cont
    **only owned** forwarding through existing lifecycle guards. It creates a fresh
    full external archive, independently checks whole-file SHA-256 and archive content,
    then rechecks the removal plan. An older good archive or `no_data` never substitutes
-   for this capture. Finally it stops the VM and runs native `machine rm` with
+   for this capture. Immediately before VM shutdown it checks both engines are still
+   idle; a detected resumed writer or failed idle inspection refuses shutdown/removal
+   and retains maintenance. Finally it stops the VM and runs native `machine rm` with
    confirmation stdin, never `--force`, global reset or prune. A changed plan requires
-   a newly reviewed preview; no digest authorizes future changes.
+   a newly reviewed preview; no digest authorizes future changes. Do not run independent
+   native writer/Podman commands concurrently: the project lock does not serialize them.
 5. Retain the successful `backup` result/archive and private `removed-vm.json` receipt.
    Confirm exact targets absent and foreign connections/defaults unchanged. Homebrew,
    Tailscale itself/unrelated services, archives, checkout and audit records remain.
@@ -522,6 +525,11 @@ Keep preview output private: it contains local identities/paths, not backup cont
 Before deletion, failed backup/validation leaves source data and prior archives
 intact; writers/owned forwarding may already be stopped while the VM remains running.
 Fix the cause before a new preview/apply. Failure does not prove service is closed.
+If writers resumed after capture, the VM/data and maintenance remain: inspect locally
+and use guarded `backup-reconcile` to establish idle engines, then preview/apply again
+for a **fresh quiesced capture including intervening changes**. Stopping the resumed
+writer does not make the earlier archive sufficient to authorize deletion; do not
+reuse it or remove the maintenance marker by hand.
 Native exports can outlive Python while retaining `command.lock`; never unlink the
 lock or kill real helpers to bypass it. Interrupted or partial removal keeps durable
 maintenance and receipt evidence. Inspect `rss status`, `rss backup-status`, native

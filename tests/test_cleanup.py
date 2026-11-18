@@ -1,6 +1,9 @@
 """Destructive cleanup through the command boundary with disposable engines."""
 
+import io
 import json
+import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -416,6 +419,66 @@ def test_vm_removal_refuses_resources_added_during_export(project):
     assert project.engine()["machine"] is not None
     assert "appeared-during-export" in project.engine()["volumes"]
     assert (project.state_dir / "last-backup.json").exists()
+
+
+@pytest.mark.parametrize("stage", ["export", "final_inventory"])
+def test_vm_removal_refuses_resumed_writer_and_preserves_post_capture_data(
+    project, stage
+):
+    plan = preview(project, "remove-vm")
+    before = project.engine()
+    project.update(resume_writer_at=stage)
+    result = project.run("remove-vm", "--confirm", plan["confirmation"])
+    after = project.engine()
+    assert after["writer_resumed"] is True
+    with tarfile.open(after["payload"]) as source:
+        assert source.extractfile("users/alice/post-capture.txt").read() == (
+            b"synthetic post-capture change"
+        )
+    locator = json.loads((project.state_dir / "last-backup.json").read_text())
+    archive = Path(locator["archive"])
+    with zipfile.ZipFile(archive) as backup:
+        with tarfile.open(fileobj=io.BytesIO(backup.read("data.tar"))) as captured:
+            assert "users/alice/post-capture.txt" not in captured.getnames()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert after["machine"] == before["machine"]
+    assert after["volumes"] == before["volumes"]
+    assert after["containers"][APP]["State"]["Running"] is True
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    assert not any(
+        call[:3] == ["--connection", "rss-aggregator", "stop"]
+        for call in after["calls"]
+    )
+    hold = project.state_dir / "maintenance.json"
+    assert hold.exists()
+    assert project.run("start").returncode == 1
+    retained = archive.read_bytes()
+    assert project.run("remove-vm", "--confirm", plan["confirmation"]).returncode == 1
+    assert archive.read_bytes() == retained
+    assert hold.exists()
+    assert "fresh quiesced capture" in result.stderr
+
+    # Reconciliation stops the owned resumed writer but cannot make the old
+    # archive current. A new apply must export the intervening source changes.
+    assert project.run("backup-reconcile").returncode == 0
+    assert not hold.exists()
+    fresh_plan = preview(project, "remove-vm")
+    retry = project.run("remove-vm", "--confirm", fresh_plan["confirmation"])
+    assert retry.returncode == 0, retry.stderr
+    report = json.loads(retry.stdout)
+    fresh_archive = Path(report["backup"]["archive"])
+    assert fresh_archive != archive
+    assert archive.read_bytes() == retained
+    with zipfile.ZipFile(fresh_archive) as backup:
+        with tarfile.open(fileobj=io.BytesIO(backup.read("data.tar"))) as captured:
+            assert captured.extractfile("users/alice/post-capture.txt").read() == (
+                b"synthetic post-capture change"
+            )
+    assert project.engine()["writers_at_vm_stop"] == []
+    assert project.engine()["machine"] is None
 
 
 def test_running_source_can_be_quiesced_without_invalidating_immutable_volume_identity(

@@ -583,6 +583,13 @@ uninstall host packages or consume production data. Maintain coverage for:
   backup/inspection/stop/rm failures, unavailable/absent/partially initialized
   sources, resources arriving during export, prior archive preservation and no
   force/reset/prune. A previous archive or `no_data` never permits removal.
+- Resume the unchanged owned writer after export copies its bytes and during the
+  final connection inventory. Model native VM shutdown as stopping even running
+  containers, not as an application-writer safeguard. Assert post-capture changes
+  are missing from the archive but retained in the source; refusal must precede
+  native VM stop/removal, leave the resumed writer untouched and retain maintenance.
+  The hold must block managed start/retry; after guarded reconciliation, a new
+  preview/apply must capture the intervening changes in a fresh archive before removal.
 - Private versioned removing/removed receipt, maintenance retention after
   interruption/partial removal, and absent-resource completion only for the exact
   owned `stopping_vm` hold/receipt with verified archive/foreign connections.

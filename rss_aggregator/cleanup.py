@@ -329,6 +329,14 @@ class Cleanup:
             "foreign_connections": foreign,
         }
         runtime._save("removed-vm.json", receipt)
+        try:
+            # Identity/plan checks do not establish continued quiescence. A
+            # native client may have resumed writers since the volume export.
+            recovery._engines_idle(owner, stop=False)
+        except Exception:
+            raise self.failure(
+                "Final idle-engine check failed; VM and data retained with maintenance. Inspect locally, use guarded backup-reconcile, then obtain a new preview and fresh quiesced capture before removal. Do not reuse the earlier archive to authorize deletion."
+            ) from None
         maintenance.phase("stopping_vm")
         result = runtime._run("podman", "machine", "stop", self.machine, check=False)
         if result.returncode:

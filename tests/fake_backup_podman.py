@@ -1,9 +1,11 @@
 """Stateful external Podman substitute for backup command-boundary tests."""
 
+import io
 import json
 import os
 import shutil
 import sys
+import tarfile
 from pathlib import Path
 
 path = Path(os.environ["FAKE_BACKUP_ENGINE"])
@@ -22,6 +24,19 @@ def fail(message):
     raise SystemExit(125)
 
 
+def resume_writer(stage):
+    if state.get("resume_writer_at") != stage or state.get("writer_resumed"):
+        return
+    state["containers"]["rss-aggregator-freshrss"]["State"]["Running"] = True
+    content = b"synthetic post-capture change"
+    with tarfile.open(state["payload"], "a") as archive:
+        info = tarfile.TarInfo("users/alice/post-capture.txt")
+        info.size = len(content)
+        archive.addfile(info, io.BytesIO(content))
+    state["writer_resumed"] = True
+    save()
+
+
 machine = state["machine"]
 connection = state["connection"]
 if args == ["machine", "inspect", "rss-aggregator"]:
@@ -38,6 +53,13 @@ elif args == ["machine", "list", "--format", "json"]:
         )
     )
 elif args == ["system", "connection", "list", "--format", "json"]:
+    if "connection_reads_after_export" in state:
+        state["connection_reads_after_export"] += 1
+        # The first post-export read belongs to _vm_plan; the second captures
+        # retained foreign connections just before the receipt and VM stop.
+        if state["connection_reads_after_export"] == 2:
+            resume_writer("final_inventory")
+        save()
     print(
         json.dumps(
             ([connection] if connection else []) + state.get("other_connections", [])
@@ -64,8 +86,12 @@ elif args[:2] == ["machine", "start"]:
     machine["State"] = "running"
     save()
 elif args == ["machine", "stop", "rss-aggregator"]:
-    if any(c["State"]["Running"] for c in state["containers"].values()):
-        fail("VM stopped with writers running")
+    # Native VM shutdown does not protect an application that resumed writing.
+    state["writers_at_vm_stop"] = [
+        name for name, c in state["containers"].items() if c["State"]["Running"]
+    ]
+    for container in state["containers"].values():
+        container["State"]["Running"] = False
     machine["State"] = "stopped"
     save()
 elif args == ["machine", "rm", "rss-aggregator"]:
@@ -182,6 +208,10 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
             output.write_bytes(b"partial archive")
             fail("injected interrupted export with sensitive filename")
         shutil.copyfile(state["payload"], output)
+        resume_writer("export")
+        if state.get("resume_writer_at") == "final_inventory":
+            state["connection_reads_after_export"] = 0
+            save()
         if state.get("add_volume_during_export"):
             state["volumes"]["appeared-during-export"] = {"Labels": {}}
             save()

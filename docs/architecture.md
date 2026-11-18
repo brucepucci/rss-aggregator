@@ -310,7 +310,13 @@ inventory; changes require a newly reviewed preview, not implicit adoption.
 Apply reuses lifecycle quiescing and exact owned-forwarding cleanup, durable stop
 maintenance and the existing full-instance snapshot engine. It independently
 revalidates fresh external archive bytes/checksum and content, then rechecks the
-plan before stopping the VM and native `machine rm` with confirmation stdin. No
+plan. After the final inventory/receipt, a read-only check of both engines must still
+establish idle writers immediately before VM shutdown; resource identity alone does
+not establish continued quiescence. A resumed writer or inspection failure retains
+the VM/data and maintenance, without stopping the writer to reuse stale capture.
+Guarded reconciliation and a new preview/apply with fresh quiesced capture are required.
+The project lock does not serialize independent native clients. Successful idle
+inspection precedes VM stop and native `machine rm` with confirmation stdin. No
 old archive, `no_data`, force, global reset/prune or unavailable-source override
 permits deletion. Export/validation failure before deletion preserves source and
 prior archives; interrupted/partial removal retains maintenance for inspection.
