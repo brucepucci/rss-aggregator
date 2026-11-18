@@ -305,7 +305,19 @@ artifacts, pods, build caches or custom networks: the selected-volume archive co
 none. Explicit SSH username is cross-checked against owned machine/connection
 metadata; rootful commands use noninteractive sudo. Each guest engine's `info` must
 attest local mode and expected privilege, non-transient storage, guest Podman 6.2.0
-and Netavark before inventory. `--remote=false` alone is insufficient if guest
+and Netavark before inventory. Compare those reported storage identities against
+**the actual selected rootless API service** (`--connection MACHINE info --format
+json`) and the rootful socket service (noninteractive guest sudo with explicit
+`--remote --url unix:///run/podman/podman.sock info --format json`). Require typed,
+present, equal graph root, run root, volume path, graph driver/options, transient
+mode and effective image-copy temp directory, plus database/network/event backends
+and target privilege. Transport-mode flags must instead identify local versus API
+execution. Any mismatch, missing field or API inspection failure retains the VM;
+never relabel an actively selected custom store as a historical store. Include
+these identities in the confirmation fingerprint and repeat the comparison at
+apply admission/post-capture. Equal surfaced fields are a necessary check, not
+proof of all configuration: native `info` does not expose every effective libpod
+static/tmp directory or custom configuration path. `--remote=false` alone is insufficient if guest
 configuration selects tunnel mode. Secrets use local `secret ls --quiet`, artifacts
 `artifact ls --quiet`, pods `pod ps --quiet`: only successful, diagnostic-free,
 exactly empty stdout establishes absence. Secret `--format json` is literal template
@@ -324,6 +336,11 @@ no extra keys. Two independent local listings must show strictly increasing vali
 `created` timestamps: [Netavark 6.2.0](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
 synthesizes an absent default with `time.Now()` per process, whereas a persisted
 replacement retains its timestamp even if it copies the name/ID/configuration.
+A strict Python-3.10-compatible RFC3339Nano parser validates explicit timezones and
+calendar/offset fields, retaining the nine-digit fraction separately from whole
+seconds. UTC `Z` and fractional precision are native contracts, not reasons to
+reject supported Python 3.10; neither truncation nor float conversion may collapse
+an increasing nanosecond pair into a persisted timestamp.
 Force guest `--log-level=warn` and reject every network warning too: the native
 loader can skip malformed/unreadable configuration files while reporting success,
 and configured logging must not suppress that evidence. This avoids guessing the effective
@@ -332,9 +349,18 @@ custom/persisted defaults and failed/malformed inspection retain the VM; there i
 no override to convert uncertainty into deletion authority.
 
 These checks repeat at preview, apply admission and post-capture plan inspection.
-They cover registered resources in the two current engine contexts and the stated
-cache paths, not historical alternate stores/cache locations, other users' engines,
-or arbitrary guest files. Manifest lists and image build caches are image objects;
+**Approved supported-use boundary:** issue #5 limits automated removal to a
+project-only VM created and used exclusively by this project. The operator must
+establish that precondition before applying; a shared/repurposed guest, other users'
+engines, historical/alternate stores/cache locations, or uncertainty requires
+retaining the VM and recovering/migrating the project without deleting it. These
+checks do not prove VM-wide absence or authorize deletion of unsupported guests.
+They inventory reported matching local/API storage contexts and stated cache paths;
+a currently selected API store always remains in scope, never a historical-store
+exception. All unrelated-resource refusals, storage identity/ownership checks and
+fresh-backup gates remain mandatory. Matching exposed metadata does not prove all
+effective service configuration. Arbitrary non-Podman guest files are not part of
+the instance archive either. Manifest lists and image build caches are image objects;
 empty pods, external build containers and standalone mount caches require the
 separate checks above. Machine/rootless and derived-root connection identities are validated.
 Foreign connections/defaults remain unchanged; a project default among other

@@ -461,6 +461,17 @@ Keep preview output private: it contains local identities/paths, not backup cont
 
 ### Preview and remove the VM
 
+**Supported-use precondition — project-only VM:** under the
+[approved issue #5 scope](https://github.com/brucepucci/rss-aggregator/issues/5),
+automatic removal is only for the dedicated VM created and used exclusively by
+this project. Before applying, establish that it has not been shared/repurposed or
+hosted other users' Podman engines or historical/alternate stores/cache locations
+outside the inspected project contexts. This is an operator-established condition,
+not something a successful preview proves. If false or uncertain, **retain the VM**
+and recover/migrate the project instance without deleting that VM. Do not erase
+unrelated resources to make it qualify. This does not relax any inspection,
+ownership, current selected-service identity, confirmation or backup safeguard.
+
 1. Coordinate with the owner; retain needed logs/container-layer diagnostics and an
    independent durable recovery copy. Record selection, compatible image and wanted
    job settings privately. Remove captured jobs **with existing commands**, using
@@ -508,10 +519,20 @@ Keep preview output private: it contains local identities/paths, not backup cont
    separate owner-reviewed recovery/migration outside this workflow; do not delete
    unrelated resources merely to pass cleanup. Failed or malformed inspections also
    refuse, including the repeated inspection after capture. Inventories cover the
-   two current engine contexts and effective/stock build-cache paths, not arbitrary
-   guest files, other users' engines or historical alternate stores. If such use is
-   known or uncertain, retain/recover the VM instead of treating a preview as proof
-   that those files are backed up. Machine/rootless identity and the derived
+   reported matching local/API contexts and effective/stock build-cache paths.
+   Matching SSH users is insufficient: cleanup compares typed storage/backend
+   identities against the actual selected rootless API service and the rootful
+   socket service. Missing/mismatched/unavailable API identity retains the VM;
+   do not reconfigure or erase a store merely to make inspection pass. The same
+   identities are bound to consent and compared again after capture.
+   VM-wide discovery of other users' engines or historical/alternate stores/cache
+   locations is outside the approved project-only scope, **not permission to delete
+   them**. Known or uncertain such use fails the supported-use precondition above:
+   retain/recover that VM. A currently selected API store is always in scope, even
+   if customized; a mismatch must never be dismissed as historical. Some effective
+   service configuration is not exposed by `info`; matching surfaced metadata is
+   not proof of all configuration or exclusivity. Arbitrary guest files are not
+   backed up by the instance archive. Machine/rootless identity and the derived
    root connection are checked; foreign connections/defaults must remain unchanged.
    If a project connection is default among others, explicitly choose the intended
    retained default with native Podman tooling after owner review, then preview anew.

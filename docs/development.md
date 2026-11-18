@@ -561,9 +561,26 @@ Issue #5 uses the existing public CLI/`Runtime.run` seam and default test workfl
 not private-helper acceptance or a separate test entrypoint:
 
 ```sh
-uv run --locked pytest tests/test_cleanup.py tests/test_package_cleanup.py
+uv run --locked pytest tests/test_cleanup.py tests/test_cleanup_context.py tests/test_package_cleanup.py
 uv run --locked rss-dev check
 ```
+
+The selected-service/timestamp boundary also has a focused minimum-version check.
+Use an actual Python 3.10 interpreter, a separate uv environment, and the locked
+project dependencies; do not emulate its parser under a newer interpreter:
+
+```sh
+PYTHON310=/absolute/path/to/python3.10
+MIN_ENV="$(mktemp -d)/venv"
+UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv sync --locked --python "$PYTHON310"
+UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv run --locked --python "$PYTHON310" pytest tests/test_cleanup_context.py
+```
+
+This does not replace the full default check or establish a complete 3.10 test
+matrix. The controlled executable emits Go-shaped RFC3339Nano (`Z` and nine-digit
+fractions) and itself remains Python-3.10-compatible. Cover zero/one/six/nine-digit
+fractions, numeric offsets, invalid/naive timestamps and exact nanosecond ordering;
+whole-second plus integer-fraction comparison must retain persisted-network refusal.
 
 Deterministic regressions use private temporary state/destinations, synthetic
 archives and controlled Podman/Homebrew executables; they do not remove a real VM,
@@ -611,9 +628,23 @@ uninstall host packages or consume production data. Maintain coverage for:
   Keep the fixture's dynamic creation distinct from persisted replacement metadata.
   [Native synthesis/loading behavior](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
   is source-verified, not a live guest acceptance result. Inventories cover current
-  engine contexts/current and stock cache paths, not historical alternate stores,
-  other users or arbitrary guest files; independent configuration mutation is not
-  serialized by the project lock.
+  engine contexts/current and stock cache paths. Issue #5's approved scope requires
+  an operator-established **project-only VM**: shared/repurposed guests, other
+  users' engines, historical/alternate stores/cache locations and uncertainty mean
+  retain the VM and recover/migrate the project, not automatic removal. Tests do not
+  prove VM-wide exclusivity. Preserve every current resource/identity/backup refusal;
+  a currently selected API store cannot be excluded as historical. Unexposed service
+  configuration is still not proven by `info`; independent configuration mutation
+  is not serialized by the project lock.
+- Model selected API and guest-local metadata separately. At preview, apply and
+  post-capture, refuse different graph/run/volume roots, driver/options, transient
+  mode, effective cache directory, database/network/event backends or target
+  privilege; also refuse missing/malformed/unavailable API identity. Rootless info
+  must come from the actual selected connection; rootful API info uses the explicit
+  guest socket via sudo, without relying on a registered/default root connection.
+  Bind the compared identities to confirmation. Never normalize remote secret
+  errors to absence. `info` comparison covers exposed identity fields, not all
+  effective service configuration; a same-user match is not storage identity.
 - Fresh export plus independent archive/checksum validation before VM deletion,
   backup/inspection/stop/rm failures, unavailable/absent/partially initialized
   sources, resources arriving during export, prior archive preservation and no
@@ -759,7 +790,9 @@ Remaining limits:
   explicit owner-coordinated Mac checks, not guarantees from fixture passes.
   A stuck lock requires inspection, never unlinking the lock/hold.
 
-- Python 3.10 (declared minimum), other Mac providers/versions, alternate image
+- A complete Python 3.10 default-suite/multi-version matrix (the focused cleanup
+  identity/native-timestamp entrypoint above does not establish it), other Mac
+  providers/versions, alternate image
   architectures and native Linux rootless-Podman integration remain unverified.
   CI's Linux baseline is not Linux container coverage. No separate typechecker or
   visual browser automation is claimed.

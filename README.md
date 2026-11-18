@@ -281,7 +281,11 @@ VM deletion. Unbacked secrets, artifacts, pods, custom networks and build caches
 either inspected engine block removal; only a verified stock network baseline is
 disposable. The audited automatic-removal gate currently requires guest Podman
 6.2.0/Netavark; other versions/backends retain the VM for owner review. Packages and
-archives remain. Optional `remove-package` is separately
+archives remain. [Automatic VM removal supports only a project-only VM](docs/operations.md#safe-cleanup),
+as approved in issue #5. Establish exclusive project use before applying: a shared
+or repurposed guest, other users' engines, historical/alternate stores, or uncertainty
+means retain the VM and recover/migrate the project instead. Preview does not prove
+VM-wide exclusivity. Optional `remove-package` is separately
 previewed/confirmed per project-added formula and requires an unused-elsewhere
 attestation; `delete-volume` is separate **irreversible**, unselected-volume deletion
 with **no automatic backup**. Backup deletion is manual exact-file review only.

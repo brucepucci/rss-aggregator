@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import tempfile
 from datetime import datetime
@@ -27,6 +28,23 @@ STOCK_NETWORK = {
     "dns_enabled": False,
     "ipam_options": {"driver": "host-local"},
 }
+
+
+def _network_time(value: str) -> tuple[datetime, int]:
+    """Parse strict RFC3339Nano without losing precision on Python 3.10."""
+    match = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+        r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})",
+        value,
+    )
+    if match is None:
+        raise ValueError("Invalid native network timestamp")
+    seconds, fraction, offset = match.groups()
+    if offset == "Z":
+        offset = "+00:00"
+    elif int(offset[1:3]) > 23 or int(offset[4:6]) > 59:
+        raise ValueError("Invalid native network offset")
+    return datetime.fromisoformat(seconds + offset), int((fraction or "").ljust(9, "0"))
 
 
 def confirmation(plan: dict[str, Any], identity: Any) -> str:
@@ -171,8 +189,96 @@ class Cleanup:
                 "Unbacked guest resources or malformed metadata; VM removal refused. Retain the VM for separate owner-reviewed recovery."
             )
 
-    def _guest_baseline(self, rootful: bool) -> str:
-        """Verify engine/storage/network baselines and return its graph root."""
+    def _api_context(self, rootful: bool, local: dict[str, Any]) -> dict[str, Any]:
+        """Refuse absent or unequal storage identities on the actual API service."""
+        args = (
+            self._guest(
+                True,
+                "podman",
+                "--log-level=warn",
+                "--remote",
+                "--url",
+                "unix:///run/podman/podman.sock",
+                "info",
+                "--format",
+                "json",
+                native=False,
+            )
+            if rootful
+            else ("--connection", self.machine, "info", "--format", "json")
+        )
+        remote = self._json(*args, object_result=True, quiet=True)
+        identities = []
+        for info, is_remote in ((local, False), (remote, True)):
+            host, store, version = (
+                info.get("host"),
+                info.get("store"),
+                info.get("version"),
+            )
+            if (
+                not isinstance(host, dict)
+                or not isinstance(store, dict)
+                or not isinstance(version, dict)
+                or version.get("Version") != "6.2.0"
+                or host.get("serviceIsRemote") is not is_remote
+                or not isinstance(host.get("security"), dict)
+                or host["security"].get("rootless") is not (not rootful)
+            ):
+                raise self.failure(
+                    "Unverifiable API engine identity; resources retained."
+                )
+            for key in ("graphRoot", "runRoot", "volumePath", "imageCopyTmpDir"):
+                if (
+                    not isinstance(store.get(key), str)
+                    or not PurePosixPath(store[key]).is_absolute()
+                ):
+                    raise self.failure(
+                        "Unverifiable API storage identity; resources retained."
+                    )
+            if (
+                store.get("transientStore") is not False
+                or not isinstance(store.get("graphOptions"), dict)
+                or not isinstance(store.get("graphDriverName"), str)
+                or not store["graphDriverName"]
+                or any(
+                    not isinstance(host.get(key), str) or not host[key]
+                    for key in ("databaseBackend", "networkBackend", "eventLogger")
+                )
+            ):
+                raise self.failure(
+                    "Unverifiable API storage identity; resources retained."
+                )
+            identities.append(
+                {
+                    "store": {
+                        key: store[key]
+                        for key in (
+                            "graphRoot",
+                            "runRoot",
+                            "volumePath",
+                            "graphDriverName",
+                            "graphOptions",
+                            "transientStore",
+                            "imageCopyTmpDir",
+                        )
+                    },
+                    "host": {
+                        key: host[key]
+                        for key in ("databaseBackend", "networkBackend", "eventLogger")
+                    },
+                    "rootless": not rootful,
+                }
+            )
+        if json.dumps(identities[0], sort_keys=True) != json.dumps(
+            identities[1], sort_keys=True
+        ):
+            raise self.failure(
+                "Selected API service and local inspection contexts differ; VM removal refused. Retain the source for owner-reviewed recovery."
+            )
+        return identities[0]
+
+    def _guest_baseline(self, rootful: bool) -> tuple[str, dict[str, Any]]:
+        """Verify local/API storage identities and the synthetic network baseline."""
         info = self._json(
             *self._guest(rootful, "info", "--format", "json"),
             object_result=True,
@@ -191,6 +297,7 @@ class Cleanup:
             raise self.failure(
                 "Unverified guest engine mode/version/backend; VM removal refused."
             )
+        identity = self._api_context(rootful, info)
         store = info.get("store")
         if (
             not isinstance(store, dict)
@@ -237,19 +344,17 @@ class Cleanup:
             ) or not isinstance(timestamp, str):
                 raise self.failure("Unverified network baseline; VM removal refused.")
             try:
-                moment = datetime.fromisoformat(timestamp)
+                moment = _network_time(timestamp)
             except ValueError:
                 raise self.failure(
                     "Malformed network metadata; resources retained."
                 ) from None
-            if moment.tzinfo is None:
-                raise self.failure("Malformed network metadata; resources retained.")
             created.append(moment)
         if created[1] <= created[0]:
             raise self.failure(
                 "Persisted or unverified default network; VM removal refused."
             )
-        return store["graphRoot"]
+        return store["graphRoot"], identity
 
     def _resources(self, owner: dict[str, Any]) -> tuple[dict[str, Any], Any]:
         """Reject independent unbacked guest resources and foreign instance state."""
@@ -266,9 +371,7 @@ class Cleanup:
                 "Unverified rootless guest identity; resources retained."
             )
         self.guest_user = username
-        graph_roots = {
-            rootful: self._guest_baseline(rootful) for rootful in (True, False)
-        }
+        contexts = {rootful: self._guest_baseline(rootful) for rootful in (True, False)}
         for args in (
             ("ps", "--all", "--external"),
             ("volume", "ls"),
@@ -294,7 +397,7 @@ class Cleanup:
                 rootful,
                 "find",
                 "-H",
-                str(PurePosixPath(graph_roots[rootful]) / "secrets"),
+                str(PurePosixPath(contexts[rootful][0]) / "secrets"),
                 "-mindepth",
                 "1",
                 "-maxdepth",
@@ -351,6 +454,7 @@ class Cleanup:
             "networks": {"rootless": ["podman"], "rootful": ["podman"]},
         }, [
             details,
+            [contexts[rootful][1] for rootful in (True, False)],
             {
                 key: volume.get(key)
                 for key in (

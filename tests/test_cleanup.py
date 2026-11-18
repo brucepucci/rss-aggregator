@@ -377,19 +377,29 @@ def test_stock_named_network_is_not_implicitly_disposable(
     ],
 )
 def test_vm_preview_refuses_unverified_native_baselines(project, engine, fault):
-    info = {
-        "host": {
-            "serviceIsRemote": False,
-            "security": {"rootless": engine == "rootless"},
-            "networkBackend": "netavark",
-        },
-        "version": {"Version": "6.2.0"},
-        "store": {
-            "transientStore": False,
-            "imageCopyTmpDir": "/var/tmp",
-            "graphRoot": "/var/lib/containers/storage",
-        },
-    }
+    user = ["sudo", "-n", "--"] if engine == "rootful" else []
+    inspected = subprocess.run(
+        [
+            str(Path(project.env["PATH"]) / "podman"),
+            "machine",
+            "ssh",
+            "--username",
+            "core",
+            "rss-aggregator",
+            *user,
+            "podman",
+            "--remote=false",
+            "info",
+            "--format",
+            "json",
+        ],
+        env=project.env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert inspected.returncode == 0, inspected.stderr
+    info = json.loads(inspected.stdout)
     network = stock_network()
     key = "networks" if engine == "rootless" else "rootful_networks"
     if fault == "remote":

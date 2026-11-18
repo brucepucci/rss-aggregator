@@ -7,7 +7,7 @@ import shlex
 import shutil
 import sys
 import tarfile
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 path = Path(os.environ["FAKE_BACKUP_ENGINE"])
@@ -61,6 +61,41 @@ def list_guest_quiet(engine, resource):
             print("synthetic-id")
 
 
+def engine_info(engine, remote=False):
+    if remote and state.get("fail_api_info") == engine:
+        fail("sensitive API info diagnostic")
+    if remote and state.get("malformed_api_info") == engine:
+        return ["sensitive invalid API info"]
+    rootful = engine == "rootful"
+    graph = (
+        "/var/lib/containers/storage"
+        if rootful
+        else "/var/home/core/.local/share/containers/storage"
+    )
+    info = {
+        "host": {
+            "serviceIsRemote": remote,
+            "security": {"rootless": not rootful},
+            "networkBackend": "netavark",
+            "databaseBackend": "sqlite",
+            "eventLogger": "journald",
+        },
+        "version": {"Version": "6.2.0"},
+        "store": {
+            "transientStore": False,
+            "imageCopyTmpDir": "/var/tmp",
+            "graphRoot": graph,
+            "runRoot": "/run/containers/storage"
+            if rootful
+            else "/run/user/1000/containers",
+            "volumePath": graph + "/volumes",
+            "graphDriverName": "overlay",
+            "graphOptions": {},
+        },
+    }
+    return state.get(engine + ("_api_info" if remote else "_info"), info)
+
+
 def list_networks(engine):
     # Native v6.2.0 synthesizes an absent default anew per local process;
     # a persisted replacement's Created field remains stable across calls.
@@ -69,13 +104,23 @@ def list_networks(engine):
         "id": "2f259bab93aaaaa2542ba43ef33eb990d0999ee1b9924b557b7be53c0b7a1bb9",
         "driver": "bridge",
         "network_interface": "podman0",
-        "created": datetime.now(UTC).isoformat(),
+        "created": datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "789Z"),
         "subnets": [{"subnet": "10.88.0.0/16", "gateway": "10.88.0.1"}],
         "ipv6_enabled": False,
         "internal": False,
         "dns_enabled": False,
         "ipam_options": {"driver": "host-local"},
     }
+    times = state.get("network_creation_times", {}).get(engine)
+    if times:
+        reads = sum(
+            call[-4:] == ["network", "ls", "--format", "json"]
+            and ("sudo" in call) == (engine == "rootful")
+            for call in state["calls"]
+        )
+        network["created"] = times[(reads - 1) % len(times)]
     if state.get("warn_network_inventory") == engine:
         sys.stderr.write("sensitive unreadable network configuration")
     print(json.dumps(guest_records(engine, "networks", [network])))
@@ -170,6 +215,7 @@ elif args == ["machine", "rm", "rss-aggregator"]:
         "rootful_secrets",
         "secret_payloads",
         "rootful_secret_payloads",
+        "selected_api_secrets",
         "artifacts",
         "rootful_artifacts",
         "networks",
@@ -214,28 +260,7 @@ elif args[:2] == ["machine", "ssh"]:
         raise SystemExit(0)
     if command[:2] == ["podman", "--remote=false"]:
         if command[2:] == ["info", "--format", "json"]:
-            print(
-                json.dumps(
-                    state.get(
-                        engine + "_info",
-                        {
-                            "host": {
-                                "serviceIsRemote": False,
-                                "security": {"rootless": not rootful},
-                                "networkBackend": "netavark",
-                            },
-                            "version": {"Version": "6.2.0"},
-                            "store": {
-                                "transientStore": False,
-                                "imageCopyTmpDir": "/var/tmp",
-                                "graphRoot": "/var/lib/containers/storage"
-                                if rootful
-                                else "/var/home/core/.local/share/containers/storage",
-                            },
-                        },
-                    )
-                )
-            )
+            print(json.dumps(engine_info(engine)))
             raise SystemExit(0)
         if command[2:] == ["network", "ls", "--format", "json"]:
             list_networks(engine)
@@ -246,6 +271,18 @@ elif args[:2] == ["machine", "ssh"]:
         if command[2:] == ["pod", "ps", "--quiet"]:
             list_guest_quiet(engine, "pods")
             raise SystemExit(0)
+    if command == [
+        "podman",
+        "--remote",
+        "--url",
+        "unix:///run/podman/podman.sock",
+        "info",
+        "--format",
+        "json",
+    ]:
+        assert rootful
+        print(json.dumps(engine_info(engine, remote=True)))
+        raise SystemExit(0)
     if command == ["podman", "--remote=false", "secret", "ls", "--quiet"]:
         list_secrets("rootful" if rootful else "rootless", local=True)
         raise SystemExit(0)
@@ -274,7 +311,9 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     if machine["State"] != "running":
         fail("engine unavailable")
     args = args[2:]
-    if args == ["secret", "ls", "--format", "json"]:
+    if args == ["info", "--format", "json"]:
+        print(json.dumps(engine_info("rootless", remote=True)))
+    elif args == ["secret", "ls", "--format", "json"]:
         list_secrets("rootless")
     elif args[0] == "ps":
         records = [
