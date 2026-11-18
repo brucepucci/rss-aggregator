@@ -123,8 +123,9 @@ typechecker or coverage percentage is required/configured.
 
 `.venv` and uv's Python/package caches are development tooling, not FreshRSS data
 or backups. Normal runtime stop leaves them alone. Do not confuse them with the
-protected ownership directory. No package-uninstall/cache-prune convenience
-command is provided.
+protected ownership directory. Optional `remove-package` removes only one confirmed,
+unchanged, unused project addition; it is not a cache prune or blanket uninstall.
+See [cleanup verification](#cleanup-verification-and-remaining-native-evidence).
 
 ## Managed pre-push hooks
 
@@ -347,11 +348,12 @@ working directory. Defaults are resolved per instance, not an import-time single
 Construction itself does not inspect or change native resources.
 
 `run(operation, *, archive=None, volume=None, username=None, api_password=None,
-loopback=False, now=None, hour=3, minute=0)` returns the same JSON-compatible
+loopback=False, now=None, hour=3, minute=0, confirm=None, package=None,
+unused_elsewhere=False)` returns the same JSON-compatible
 operation dictionaries and sends diagnostics to stderr. It serializes callable as well as CLI callers under the
 same nonblocking project lock. Unknown operations/ownership/lock failures raise
 `RuntimeFailure`; OS/configuration errors propagate for the caller to handle.
-There are twenty public operations, not a command for every helper. Optional
+There are twenty-three public operations (cleanup adds three), not a command for every helper. Optional
 `now` is an aware `datetime` controlling backup eligibility/freshness tests only;
 there is no CLI clock override. Omit it in production. `hour`/`minute` apply only
 to explicit `backup-enable` and use UTC.
@@ -363,6 +365,9 @@ to explicit `backup-enable` and use UTC.
 | `run("restore", archive=Path(...), volume="fresh-name")` | Requires archive path and fresh target name; missing values raise `ValueError`. Shares archive validation, ownership and no-activation safeguards. |
 | `run("select-volume", volume="owned-name")` | Requires volume name; omission raises `ValueError`. Same stopped-app/running-VM and provenance checks. |
 | `run("backup-enable", hour=3, minute=0)`, `run("backup-disable")`, `run("backup-due")`, `run("backup-status")`, `run("backup-reconcile")` | Same opt-in, captured-setting, daily retry, status and maintenance semantics as the [CLI](cli.md#daily-backup-status-results). Status returns `protected` for callable checks; CLI `--check` translates false into exit 1. Busy status alone may return an atomic read-only view without the operation lock. |
+| `run("remove-vm", confirm=None)` | Default native inspection-only preview; `confirm` must be the current plan SHA-256 to apply. Same fresh full external backup, ownership/resource/connection guards, durable receipt/maintenance and narrowly scoped absent-resource completion as the [CLI](cli.md#cleanup-commands). |
+| `run("delete-volume", volume="inactive-owned-name", confirm=None)` | Explicit unselected/unmounted/unattached labelled volume only; missing name raises `ValueError`. Preview by default, irreversible nonforce deletion with matching digest; no automatic backup. |
+| `run("remove-package", package="plain-formula", confirm=None, unused_elsewhere=False)` | Missing package raises `ValueError`. Default preview; apply requires current digest plus `unused_elsewhere=True` for each installed eligible candidate. Fresh baseline/additions/version/dependent/Podman checks and normal native uninstall semantics match CLI; never a sweep. |
 | `run("api-check", username="<FRESHRSS-USER>", api_password="<API-PASSWORD>")` | No prompts; supply credentials only in local process memory, never source/shell arguments. Same owned/running/security-checked app and active-forwarding guards; only sanitized counts/diagnostics/transport returned. Optional `loopback=True` selects the verified owned HTTP publication and returns `https_verified: false`; omitted/false retains trusted HTTPS. |
 
 `Operation`, `Runtime` and `RuntimeFailure` are exported by `rss_aggregator`.
@@ -550,6 +555,223 @@ startup gates. Do not kill helpers or remove the lock to obtain a pass. Do not
 infer live acceptance from the default suite or simulate it against production
 merely to fill evidence gaps.
 
+## Cleanup verification and remaining native evidence
+
+Issue #5 uses the existing public CLI/`Runtime.run` seam and default test workflow,
+not private-helper acceptance or a separate test entrypoint:
+
+```sh
+uv run --locked pytest tests/test_cleanup.py tests/test_cleanup_context.py tests/test_guest_network.py tests/test_package_cleanup.py
+uv run --locked rss-dev check
+```
+
+The selected-service/timestamp boundary also has a focused minimum-version check.
+Use an actual Python 3.10 interpreter, a separate uv environment, and the locked
+project dependencies; do not emulate its parser under a newer interpreter:
+
+```sh
+PYTHON310=/absolute/path/to/python3.10
+MIN_ENV="$(mktemp -d)/venv"
+UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv sync --locked --python "$PYTHON310"
+UV_PROJECT_ENVIRONMENT="$MIN_ENV" uv run --locked --python "$PYTHON310" pytest tests/test_cleanup_context.py tests/test_guest_network.py
+```
+
+This does not replace the full default check or establish a complete 3.10 test
+matrix. The controlled executable emits Go-shaped RFC3339Nano (`Z` and nine-digit
+fractions) and itself remains Python-3.10-compatible. Cover zero/one/six/nine-digit
+fractions, numeric offsets, invalid/naive timestamps and exact nanosecond ordering;
+whole-second plus integer-fraction comparison must retain persisted-network refusal.
+This is the **host** parser compatibility contract. The standalone provenance helper
+runs in the Linux **guest** and requires Python 3.11+ with `tomllib`, `systemctl`,
+readable `/proc`, noninteractive sudo for rootful execution and native `podman unshare`
+for rootless execution. It does not raise the host package's Python minimum or add a
+runtime flag/setting. Missing guest prerequisites must refuse, never trigger repair
+or a service restart. The audited native success profile is the stock Podman
+6.2.0/Netavark guest, not arbitrary customized systemd/Podman service equivalence.
+
+Deterministic regressions use private temporary state/destinations, synthetic
+archives and controlled Podman/Homebrew executables; they do not remove a real VM,
+uninstall host packages or consume production data. Maintain coverage for:
+
+- Native inspection-only previews (except the existing lock), exact targets,
+  retained resources and no preview destination creation; stale confirmations
+  after resource/ownership/image/directory/connection changes must refuse.
+- The actual native-drill setup path must accept its generated disposable machine
+  name through a controlled Podman executable enforcing the native 30-character
+  limit. Stop at the controlled VM-start boundary; this is setup compatibility,
+  not a substitute for native recovery or authenticated-state evidence.
+- Running owned source, exactly selected labelled volume, only labelled reserved
+  containers/pinned images, no rootful containers/volumes/images including stopped,
+  external build containers and intermediate images; derived-root/default-connection
+  validation and removed captured jobs. Empty pods are independent resources too.
+- Rootless/rootful standalone secret sentinels must survive refusal at preview,
+  apply admission and post-export inspection. Model native VM deletion as destroying
+  guest secret storage; any secret, failed metadata command or malformed inventory
+  must retain the VM/data. Assert only guest-local `podman --remote=false secret ls
+  --quiet` through named-machine SSH with an explicitly verified guest username;
+  rootful uses `sudo -n --`. `info` must attest local mode and expected rootless/rootful
+  privilege before listings: configuration can override `--remote=false`. Accept
+  exactly empty stdout only at exit zero with no diagnostics; whitespace is not an
+  empty list. No payload reads or names/payloads/native diagnostics in output.
+  Empty inventories must permit normal removal. Model native `--format json` as
+  literal template text (empty stdout or `json` per row), never a fabricated JSON
+  array, and model the remote tunnel's discarded API error as exit-zero/empty.
+  [Pinned native quiet/local contracts](https://github.com/containers/podman/blob/v6.2.0/cmd/podman/secrets/list.go)
+  are source-verified; remote loopback experiments are not guest-local evidence.
+  Name-only secret-storage inspection must also refuse stale/empty metadata DBs,
+  driver remnants and unavailable inspection: native loading can swallow failed stat.
+- Rootless/rootful artifact, custom-network, pod, external-container, mount-cache
+  and secret-storage sentinels must survive preview/apply/post-export refusal,
+  including failed/malformed metadata. Model deletion as destroying these stores.
+  Inspect effective and stock `/var/tmp`/`/tmp` Buildah cache names, never contents;
+  `images --all` covers intermediate image caches/manifest lists, not mount caches.
+- Network success must require the complete audited stock default, not name/ID.
+  Assert refusal for custom subnets, persisted stock-shaped replacements, extra or
+  wrongly typed fields, invalid timestamps and warnings from skipped config files.
+  Model selected rootless/rootful **API and local network inventories separately**:
+  a custom API network must refuse even when local lists look stock, at preview,
+  apply admission and post-export inspection, without deleting source/sentinels or
+  prior archives. API failure, malformed shape/time and diagnostics must also refuse.
+  Two independent *local* listings must synthesize increasing `created` timestamps;
+  persisted configuration retains its timestamp. Accept a stable valid **API**
+  timestamp: the service caches its synthetic default, so advancement is not an API
+  requirement. Force guest `--log-level=warn` so configuration cannot hide local
+  loader warnings; remote success cannot substitute for missing server warnings.
+  Supported gate: guest Podman 6.2.0, Netavark and non-transient storage; refuse
+  unknown versions/backends/mode/storage. Keep the fixture's dynamic local creation
+  distinct from persisted replacement and cached API metadata.
+  [Native synthesis/loading behavior](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
+  explains the contract; fixture passes do not prove native guest provenance.
+  Inventories cover current
+  engine contexts/current and stock cache paths. Issue #5's approved scope requires
+  an operator-established **project-only VM**: shared/repurposed guests, other
+  users' engines, historical/alternate stores/cache locations and uncertainty mean
+  retain the VM and recover/migrate the project, not automatic removal. Tests do not
+  prove VM-wide exclusivity. Preserve every current resource/identity/backup refusal;
+  a currently selected API store cannot be excluded as historical. Unexposed service
+  configuration is still not proven by `info`; independent configuration mutation
+  is not serialized by the project lock.
+- Model selected API and guest-local metadata separately. At preview, apply and
+  post-capture, refuse different graph/run/volume roots, driver/options, transient
+  mode, effective cache directory, database/network/event backends or target
+  privilege; also refuse missing/malformed/unavailable API identity. Rootless info
+  must come from the actual selected connection; rootful API info uses the explicit
+  guest socket via sudo, without relying on a registered/default root connection.
+  Bind the compared identities to confirmation. Never normalize remote secret
+  errors to absence. `info` comparison covers exposed identity fields, not all
+  effective service configuration; a same-user match is not storage identity.
+- Bracketing provenance must bind the actual selected listener to systemd MainPID,
+  exact stock executable/argv, its kernel socket inode in process FDs, matching
+  root/mount/user/network namespaces and a stable configuration fingerprint. Cover
+  missing/unavailable helper proof, service/PID/start/listener swaps during the
+  API-plus-two-local-list window and configuration changes. A changed config
+  fingerprint must stale consent; an idle stock-service restart between complete
+  inspections must not do so merely because its PID/start cookie changed. Refusal
+  must leave VM/data intact at preview, apply and post-export, with no corrective
+  mutation or restart. Use synthetic config/name/argv/env/diagnostic sentinels to
+  assert only fingerprints leave the helper; no Podman secret payload reads.
+  Helper controls also need native scrutiny: config main/drop-in candidates and
+  absent-path/ancestor witnesses, startup/environment selectors, custom network
+  directories, `engine.env` (including native case-insensitive TOML table/key aliases),
+  symlinks, config ctime/mtime predating startup and trusted
+  boot/clock agreement. The audited Fedora root-home alias is an allowed exception,
+  not permission to resolve arbitrary symlinks. Substituted helper responses at the
+  public command boundary alone cannot prove these Linux/systemd checks.
+- Fresh export plus independent archive/checksum validation before VM deletion,
+  backup/inspection/stop/rm failures, unavailable/absent/partially initialized
+  sources, resources arriving during export, prior archive preservation and no
+  force/reset/prune. A previous archive or `no_data` never permits removal.
+- Disconnect the source immediately after export so both post-capture inspection
+  and the fallback idle check fail. Assert nonzero exit/empty stdout, fixed
+  owner-inspection and guarded `backup-reconcile` guidance, and no raw native
+  diagnostic (use only synthetic URL/token sentinels). Source bytes, prior and
+  newly verified archive bytes, the owned maintenance hold and running VM must
+  survive without native stop/rm or a removal receipt. Unknown idleness must not
+  clear the hold; an idle fallback may still retire it after an ordinary failure.
+- Resume the unchanged owned writer after export copies its bytes and during the
+  final connection inventory (the third post-export connection read: `_vm_plan`
+  reads once directly and once through `_owner`). Assert the native-call trace
+  places the injection after plan inspection and immediately before the final idle
+  check, with the removal receipt retained. Model native VM shutdown as stopping even running
+  containers, not as an application-writer safeguard. Assert post-capture changes
+  are missing from the archive but retained in the source; refusal must precede
+  native VM stop/removal, leave the resumed writer untouched and retain maintenance.
+  The hold must block managed start/retry; after guarded reconciliation, a new
+  preview/apply must capture the intervening changes in a fresh archive before removal.
+- Private versioned removing/removed receipt, maintenance retention after
+  interruption/partial removal, and absent-resource completion only for the exact
+  owned `stopping_vm` hold/receipt with verified archive/foreign connections.
+  Unknown/mismatched state must refuse, not delete records or broaden authority.
+- Successful generation retirement during `setup`, preserving baseline/additions,
+  locators/evidence/checkout and refusing reappearing collisions. Setup then restore
+  to a fresh name before any empty app start; selection/compatible-image gates remain.
+- Separate nonforce irreversible deletion only for explicit unselected labelled
+  volumes with zero mounts/no stopped-container attachment; no automatic backup,
+  other resources/archives retained and already-absent behavior. Verified absent VM,
+  volume and package targets return successful absence JSON even with invalid/stale
+  confirmation; absent packages do not require unused-elsewhere attestation.
+- One plain formula per preview/apply; initial baseline and additions ledgers,
+  unchanged installed versions, fresh recursive formula/cask optional/build/test
+  dependents and no Podman machines/connections. Require both per-candidate external
+  adoption attestation and current full-plan digest; recheck immediately before
+  uninstall, retain native dependent checks and preserve ledgers/other packages on
+  refusal. Model Homebrew's implicit uninstall-time global autoremove and verify that
+  `HOMEBREW_NO_AUTOREMOVE=1` is forced for unset, empty, false and enabled inherited
+  settings: both baseline and unconfirmed project-dependency sentinels must survive.
+  Native dependent checks must still reject late adoption. Removing Podman first
+  does not authorize a dependency sweep.
+
+Native provenance verification is a separate, **read-only** check of the actual
+`Cleanup._guest_baseline` and unmodified guest helper on both rootless and rootful
+engines of a new disposable stock Podman 6.2.0/Netavark guest. Verify exact helper
+success plus custom-network-directory, persisted-default and skipped-loader-warning
+refusals with synthetic fixtures, preserving source/evidence. No secret payloads or
+real credentials are needed. Record exact commands, revision and performed/unrun
+positive and negative cases in the issue/PR, not as permanent branch-status claims
+here. A successful native baseline proof is not VM removal, FreshRSS recovery or
+atomic protection against independent native/root clients; it does not establish
+all effective configuration inputs. The project-only VM policy remains mandatory.
+
+**Not established by these deterministic checks:** actual disposable VM
+remove/recreate/restore with authenticated original user, subscriptions, article
+content and read/unread plus starred/unstarred state; real host Homebrew uninstall;
+or native unrelated-sentinel preservation. Earlier source-absent recovery and
+ordinary VM-restart evidence do not prove VM teardown/generation retirement. Default
+fixture passes must not be described as these native acceptance results. Select the
+native drill separately and retain its revision-specific outcomes in the issue/PR.
+
+An owner-coordinated real check requires explicit approval, an independent verified backup,
+exclusively disposable resources, a private expected-state record and a preservation
+inventory. Follow [the operator runbook](operations.md#safe-cleanup), including job
+removal, fresh removal-time capture, setup/restore-before-start and authenticated
+comparison. Do not delete the only real instance or uninstall real host formulae just
+to demonstrate a preview. Preserve sensitive archives/audits and record exact revision,
+commands, sanitized results and all unrun checks in the issue/PR handoff. Do not infer
+real sentinel preservation from substitute inventories. Manual residual/backup review
+is not automatic pruning or secure-erasure evidence. No new settings are introduced.
+
+Run only the explicitly selected native drill:
+
+```sh
+uv run --locked pytest tests/integration/test_live_cleanup.py::test_disposable_vm_remove_recreate_restore_preserves_authenticated_state -m live -q
+```
+
+It requires macOS/Apple Silicon virtualization, preinstalled Homebrew Podman, the
+reviewed compatible image configuration, internet/public-feed access and an approved
+idle-host window with **no running Podman machine**. Unlike ordinary FreshRSS live
+tests, it creates a uniquely named fresh owned VM with private temporary ownership,
+backup destination and synthetic user. The `rss-cleanup-<16-hex>` machine name is
+28 characters, within Podman's 30-character limit. It never borrows the owner's existing VM or
+fabricates its owner record. It uses loopback/namespaced job labels without real
+job activation, removes/recreates its disposable VM, restores before empty startup,
+and compares authenticated article/read/star state, retained machine names and
+connection/default inventories. These comparisons do not inspect every unrelated
+guest volume/image or prove preservation of all host state. Failed drills retain
+namespaced resources/state for inspection, not
+forced fallback cleanup. Keep any retained artifacts private. This is not a real
+host-uninstall test, unrelated-sentinel proof, cross-host recovery or permission to
+run against production; coordinate prerequisites and preservation before selection.
+
 ## Verification and adoption status
 
 The repository implements uv/lockfile management, deterministic default pytest
@@ -618,7 +840,9 @@ Remaining limits:
   explicit owner-coordinated Mac checks, not guarantees from fixture passes.
   A stuck lock requires inspection, never unlinking the lock/hold.
 
-- Python 3.10 (declared minimum), other Mac providers/versions, alternate image
+- A complete Python 3.10 default-suite/multi-version matrix (the focused cleanup
+  identity/native-timestamp entrypoint above does not establish it), other Mac
+  providers/versions, alternate image
   architectures and native Linux rootless-Podman integration remain unverified.
   CI's Linux baseline is not Linux container coverage. No separate typechecker or
   visual browser automation is claimed.
@@ -630,10 +854,14 @@ Remaining limits:
 - Physical second-host recovery and cross-architecture recovery are unverified.
   Verification archives in temporary private directories do not establish a
   durable user backup configuration; VM-native storage itself is not a backup.
-- Private/paid-feed authorization acceptance and destructive cleanup are not
-  implemented/verified project capabilities; Linux server deployment remains a
-  later phase. No VM/volume deletion, global prune/reset or package-uninstall
-  convenience command exists.
+- Private/paid-feed authorization acceptance remains unverified; Linux server
+  deployment remains a later phase. Preview-first owned VM removal, separate
+  inactive-volume deletion and per-formula removal are implemented with deterministic
+  guards. Disposable removal/recreation/authenticated recovery requires the separately
+  selected native drill and revision-specific evidence. Actual host uninstall and
+  full unrelated-resource preservation are not established by that drill; see
+  [cleanup verification](#cleanup-verification-and-remaining-native-evidence).
+  Global prune/reset, automatic backup pruning and cache/directory sweeps remain unsupported.
 - [Issue #7](https://github.com/brucepucci/rss-aggregator/issues/7) owns broader
   controlled publisher/error cases, interruption-safe fixtures, a coverage matrix,
   Markdown/local-reference automation and Linux/Mac integration responsibilities.

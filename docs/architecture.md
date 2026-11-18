@@ -287,6 +287,197 @@ daily work or actual unattended evidence. An available local archive is not proo
 of Time Machine inclusion/retrieval or host-loss recovery. Existing full-state
 live tests remain explicit selections, not default-suite proof of infrastructure.
 
+## Preview-first removal and generation retirement
+
+Issue #5 adds three operations to the existing thin CLI/`Runtime.run` boundary,
+sharing `command.lock` and maintenance admission rather than a parallel teardown
+engine. `cleanup.py` handles VM removal/inactive-volume deletion and
+`package_cleanup.py` handles per-formula eligibility. No new runtime settings,
+background service or automatic sweep is introduced. Native read-only preview
+binds explicit consent to the current private plan; it does not export, stop,
+create a destination or rewrite records (the existing lock is opened for writing).
+
+VM removal requires a running accessible owned machine, exactly the selected
+labelled volume, only reserved owner-labelled app/preflight containers and pinned
+images, and no rootful containers/volumes/images. Both inventories include external
+build containers and intermediate images. Both engines must have no secrets, OCI
+artifacts, pods, build caches or custom networks: the selected-volume archive covers
+none. Explicit SSH username is cross-checked against owned machine/connection
+metadata; rootful commands use noninteractive sudo. Each guest engine's `info` must
+attest local mode and expected privilege, non-transient storage, guest Podman 6.2.0
+and Netavark before inventory. Compare those reported storage identities against
+**the actual selected rootless API service** (`--connection MACHINE info --format
+json`) and the rootful socket service (noninteractive guest sudo with explicit
+`--remote --url unix:///run/podman/podman.sock info --format json`). Require typed,
+present, equal graph root, run root, volume path, graph driver/options, transient
+mode and effective image-copy temp directory, plus database/network/event backends
+and target privilege. Transport-mode flags must instead identify local versus API
+execution. Any mismatch, missing field or API inspection failure retains the VM;
+never relabel an actively selected custom store as a historical store. Include
+these identities in the confirmation fingerprint and repeat the comparison at
+apply admission/post-capture. Equal surfaced fields are a necessary check, not
+proof of all configuration: native `info` does not expose every effective libpod
+static/tmp directory or custom configuration path. `--remote=false` alone is insufficient if guest
+configuration selects tunnel mode. Secrets use local `secret ls --quiet`, artifacts
+`artifact ls --quiet`, pods `pod ps --quiet`: only successful, diagnostic-free,
+exactly empty stdout establishes absence. Secret `--format json` is literal template
+text, not a JSON mode; the remote secret tunnel can discard API errors. No secret
+payload is requested; unrelated names/native diagnostics never enter reports or
+receipts. A name-only guest `find` also requires secret-manager storage to contain
+only its native lockfile, refusing even empty/stale databases and driver remnants
+because native secret loading can swallow a failed database stat. Buildah mount
+cache names are inspected in the effective image-copy temp directory and stock
+`/var/tmp`/`/tmp`; no cache contents are read.
+
+The only disposable networks are verified *synthetic stock defaults*, listed under
+both engine contexts in preview targets. `Cleanup._api` consistently targets the
+actual selected rootless connection or explicit rootful socket for both `info` and
+`network ls --format json`. Each API list and each of two fresh local lists must
+succeed without diagnostics and contain exactly the audited stock shape: `podman`,
+its fixed native ID, bridge/`podman0`, `10.88.0.0/16` with gateway `10.88.0.1`,
+disabled DNS/IPv6/internal flags and host-local IPAM, with no extra keys and a valid
+`created` timestamp. Shape equality alone is not provenance.
+
+`Cleanup._stock_network` uses a strict Python-3.10-compatible RFC3339Nano parser
+validating explicit timezones and calendar/offset fields, retaining the nine-digit
+fraction separately from whole seconds. Two independent **local** listings must
+show strictly increasing timestamps: [Netavark 6.2.0](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
+synthesizes an absent default with `time.Now()` per process, whereas a persisted
+replacement retains its timestamp even if it copies the name/ID/configuration.
+Neither truncation nor float conversion may collapse an increasing nanosecond pair.
+The API service caches its synthetic timestamp; a stable API timestamp is valid
+and is **not** required to advance or equal either local timestamp. API-only lists
+omit server-side loader warnings and cannot establish persisted-network provenance.
+Force guest-local `--log-level=warn` and reject every warning: the native loader can
+skip malformed/unreadable configuration files while reporting success.
+
+`Cleanup._network_context` sends the standalone `guest_network.py` helper to the
+guest before and after the actual API list plus both fresh local lists. The helper
+requires guest **Python 3.11+ with `tomllib`**, `systemctl` and readable Linux `/proc`;
+rootless execution runs inside native `podman unshare`, rootful via noninteractive
+sudo. The audited stock success profile requires all of the following:
+
+- `systemctl [--user] show podman.service` supplies `MainPID`; its executable is
+  `/usr/bin/podman` with exactly `/usr/bin/podman --log-level=info system service`
+  argv. Extra startup configuration/remote/storage selectors, modules or custom
+  network-directory flags are not accepted. Service/helper environment selectors
+  must also satisfy the stock selector restrictions, rather than trusting a matching
+  username.
+- The expected selected socket has exactly one listening row in `/proc/net/unix`.
+  That row's **kernel socket inode** must occur in the service process's file
+  descriptors; a filesystem socket inode alone is not listener ownership proof.
+  Service and helper must share filesystem root and mount, user and network
+  namespaces. Native rootless unshare supplies the required user/mount context.
+- Witness `containers.conf` and `storage.conf` main candidates in vendor
+  `/usr/share/containers`, system `/etc/containers` and the selected account's
+  `~/.config/containers`, plus their general, rootful/rootless and rootless-UID
+  drop-in candidates. Hash configuration files locally, include absent-path
+  witnesses and ancestor/directory metadata, and inspect the drop-in tree without
+  silent truncation. Reject unrecognized symlinks; the audited Fedora root-home
+  alias `/root` → `/var/roothome` is the sole exception. Reject TOML
+  `network.network_config_dir` overrides or `engine.env` values, matching native
+  case-insensitive TOML struct keys and refusing ambiguous aliases.
+- Require configuration witnesses' **ctime and mtime** to safely predate service
+  startup, with conservative two-second clearance and agreement between trusted
+  guest boot/start ticks and wall/boot clocks. Invalid/unavailable configuration,
+  fresh or backdated-but-recently-changed files and uncertain clocks refuse.
+  Recheck process start and file metadata while inspecting; the bracketing helper
+  records must match in both configuration fingerprint and service cookie
+  (PID/start ticks/listener inode).
+
+Only fingerprints and the helper protocol version leave the guest from this
+provenance inspection, never configuration payloads, raw names, argv, environment
+or native diagnostics. Configuration files are read/hashed locally; no Podman secret
+payload is requested. `Cleanup._guest_baseline` binds the stable configuration
+fingerprint into the compared engine identity and confirmation. The service cookie
+is only a bracketing guard: an idle stock service restart between complete
+inspections does not itself stale consent; a changed configuration fingerprint does.
+Unknown, custom, stale, changed or unavailable provenance retains the VM without
+restarting the service or correcting configuration. This deliberately conservative
+stock Podman 6.2.0/Netavark profile is not arbitrary service-equivalence detection,
+proof of all effective configuration, or atomic protection against independent
+native/root clients. No override converts uncertainty into deletion authority.
+
+These checks repeat at preview, apply admission and post-capture plan inspection.
+**Approved supported-use boundary:** issue #5 limits automated removal to a
+project-only VM created and used exclusively by this project. The operator must
+establish that precondition before applying; a shared/repurposed guest, other users'
+engines, historical/alternate stores/cache locations, or uncertainty requires
+retaining the VM and recovering/migrating the project without deleting it. These
+checks do not prove VM-wide absence or authorize deletion of unsupported guests.
+They inventory reported matching local/API storage contexts and stated cache paths;
+a currently selected API store always remains in scope, never a historical-store
+exception. All unrelated-resource refusals, storage identity/ownership checks and
+fresh-backup gates remain mandatory. Matching exposed metadata does not prove all
+effective service configuration. Arbitrary non-Podman guest files are not part of
+the instance archive either. Manifest lists and image build caches are image objects;
+empty pods, external build containers and standalone mount caches require the
+separate checks above. Machine/rootless and derived-root connection identities are validated.
+Foreign connections/defaults remain unchanged; a project default among other
+connections refuses instead of letting native removal select another default.
+Captured jobs must first be removed by supervision-remove/backup-disable. Confirmation
+binds ownership, immutable resource/image identity, destination and connection
+inventory; changes require a newly reviewed preview, not implicit adoption.
+
+Apply reuses lifecycle quiescing and exact owned-forwarding cleanup, durable stop
+maintenance and the existing full-instance snapshot engine. It independently
+revalidates fresh external archive bytes/checksum and content, then rechecks the
+plan. After the final inventory/receipt, a read-only check of both engines must still
+establish idle writers immediately before VM shutdown; resource identity alone does
+not establish continued quiescence. A resumed writer or inspection failure retains
+the VM/data and maintenance, without stopping the writer to reuse stale capture.
+Guarded reconciliation and a new preview/apply with fresh quiesced capture are required.
+The project lock does not serialize independent native clients. Successful idle
+inspection precedes VM stop and native `machine rm` with confirmation stdin. No
+old archive, `no_data`, force, global reset/prune or unavailable-source override
+permits deletion. Export/validation failure before deletion preserves source and
+prior archives. The failure handler independently guards its fallback idle inspection:
+if that check also fails (including a post-export disconnect), retain the maintenance
+hold, source and archives and emit only fixed owner-inspection/guarded-reconciliation
+guidance, never the native exception. Clear the hold only after successful idle
+verification; uncertain idleness must not authorize resumption. Interrupted/partial
+removal retains maintenance for inspection.
+
+Private `removed-vm.json` version 1 records `status: removing`/`removed`, exact
+`owner`, `plan`, fresh `backup` and `foreign_connections` before native stop/rm.
+Completion requires absent exact machine/connections and unchanged foreign
+identities/defaults. If Python dies after rm, the same operation may finalize only
+the exact owned receipt and matching `stopping_vm` hold after independently verifying
+the recorded archive. Other absent/partial/mismatched states are not authority to
+clear records or broaden deletion. Ordinary repeated absence reports absent only.
+
+After successful removal, setup retires **only the exact old generation**: owner,
+selection/provenance, security, Serve, operator intent and supervision recovery
+records move to private `retired-<hash>/`. Baseline/additions, backup locators/evidence,
+receipt and checkout remain. Absent resource names then receive fresh ownership;
+reappearing names refuse adoption. Restore to a fresh explicit volume **before any
+empty app start**: setup, restore (may start only the owned VM), select-volume, start
+with the recorded compatible image. Use a fresh name, not the initial selected
+`rss-aggregator-data` even when absent, and verify the old original volume is absent.
+Retirement is not ownership fabrication or a cache sweep.
+
+Permanent volume deletion is a distinct irreversible consent boundary: one explicit
+labelled **unselected** volume, zero mounts and no attachments even to stopped
+containers. It creates no backup and invokes nonforce native removal, preserving
+all other resources/archives. Package removal similarly targets one plain formula:
+initial baseline plus additions ledger, unchanged installed version, fresh recursive
+installed formula/cask optional/build/test reverse dependencies and no Podman
+machines/connections. Apply requires both the exact current-plan digest and operator
+unused-elsewhere attestation; metadata cannot prove external adoption. Normal native
+`brew uninstall --formula` retains dependent checks, without force/ignore-dependencies/
+autoremove/cleanup. Podman goes first; each remaining addition needs a fresh preview.
+
+Backups/audits remain private; manual exact-file double review is the only archive
+removal procedure. No recursive directory/cache cleanup is provided. See
+[operations](operations.md#safe-cleanup) for unavailable-VM preservation/provider
+recovery and interrupted-removal handling, and [configuration](configuration.md#managed-local-records)
+for records. Deterministic guards are not real disposable VM remove/recreate/
+authenticated-state acceptance, native host uninstall or sentinel-preservation proof.
+Select the [native drill separately](development.md#cleanup-verification-and-remaining-native-evidence)
+and record revision-specific outcomes in the issue/PR. Its retained machine-name
+and connection/default comparisons do not establish full preservation of every
+unrelated resource or native package-uninstall behavior.
+
 ## Decisions
 
 - [ADR 0001: isolate local development with Podman](adr/0001-isolate-local-development-with-podman.md)

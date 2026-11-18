@@ -13,7 +13,7 @@ Run from a synchronized checkout (`uv sync --locked` first):
 
 | Invocation | Purpose and accepted arguments/options |
 | --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the twenty operations below. |
+| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the twenty-three operations below. |
 | `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint; Python's `-m` selects the module. |
 | `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. It is not a Python module to pass to `python3`. |
 | `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
@@ -43,7 +43,7 @@ not the invoked application's access to live services.
 
 Use `uv run --locked rss COMMAND` or either runtime alias above. Every subcommand
 accepts `--help`. Except for `api-check`, `restore`, `select-volume`,
-`backup-enable` and `backup-status`, commands
+`backup-enable`, `backup-status`, `remove-vm`, `delete-volume` and `remove-package`, commands
 have **no positional arguments or options other than `--help`**.
 
 Successful operations emit exactly one indented JSON object on stdout and exit 0.
@@ -67,10 +67,116 @@ operation-specific, not a universal envelope; there is no extra text-output mode
 | `rss backup-disable` | Remove only the exact unchanged owned job under the project lock; never interrupts active work. Refuses foreign/changed definitions and unexpected launchd inspection errors, preserving registration for inspection/retry. | `enabled: false`; removal also returns `archives_preserved: true`. Already unconfigured is a no-op; preserves archives and evidence. |
 | `rss backup-due` | Scheduler entrypoint: execute eligible daily work through existing backup guards. No automatic installation. Requires the exact unchanged owned definition and matching loaded identity before reserving an attempt or touching resources. Uses captured settings/dependencies; refuses a mismatching invocation or uncertain launchd inspection. | `outcome: "disabled"`, `"not_due"` (with `next_expected_attempt`) or `"success"` (with nested `backup` archive result). Failures/contention exit 1, not a successful archive. Manual invocation is not unattended timing evidence. |
 | `rss backup-status [--check]` | Inspect private evidence, scheduler/dependencies and freshness without changing runtime resources; remains read-only when the lock is busy. | Status fields below; a successful inspection need not mean protection is healthy. |
-| `rss backup-reconcile` | After owner inspection, validate maintenance ownership and confirm both engines idle, safely stopping only owned writers/forwarding if needed. Does not start a stopped VM or resume the app. Surviving exports/foreign workloads/uncertain forwarding refuse. | `reconciled: boolean`, `resumed: false`, `action`. No hold is a no-op. Clear only through this command, never hand-edit records. |
+| `rss backup-reconcile` | After owner inspection, validate maintenance ownership and confirm both engines idle, safely stopping only owned writers/forwarding if needed. Does not start a stopped VM or resume the app. Surviving exports/foreign workloads/uncertain forwarding refuse. | `reconciled: boolean`, `resumed: false`, `action`. No hold is a no-op. Clear through this command or the exact absent-VM removal receipt completion below; never hand-edit records. |
 | `rss restore ARCHIVE --volume NAME` | Validate locally, then import into a fresh owned volume. May start only the owned VM; leaves it running. Does not activate the imported data, overwrite an existing volume, or require `RSS_BACKUP_DIR`. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
 | `rss select-volume NAME` | Select an owned volume while the VM runs and the application is stopped/absent. Refuses incomplete imports or recorded-image mismatch. Does not start the app or delete the original volume. | `volume`, `selected: true`, `next_step`. |
 | `rss stop` | After acquiring the project lock, persist stopped intent before maintenance refusal or shutdown (even if already stopped or shutdown fails). Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
+
+### Cleanup commands
+
+These are three separate operations, not a teardown sweep. Default previews use
+native read-only inspection under the existing `command.lock`; they do not stop
+services, export data, create `RSS_BACKUP_DIR` or rewrite audit/ownership records.
+The lock itself is opened for writing. Exception: an absent VM after interrupted
+removal may finalize only its exact validated receipt/hold, as described below.
+See the [full cleanup runbook](operations.md#safe-cleanup) before applying.
+**Approved project-only VM precondition:** before applying `remove-vm`, the operator
+must establish exclusive project use under [issue #5](https://github.com/brucepucci/rss-aggregator/issues/5).
+Shared/repurposed guests, other users' Podman engines and historical/alternate
+stores/cache locations are unsupported; known or uncertain such use requires
+retaining the VM and recovering/migrating the project without deleting that VM.
+The tool does not prove VM-wide exclusivity. This precondition does not waive any
+current-resource, selected-service identity or backup safeguard, and introduces no
+new flag or deletion override.
+See the [enforcement limits](architecture.md#preview-first-removal-and-generation-retirement).
+
+| Command | Purpose, prerequisites and failure behavior | JSON result |
+| --- | --- | --- |
+| `rss remove-vm [--confirm SHA256]` | Preview exact owned VM, connections, labelled app/preflight containers, selected volume and pinned images. Requires removed supervision/daily jobs, accessible running owned VM, exactly the selected owned volume, no other rootless containers/images, and no rootful containers/volumes/images. Both inventories include external/build containers and intermediate images. Both engines must have no secrets, artifacts, pods, build-cache directories or custom networks. Typed storage/backend identities must match between guest-local inspection and the actual selected rootless API service plus explicit rootful socket API; missing/unavailable/mismatching identities refuse, and the identities are bound to confirmation and rechecked after capture. Matching usernames alone never establishes the selected store. Explicit guest-user SSH with local-mode/privilege attestation runs `podman --log-level=warn --remote=false secret ls --quiet` (rootful via noninteractive sudo), never the error-swallowing secret tunnel; success requires exactly empty stdout and no diagnostics. Metadata-only artifact/pod quiet lists and cache/secret-storage name checks also fail closed. Secret metadata/driver remnants, even an empty old secret database, retain the VM for owner review. The audited gate requires guest Podman **6.2.0**, Netavark and non-transient storage. The actual selected rootless API and explicit rootful socket API must each list the exact stock network shape with valid time and diagnostic-free success. API results alone cannot prove provenance: bracketing guest helper proof and two fresh local listings are also required, as detailed below. Persisted replacements, custom/stale/changed/unavailable provenance, warnings or malformed metadata refuse. No unrelated names or secret payloads are exposed. Validates derived root connection and preserves foreign identities/defaults; refuses a project default among other connections. Requires explicit private external `RSS_BACKUP_DIR`. Apply repeats inspection, quiesces through existing lifecycle/owned-forwarding guards, creates and independently validates a **fresh full** archive, rechecks the plan and both engines' idle state immediately before stopping the VM, then invokes native `machine rm` with confirmation stdin, never force/reset/prune. Missing source, old backup or `no_data` cannot authorize deletion. | Preview: `preview: true`, `targets` (`machine`, `connections`, `containers`, `volumes`, `images`, `networks: {rootless, rootful}`), `ownership`, `backup_directory`, `backup_required`, `packages`, `retained`, `confirmation`. Success: `preview: false`, `removed: true`, `targets`, fresh `backup`, `retained`. Fully absent VM/connections: `machine`, `status: "absent"`, `preview: true`, no wider cleanup. |
+| `rss delete-volume NAME [--confirm SHA256]` | Separate irreversible deletion of one explicit owner-labelled **unselected** volume on the running owned VM. Requires zero `MountCount` and no attachment to any container, even stopped. No automatic backup. Rechecks before native nonforce `volume rm`; all other resources/backups remain. Selected, mounted, attached, foreign or changed targets refuse. | Preview: `preview: true`, `volume`, `ownership`, `irreversible: true`, `backup_created: false`, `retained`, `confirmation`. Success adds `deleted: true`, sets `preview: false`. Already absent: `preview: true`, `volume`, `status: "absent"`. |
+| `rss remove-package NAME [--confirm SHA256] [--unused-elsewhere]` | Preview one plain Homebrew formula. Fresh baseline/additions/version, recursive installed reverse dependencies (formulae and casks, including optional/build/test) and all Podman machine/connection inventories determine retention. Apply to an installed candidate requires both current digest and per-candidate unused-elsewhere attestation. Pre-existing, unknown, upgraded, shared or externally adopted packages must remain. Uses normal `brew uninstall --formula NAME` with native dependent checks enabled and `HOMEBREW_NO_AUTOREMOVE=1` forced in the subprocess regardless of inherited settings; no force/ignore-dependencies/autoremove/cleanup. Inspection/native refusal fails closed. Remove Podman first, then preview each remaining addition afresh. | `preview`, `status` (`"preview"`, `"absent"`, `"removed"`), `targets: {package, version}`, `ownership: {baseline, addition, recorded_version, version_matches}`, `dependents`, `retain` (reasons), `confirmation`. Ineligible candidates can still return a successful preview with nonempty `retain`; this is not permission to uninstall. |
+
+**VM network proof and prerequisites.**
+
+`remove-vm` additionally requires guest **Python 3.11+ with `tomllib`**, `systemctl`,
+readable Linux `/proc`, native `podman unshare` for rootless inspection and
+noninteractive sudo for rootful inspection. These are inspection prerequisites,
+not host Python changes or new CLI flags/settings; cleanup does not install them.
+The supported success profile is the audited stock Podman 6.2.0/Netavark service,
+not every theoretically equivalent custom service.
+
+Both APIs and both fresh local `network ls --format json` results must contain
+exactly the stock bridge shape with valid RFC3339Nano `created`, with no diagnostics
+or extra fields. Only the **local** timestamps must strictly increase. The API
+service caches synthetic timestamps, so a stable API timestamp is accepted; it
+need not match the local values. API-only lists omit server loader warnings and
+persisted-network provenance. Local commands force `--log-level=warn`; any warning
+refuses even when native exit status is zero.
+
+Before/after those listings, the guest helper must prove the same stock systemd
+service process owns the actual selected socket listener, shares the helper's
+filesystem root and mount/user/network namespaces, and has unchanged configuration
+fingerprints. It requires exact native stock service argv, rejects startup
+configuration/remote/storage/module/custom-network selectors and unsupported
+environment selectors, and inspects vendor/system/user main containers/storage
+configuration and applicable drop-in candidates, including absent paths/ancestors.
+Files are hashed **inside the guest**; ctime/mtime must safely predate service startup
+with trusted boot/clock agreement. Unrecognized symlinks, network-directory overrides
+or `engine.env` values refuse; the audited Fedora `/root` → `/var/roothome` alias is
+accepted. Only fingerprints leave this provenance helper, not config payloads, raw
+names, argv, environment or diagnostics; it never reads Podman secret payloads.
+Unknown/custom/stale/changed/unavailable proof fails exit 1 with no result JSON and
+retains the VM; there is no service restart, corrective mutation or bypass. These
+checks repeat at preview, apply admission and post-capture. They do not serialize
+independent native/root clients or establish every effective configuration input.
+See the [deep algorithm](architecture.md#preview-first-removal-and-generation-retirement).
+
+`confirmation` is a SHA-256 digest of the current plan/private evidence, not a
+password or reusable blanket consent. VM consent binds ownership, native resource
+and image identity, directory and connection/default inventories, plus the guest
+network configuration fingerprint. A changed fingerprint stales consent. The
+service PID/start/listener cookie is only a bracketing guard; an idle stock service
+restart between complete inspections does not itself stale consent. Package consent
+also binds baseline/additions, current installed version/dependents and executable
+and Podman identities. For present targets, a stale/invalid digest fails with exit 1
+and no JSON; obtain and review a new preview rather than retrying an old digest.
+Once inspection verifies an already-absent target, the command instead succeeds
+with exit 0 and absence JSON without validating the digest; package absence also
+requires no `--unused-elsewhere` attestation. These no-ops authorize no further
+resource deletion; other inspection, ownership and maintenance safeguards still apply.
+`--unused-elsewhere` alone never applies; it is an operator assertion that metadata
+cannot establish.
+All normal success/usage/failure stream and exit conventions above apply.
+
+VM export/validation failure before deletion retains source data and prior archives;
+writers may already be stopped while the VM runs. If the fallback idle inspection
+also fails (for example, a post-export disconnect), exit 1 with no result JSON and
+only fixed owner-inspection/guarded-reconciliation guidance; preserve the source,
+archives and maintenance rather than exposing native diagnostics or clearing an
+uncertain hold. Restore source access and establish idle engines before guarded
+reconciliation and a new preview/fresh capture. A resumed writer or failed final
+idle-engine inspection refuses before VM stop/removal and retains maintenance;
+it does not stop that writer and reuse the earlier capture. Inspect and reconcile,
+then obtain a new preview and fresh quiesced capture before retrying removal.
+Interrupted/partial stop/removal
+retains maintenance and private `removed-vm.json` (`version: 1`, status
+`removing`/`removed`, `owner`, `plan`, `backup`, `foreign_connections`). Inspect locally;
+never delete records or override the hold. After abrupt death following native rm,
+repeat `remove-vm`: only absent exact machine/connections plus the exact owned receipt,
+`stopping_vm` hold, independently reverified archive and unchanged foreign connections
+permit completion. Other cases need manual inspection and guarded reconciliation,
+not record deletion or broader cleanup. Successful absence never sweeps packages,
+archives or directories. See [interrupted removal](operations.md#failed-or-interrupted-removal).
+
+`setup` after successful removal retires only that exact old generation's owner,
+selection/provenance, security, Serve, intent and recovery records into private
+`retired-<hash>/`, preserving inventories/additions, backup locators/evidence, receipt
+and checkout, then creates fresh ownership. It never fabricates a record to adopt a
+reappearing machine. Restore before any empty startup: `setup`,
+`restore ARCHIVE --volume NEW` (starts only the owned VM), `select-volume NEW`,
+`start`, with the recorded compatible image. Use a fresh `NEW` name, not the initial
+`rss-aggregator-data` selection even when absent; verify the old original volume
+is absent. See [recreation](operations.md#recreate-and-restore-after-removal).
 
 ### Start and cold recreation
 
@@ -148,7 +254,11 @@ installs no job; actual reboot/login evidence remains separately required.
 | `backup-enable --hour H` | Optional integer `0–23`, default `3`. | Daily UTC hour, not local time; invalid range/type is usage error 2. Changing an installed policy requires disable/re-enable. |
 | `backup-enable --minute M` | Optional integer `0–59`, default `0`. | Daily UTC minute; invalid range/type is usage error 2. Wakeups may lag the target by up to 15 minutes while the session/host is available. |
 | `backup-status --check` | Optional boolean, default absent. | Emit the same status JSON, then exit 1 with sanitized stderr guidance unless `protected` is true; inspection errors still fail without JSON. |
-| Volume name syntax | Applies to `restore --volume` and `select-volume`. | 1–128 characters, first ASCII letter/digit, remaining ASCII letters/digits/`_`/`.`/`-`. Not a path or option; invalid names fail the operation (exit 1). |
+| Cleanup `--confirm SHA256` | Optional text, absent means preview only; applies to all three cleanup commands. | Pass the exact current preview's `confirmation` to request apply. For present targets, invalid/stale text fails exit 1 without JSON, not a bypass. Verified already-absent targets succeed with absence JSON without digest validation (or package unused-elsewhere attestation). No interactive project prompt substitutes for this digest. |
+| `delete-volume NAME` | Required positional volume name, no default. | Exactly one unselected labelled volume; selected/mounted/attached/foreign targets refuse. Already absent reports absence. |
+| `remove-package NAME` | Required positional formula name, no default. | One plain lowercase formula name (letters/digits, `+`, `_`, `.`, `-`, optional `@version`); no tap paths, casks, paths, options or multiple names. Invalid name fails exit 1. |
+| `remove-package --unused-elsewhere` | Optional boolean, default false; mandatory for apply to an installed candidate. | Attest this exact package has not been adopted by other work. Cannot override retention reasons/dependent checks or replace `--confirm`. |
+| Volume name syntax | Applies to `restore --volume`, `select-volume` and `delete-volume`. | 1–128 characters, first ASCII letter/digit, remaining ASCII letters/digits/`_`/`.`/`-`. Not a path or option; invalid names fail the operation (exit 1). |
 
 `api-check` accepts no positional arguments, credential flags/environment variables
 or URL argument. It prompts on stderr for the FreshRSS username and hidden separate
@@ -353,5 +463,7 @@ Operational uses of upstream Homebrew/Podman commands are scoped in
 [operations](operations.md), [configuration](configuration.md#changing-the-loopback-port)
 and [recovery](backup-restore.md). Credential-free curl diagnostics and their
 flags/HTTP-status semantics belong to the canonical [private-access runbook](tailscale-readkit.md#real-https-checks--human-assisted).
-There is no project command for prune/reset, VM/volume deletion, package uninstall,
+[Cleanup commands](#cleanup-commands) cover only guarded owned VM removal, separate
+unselected-volume deletion and one confirmed project-added formula. There is no
+project command for global prune/reset, automatic package/cache/directory sweeps,
 automatic image updates, forwarding adoption/reset or an insecure TLS bypass.

@@ -16,6 +16,8 @@ elif args[:2] == ["machine", "inspect"]:
     print(json.dumps([state["details"][args[2]]]))
 elif args[:2] == ["machine", "init"]:
     name = args[-1]
+    if len(name) > 30:
+        raise SystemExit("machine name must be 30 characters or less")
     if any(m["Name"] == name for m in state["machines"]):
         raise SystemExit("machine name conflict")
 

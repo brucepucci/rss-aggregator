@@ -438,18 +438,303 @@ second-host/cross-architecture portability nor paid-feed/ReadKit acceptance.
 
 ## Safe cleanup
 
-For now, safe cleanup is **`uv run --locked rss stop`**. No VM/volume deletion,
-prune, package uninstall or destructive convenience command exists. **Deleting the
-VM destroys its native volumes and all FreshRSS data.** Preserve external backups.
-Do not run global Podman prune/reset or remove shared Homebrew dependencies.
+**VM removal destroys every remaining native guest volume/image, including the
+FreshRSS database.** The following operations are intentionally separate:
 
-Keep `.local/owner.json` and its companion records: they associate the controlling
-checkout with machine/connection identity and resource labels. Preserve this
-state when relocating a checkout on the same host; use fresh setup and restore
-when moving to another host. The package-addition ledger is evidence for later
-conservative cleanup, not permission to uninstall packages adopted by other work.
-`.venv` and uv caches are tooling, not FreshRSS data or backups. Normal stop leaves
-them alone; do not confuse `.local/` with a disposable tool cache.
+| Task | Operation and boundary |
+| --- | --- |
+| Release memory / stop serving | `rss stop`: backed-up shutdown, retains VM/data/packages. |
+| Recreate application | `rss replace`: retains selected named data volume. |
+| Remove owned VM | `rss remove-vm`: preview first; apply requires fresh verified external backup and current plan digest. Retains packages, archives and audit state. |
+| Delete inactive data | `rss delete-volume NAME`: separate irreversible preview/confirmation, **no automatic backup**. |
+| Optional host formula removal | `rss remove-package NAME`: one proven project addition, fresh confirmation plus unused-elsewhere attestation. |
+| Delete an archive | Manual exact-file double review below; never pruning or directory removal. |
+
+Use the stable controlling checkout, existing private `RSS_STATE_DIR` and intended
+port/image/forwarding settings throughout. Never copy/fabricate owner records,
+relabel resources, remove `.local/`, run global Podman prune/reset, or remove shared
+Homebrew dependencies to make cleanup pass. All previews use native read-only
+inspection under the existing command lock; they do not stop services, create a
+backup/destination or rewrite ledgers. The lock file itself is opened for writing.
+An interrupted-removal receipt finalization is the narrowly scoped exception below.
+Keep preview output private: it contains local identities/paths, not backup contents.
+
+### Preview and remove the VM
+
+**Supported-use precondition — project-only VM:** under the
+[approved issue #5 scope](https://github.com/brucepucci/rss-aggregator/issues/5),
+automatic removal is only for the dedicated VM created and used exclusively by
+this project. Before applying, establish that it has not been shared/repurposed or
+hosted other users' Podman engines or historical/alternate stores/cache locations
+outside the inspected project contexts. This is an operator-established condition,
+not something a successful preview proves. If false or uncertain, **retain the VM**
+and recover/migrate the project instance without deleting that VM. Do not erase
+unrelated resources to make it qualify. This does not relax any inspection,
+ownership, current selected-service identity, confirmation or backup safeguard.
+
+1. Coordinate with the owner; retain needed logs/container-layer diagnostics and an
+   independent durable recovery copy. Record selection, compatible image and wanted
+   job settings privately. Remove captured jobs **with existing commands**, using
+   their existing selectors, before cleanup:
+
+   ```sh
+   uv run --locked rss supervision-remove
+   uv run --locked rss backup-disable
+   ```
+
+   Require both removals to succeed; never delete plists/registrations by hand.
+   Removal of jobs does not stop FreshRSS. Do not run normal `stop` before the VM
+   removal preview: removal needs an accessible **running** source for a fresh backup.
+   If already stopped, start only the verified owned VM locally; do not start an
+   empty/replacement application merely to satisfy inspection.
+2. Explicitly export an absolute private `RSS_BACKUP_DIR` outside every Git checkout
+   (no default), and run:
+
+   ```sh
+   uv run --locked rss remove-vm
+   ```
+
+   Review exact machine/connections, container names, selected volume, pinned image
+   IDs, ownership, backup directory, retained resources and `confirmation`. Preview
+   does not create the directory. An existing directory must be user-owned/private;
+   apply creates a missing destination through the normal backup path.
+3. Resolve every refusal without broadening scope. The owned rootless engine may
+   contain only labelled app/preflight containers, **exactly the selected volume**
+   and pinned image(s). Additional recovery volumes must be deliberately retained
+   elsewhere or separately handled; labels alone do not make them disposable. The
+   rootful engine must have no containers (including external/build containers),
+   volumes, images (including intermediate images), pods, secrets or OCI artifacts.
+   **Neither engine may contain secrets, artifacts, pods, build caches or custom networks**:
+   the project owns none and the instance backup does not preserve them. Only a
+   verified stock built-in network baseline is disposable, not a network accepted
+   merely because its name is familiar. Automatic removal currently requires
+   **guest Podman 6.2.0, Netavark and non-transient storage**; other versions/backends,
+   persisted/reconfigured default networks or inspection warnings retain the VM.
+   Both the actual selected rootless API and explicit rootful socket API must list
+   the exact stock network shape with valid timestamps and no diagnostics. Two
+   fresh **local** inspections must independently synthesize increasing `created`
+   timestamps; a stable API timestamp is normal because the service caches it.
+   API-only lists omit server loader warnings and persisted provenance, so they
+   cannot replace the local proof. Forced local warning output must be empty,
+   including warnings about skipped configuration files.
+   See the [audited inventory boundary](architecture.md#preview-first-removal-and-generation-retirement).
+   Cleanup never reads Podman secret payloads or cache contents and does not report
+   unrelated resource names. Its provenance helper reads/hashes configuration files
+   only inside the guest; config payloads, raw names, argv, environment and native
+   diagnostics do not leave that helper, only fingerprints. Even empty/stale secret
+   databases or driver remnants require separate review rather than trusting native
+   empty-list output. Retain the VM and arrange separate owner-reviewed
+   recovery/migration outside this workflow; do not delete
+   unrelated resources merely to pass cleanup. Failed or malformed inspections also
+   refuse, including the repeated inspection after capture. Inventories cover the
+   reported matching local/API contexts and effective/stock build-cache paths.
+   Matching SSH users is insufficient: cleanup compares typed storage/backend
+   identities against the actual selected rootless API service and the rootful
+   socket service. Missing/mismatched/unavailable API identity retains the VM;
+   do not reconfigure or erase a store merely to make inspection pass. The same
+   identities are bound to consent and compared again after capture.
+   Network proof also requires guest **Python 3.11+ with `tomllib`**, `systemctl`,
+   readable Linux `/proc` and native `podman unshare` for rootless inspection, plus
+   noninteractive sudo for rootful inspection. The helper brackets the API/local
+   lists with same-service/process/socket-listener and namespace proof, exact stock
+   service argv and stable containers/storage configuration fingerprints. It checks
+   vendor/system/user main and drop-in candidates, absent paths and ancestors;
+   ctime/mtime must safely predate service startup under trusted boot/clock agreement.
+   Startup selectors, custom network-directory overrides, `engine.env` values,
+   unrecognized symlinks and unknown/custom/stale/changed/unavailable provenance
+   retain the VM. The audited Fedora `/root` → `/var/roothome` alias is accepted.
+   This intentionally conservative stock profile is not arbitrary service-equivalence
+   detection. Do not restart a service, rewrite config, install guest tools or erase
+   evidence merely to obtain deletion authority; cleanup makes no such repairs.
+   A configuration fingerprint change requires fresh preview/consent; a stock idle
+   service restart between complete inspections does not itself invalidate consent.
+   Service swaps **during** an inspection refuse. No check is atomic against
+   independent native/root clients: coordinate against concurrent mutations.
+   VM-wide discovery of other users' engines or historical/alternate stores/cache
+   locations is outside the approved project-only scope, **not permission to delete
+   them**. Known or uncertain such use fails the supported-use precondition above:
+   retain/recover that VM. A currently selected API store is always in scope, even
+   if customized; a mismatch must never be dismissed as historical. Some effective
+   service configuration is not exposed by `info`; matching surfaced metadata is
+   not proof of all configuration or exclusivity. Arbitrary guest files are not
+   backed up by the instance archive. Machine/rootless identity and the derived
+   root connection are checked; foreign connections/defaults must remain unchanged.
+   If a project connection is default among others, explicitly choose the intended
+   retained default with native Podman tooling after owner review, then preview anew.
+   Cleanup will not choose a default for you or contact unrelated engines.
+4. Only after reviewing the current preview, substitute its exact digest:
+
+   ```sh
+   uv run --locked rss remove-vm --confirm '<CURRENT-PREVIEW-SHA256>'
+   ```
+
+   Apply repeats inspection, takes durable maintenance, quiesces writers and removes
+   **only owned** forwarding through existing lifecycle guards. It creates a fresh
+   full external archive, independently checks whole-file SHA-256 and archive content,
+   then rechecks the removal plan. An older good archive or `no_data` never substitutes
+   for this capture. Immediately before VM shutdown it checks both engines are still
+   idle; a detected resumed writer or failed idle inspection refuses shutdown/removal
+   and retains maintenance. Finally it stops the VM and runs native `machine rm` with
+   confirmation stdin, never `--force`, global reset or prune. A changed plan requires
+   a newly reviewed preview; no digest authorizes future changes. Do not run independent
+   native writer/Podman commands concurrently: the project lock does not serialize them.
+5. Retain the successful `backup` result/archive and private `removed-vm.json` receipt.
+   Confirm exact targets absent and foreign connections/defaults unchanged. Homebrew,
+   Tailscale itself/unrelated services, archives, checkout and audit records remain.
+   A repeat with VM and both owned connections fully absent reports `absent`, not a
+   wider sweep. A lingering connection or partial setup is a refusal for inspection,
+   not permission to delete unverified names. See [recreation below](#recreate-and-restore-after-removal).
+
+### Failed or interrupted removal
+
+Before deletion, failed backup/validation leaves source data and prior archives
+intact; writers/owned forwarding may already be stopped while the VM remains running.
+Fix the cause before a new preview/apply. Failure does not prove service is closed.
+If the source disconnects after export or the fallback idle inspection also fails,
+the fixed error retains the VM, source, archives and maintenance without exposing
+native diagnostics. Restore source access and inspect both engines locally before
+using guarded `backup-reconcile`; then obtain a new preview and fresh capture.
+Do not clear a hold based on an earlier archive or assume uncertain writers stopped.
+If writers resumed after capture, the VM/data and maintenance remain: inspect locally
+and use guarded `backup-reconcile` to establish idle engines, then preview/apply again
+for a **fresh quiesced capture including intervening changes**. Stopping the resumed
+writer does not make the earlier archive sufficient to authorize deletion; do not
+reuse it or remove the maintenance marker by hand.
+Native exports can outlive Python while retaining `command.lock`; never unlink the
+lock or kill real helpers to bypass it. Interrupted or partial removal keeps durable
+maintenance and receipt evidence. Inspect `rss status`, `rss backup-status`, native
+machine/connection identities and the exact archive privately with the owner.
+Use guarded `backup-reconcile` only when its existing owner/schema/idle-engine checks
+can establish safety; never delete/override records to clear a hold.
+
+If the process died after native rm, repeat the **same `rss remove-vm` operation**.
+It may finish the receipt only when exact VM/connections are absent, its versioned
+receipt matches the current owner, the matching hold is at `stopping_vm`, the recorded
+external archive independently verifies and foreign connections/defaults still match.
+This is receipt completion, not further deletion. Missing/malformed/mismatched evidence,
+partial remaining resources or a changed foreign inventory require manual inspection;
+there is no automatic adoption, record deletion or data-loss override.
+
+**Unavailable VM:** preserve the VM disk, ownership/selection/provenance, logs and all
+archives. Refuse automated removal if the source cannot be inspected/exported. With
+the owner and provider-specific Podman recovery guidance, repair access or recover
+from a verified external copy. If disk mounting/extraction is needed, obtain explicit
+approval, preserve an independent source-disk copy first, keep the original untouched,
+and establish a read-only/provider-supported recovery path; do not attach writable
+SQLite storage concurrently or guess provider disk paths. The project has no mount
+recovery automation. If safe access cannot be established, stop and retain evidence.
+A known old archive does not authorize deleting the unavailable source.
+
+### Recreate and restore after removal
+
+Keep the controlling checkout, inventories/additions, backup locators/evidence and
+archives. After successful deletion, `setup` retires only the exact prior generation's
+owner, selected-volume/provenance, security, Serve, operator intent and supervision
+recovery state into private `retired-<hash>/`, then creates fresh ownership. It preserves
+the removal receipt and refuses a reappearing colliding machine/connection; never
+fabricate an owner record or manually move files to force adoption.
+
+Restore **before any empty application `start`**. Use the archive's recorded compatible
+reviewed image configuration, not an assumed database downgrade or floating latest:
+
+```sh
+uv run --locked rss setup
+uv run --locked rss restore '/absolute/private/ARCHIVE.zip' --volume NEW
+uv run --locked rss select-volume NEW
+uv run --locked rss start
+```
+
+Replace `NEW` with a fresh valid name, not the old selected/original name. The initial
+`rss-aggregator-data` selection is refused as a restore target even when absent.
+Confirm that the old original volume is absent, not silently recreated. Restore
+starts only the owned VM as needed, imports without activation and
+leaves the VM running. Check `restored: true`, then explicitly select the complete
+volume and start. Follow [full-state recovery](backup-restore.md#recovery-on-this-or-a-clean-host)
+for matching first activation, host-specific settings and trusted archive handling.
+Independently verify fresh login, original user/settings/subscriptions, representative
+article content and both read/unread and starred/unstarred state. HTTP readiness or
+empty infrastructure is not recovery acceptance. Re-enable only explicitly wanted
+jobs after successful application/private-access verification with fresh captures.
+Retain the archive and retired audit evidence.
+
+Use the [separately selected native drill](development.md#cleanup-verification-and-remaining-native-evidence)
+to verify disposable VM remove/recreate/authenticated recovery and retain
+revision-specific outcomes in the issue/PR. Earlier source-absent recovery and
+default deterministic tests do not prove this whole path. The native drill compares
+retained machine names and connection/default inventories, but does not uninstall
+host packages or fully inspect every unrelated resource.
+
+### Permanently delete an inactive volume
+
+This is **irreversible application-data deletion**, not environment cleanup. It makes
+**no automatic backup**. With owner approval, first retain and independently verify
+any recovery copy needed. Run `rss delete-volume NAME`, inspect its exact volume,
+label ownership, `irreversible`, `backup_created: false`, preserved resources and
+`confirmation`; only then run `rss delete-volume NAME --confirm '<CURRENT-PREVIEW-SHA256>'`.
+The running owned VM must show an **unselected** labelled volume, zero `MountCount`
+and no attachments, including stopped containers. Selected/mounted/attached/foreign
+or changed volumes refuse; do not detach or change selection merely to bypass review.
+Native `volume rm` is nonforce. Only that target (and its provenance entry) is removed;
+containers, VM, all other volumes, packages and archives remain. Already absent reports
+absence, not cleanup of another target.
+
+### Optionally remove project-added formulae
+
+Package removal is never automatic after VM deletion. Preserve initial
+`host-before.json` and cumulative `host-additions.json`; an installation delta is
+not proof of continued exclusive use. Before each candidate, confirm with the owner
+that no other project/manual tool has adopted it. Unknown external usage means retain.
+
+1. Remove the owned VM first. **Any** remaining Podman machine or connection, including
+   foreign/stopped ones, blocks package removal; preserve them, never delete them to
+   obtain eligibility. Remove Podman first only if it is an unchanged recorded addition
+   and unused elsewhere: `rss remove-package podman`.
+2. Read the one-formula preview's `targets`, ownership/version evidence, current
+   `dependents`, `retain` reasons and `confirmation`. A successful preview with retention
+   reasons is not uninstall approval. Baseline/pre-existing, unknown or upgraded
+   packages stay. Fresh recursive reverse-dependency inspection covers installed
+   formulae **and casks**, including optional/build/test dependencies. Query failures
+   and unverified Podman absence refuse.
+3. Only when eligible and genuinely unused elsewhere, run
+   `rss remove-package podman --unused-elsewhere --confirm '<CURRENT-PREVIEW-SHA256>'`.
+   Both assertions are required. Apply rechecks native inventories/versions/identity
+   before normal `brew uninstall --formula`, with native dependent checks **enabled**
+   and `HOMEBREW_NO_AUTOREMOVE=1` forced in the subprocess regardless of inherited
+   settings. This suppresses Homebrew's implicit global orphan sweep; installation's
+   no-cleanup setting alone does not prevent uninstall-time autoremove.
+   There is no force, ignore-dependencies, autoremove or cleanup; native refusal is
+   not a reason to bypass dependencies. It does not reverse historical upgrades.
+4. Preview each remaining ledger addition **again**, one plain formula name at a time,
+   after Podman removal. Attest/confirm each separately only if no current consumer
+   needs it. Do not turn the ledger into an uninstall loop. Already absent reports
+   absence. Preserve ledgers/evidence and all other packages/resources/backups.
+
+### Residual files and manual archive deletion
+
+There is no automatic cache/configuration/directory sweep. `.venv` and uv caches are
+tooling, not FreshRSS data; stop/removal do not clear them. Retain sensitive audits,
+retired generations, backup locators and external archives privately. Review residuals
+locally one **exact owned path** at a time against ownership evidence and current
+consumers; uncertainty means retain. No broad `rm`, recursive cleanup of `.local/`,
+Homebrew directories, Podman storage or backup directories is authorized.
+
+Archive deletion is a **separate manual exact-file double-review confirmation**:
+
+1. Obtain owner approval for the specific archive; select its absolute regular-file
+   path locally. Review parent directory, symlinks, basename, size/date and checksum
+   against private publication evidence. Do not choose a glob, directory or newest/oldest
+   shortcut. Archive contents include credentials/private feed URLs.
+2. Independently review the exact target a second time with the owner. Verify any
+   required retained recovery copy by checksum/archive validation and recovery evidence;
+   confirm this is not the only needed recovery point. Unknown copy status means retain.
+3. Obtain explicit final confirmation naming **that exact file** after both reviews.
+   Use a local file manager's single-file deletion, with no multi-select/recursive
+   operation. Do not provide a shell one-liner or remove its parent directory. Deletion
+   of a staged copy, independent copy or trash contents needs its own review/approval;
+   this procedure is not secure-erasure proof.
+4. Confirm only that file is gone and retained archives remain. Keep a private minimal
+   audit of consent/identity/outcome, not database contents or credentials. No automatic
+   archive pruning, record sweep, encryption or upload is implied.
 
 ## Service logs and feed errors
 
