@@ -299,13 +299,44 @@ create a destination or rewrite records (the existing lock is opened for writing
 
 VM removal requires a running accessible owned machine, exactly the selected
 labelled volume, only reserved owner-labelled app/preflight containers and pinned
-images, no rootless secrets, and an entirely empty rootful engine, including stopped
-containers/volumes/images and secrets. Both explicitly targeted engines are checked
-with metadata-only `secret ls --format json` during preview, apply admission and
-post-capture plan inspection. Any secret or failed/malformed inventory refuses:
-this project owns no engine secrets and the selected-volume archive preserves none.
-Secret names/payloads are not included in reports or receipts; payloads are never
-requested. Machine/rootless and derived-root connection identities are validated.
+images, and no rootful containers/volumes/images. Both inventories include external
+build containers and intermediate images. Both engines must have no secrets, OCI
+artifacts, pods, build caches or custom networks: the selected-volume archive covers
+none. Explicit SSH username is cross-checked against owned machine/connection
+metadata; rootful commands use noninteractive sudo. Each guest engine's `info` must
+attest local mode and expected privilege, non-transient storage, guest Podman 6.2.0
+and Netavark before inventory. `--remote=false` alone is insufficient if guest
+configuration selects tunnel mode. Secrets use local `secret ls --quiet`, artifacts
+`artifact ls --quiet`, pods `pod ps --quiet`: only successful, diagnostic-free,
+exactly empty stdout establishes absence. Secret `--format json` is literal template
+text, not a JSON mode; the remote secret tunnel can discard API errors. No secret
+payload is requested; unrelated names/native diagnostics never enter reports or
+receipts. A name-only guest `find` also requires secret-manager storage to contain
+only its native lockfile, refusing even empty/stale databases and driver remnants
+because native secret loading can swallow a failed database stat. Buildah mount
+cache names are inspected in the effective image-copy temp directory and stock
+`/var/tmp`/`/tmp`; no cache contents are read.
+
+The only disposable networks are verified *synthetic stock defaults*, listed under
+both engine contexts in preview targets. Require the full stock bridge configuration,
+fixed ID, subnet/gateway, disabled DNS/IPv6/internal flags and host-local IPAM, with
+no extra keys. Two independent local listings must show strictly increasing valid
+`created` timestamps: [Netavark 6.2.0](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
+synthesizes an absent default with `time.Now()` per process, whereas a persisted
+replacement retains its timestamp even if it copies the name/ID/configuration.
+Force guest `--log-level=warn` and reject every network warning too: the native
+loader can skip malformed/unreadable configuration files while reporting success,
+and configured logging must not suppress that evidence. This avoids guessing the effective
+network configuration directory. Other guest versions/backends, uncertain clocks,
+custom/persisted defaults and failed/malformed inspection retain the VM; there is
+no override to convert uncertainty into deletion authority.
+
+These checks repeat at preview, apply admission and post-capture plan inspection.
+They cover registered resources in the two current engine contexts and the stated
+cache paths, not historical alternate stores/cache locations, other users' engines,
+or arbitrary guest files. Manifest lists and image build caches are image objects;
+empty pods, external build containers and standalone mount caches require the
+separate checks above. Machine/rootless and derived-root connection identities are validated.
 Foreign connections/defaults remain unchanged; a project default among other
 connections refuses instead of letting native removal select another default.
 Captured jobs must first be removed by supervision-remove/backup-disable. Confirmation

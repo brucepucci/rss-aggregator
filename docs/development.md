@@ -577,14 +577,43 @@ uninstall host packages or consume production data. Maintain coverage for:
   limit. Stop at the controlled VM-start boundary; this is setup compatibility,
   not a substitute for native recovery or authenticated-state evidence.
 - Running owned source, exactly selected labelled volume, only labelled reserved
-  containers/pinned images, empty rootful engine including stopped resources,
-  derived-root/default-connection validation and removed captured jobs.
+  containers/pinned images, no rootful containers/volumes/images including stopped,
+  external build containers and intermediate images; derived-root/default-connection
+  validation and removed captured jobs. Empty pods are independent resources too.
 - Rootless/rootful standalone secret sentinels must survive refusal at preview,
   apply admission and post-export inspection. Model native VM deletion as destroying
   guest secret storage; any secret, failed metadata command or malformed inventory
-  must retain the VM/data. Assert only explicit-engine `secret ls --format json`
-  calls, no payload reads and no secret names/payloads/native diagnostics in output.
-  Empty secret inventories must still allow normal guarded removal.
+  must retain the VM/data. Assert only guest-local `podman --remote=false secret ls
+  --quiet` through named-machine SSH with an explicitly verified guest username;
+  rootful uses `sudo -n --`. `info` must attest local mode and expected rootless/rootful
+  privilege before listings: configuration can override `--remote=false`. Accept
+  exactly empty stdout only at exit zero with no diagnostics; whitespace is not an
+  empty list. No payload reads or names/payloads/native diagnostics in output.
+  Empty inventories must permit normal removal. Model native `--format json` as
+  literal template text (empty stdout or `json` per row), never a fabricated JSON
+  array, and model the remote tunnel's discarded API error as exit-zero/empty.
+  [Pinned native quiet/local contracts](https://github.com/containers/podman/blob/v6.2.0/cmd/podman/secrets/list.go)
+  are source-verified; remote loopback experiments are not guest-local evidence.
+  Name-only secret-storage inspection must also refuse stale/empty metadata DBs,
+  driver remnants and unavailable inspection: native loading can swallow failed stat.
+- Rootless/rootful artifact, custom-network, pod, external-container, mount-cache
+  and secret-storage sentinels must survive preview/apply/post-export refusal,
+  including failed/malformed metadata. Model deletion as destroying these stores.
+  Inspect effective and stock `/var/tmp`/`/tmp` Buildah cache names, never contents;
+  `images --all` covers intermediate image caches/manifest lists, not mount caches.
+- Network success must require the complete audited stock default, not name/ID.
+  Assert refusal for custom subnets, persisted stock-shaped replacements, extra or
+  wrongly typed fields, invalid timestamps and warnings from skipped config files.
+  Two independent *local* listings must synthesize increasing `created` timestamps;
+  persisted configuration retains its timestamp. Force guest `--log-level=warn` so
+  configuration cannot hide loader warnings. Supported gate: guest Podman 6.2.0,
+  Netavark and non-transient storage; refuse unknown versions/backends/mode/storage.
+  Keep the fixture's dynamic creation distinct from persisted replacement metadata.
+  [Native synthesis/loading behavior](https://github.com/containers/podman/blob/v6.2.0/vendor/go.podman.io/common/libnetwork/netavark/network.go#L198-L337)
+  is source-verified, not a live guest acceptance result. Inventories cover current
+  engine contexts/current and stock cache paths, not historical alternate stores,
+  other users or arbitrary guest files; independent configuration mutation is not
+  serialized by the project lock.
 - Fresh export plus independent archive/checksum validation before VM deletion,
   backup/inspection/stop/rm failures, unavailable/absent/partially initialized
   sources, resources arriving during export, prior archive preservation and no

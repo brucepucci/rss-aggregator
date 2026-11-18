@@ -41,12 +41,16 @@ class BackupProject:
             "Created": "fixture",
             "ConfigDir": {"Path": "/fixture"},
             "Rootful": False,
-            "SSHConfig": {"Port": 12345, "IdentityPath": "/fixture/key"},
+            "SSHConfig": {
+                "Port": 12345,
+                "IdentityPath": "/fixture/key",
+                "RemoteUsername": "core",
+            },
             "State": "running",
         }
         connection = {
             "Name": "rss-aggregator",
-            "URI": "ssh://fixture",
+            "URI": "ssh://core@fixture",
             "Identity": "/fixture/key",
         }
         owner = {"token": "fixture-owner", "machine": machine, "connection": connection}

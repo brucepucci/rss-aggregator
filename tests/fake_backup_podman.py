@@ -3,9 +3,11 @@
 import io
 import json
 import os
+import shlex
 import shutil
 import sys
 import tarfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 path = Path(os.environ["FAKE_BACKUP_ENGINE"])
@@ -24,14 +26,59 @@ def fail(message):
     raise SystemExit(125)
 
 
-def list_secrets(engine):
+def list_secrets(engine, local=False):
     if state.get("fail_secret_inventory") == engine:
-        fail("sensitive secret inspection diagnostic")
+        # The native remote tunnel drops SecretList's API error. Only the
+        # guest-local engine reliably propagates an unavailable inventory.
+        if local:
+            fail("sensitive secret inspection diagnostic")
+        return
     if state.get("malformed_secret_inventory") == engine:
         print(json.dumps({"sensitive": "invalid secret metadata"}))
     else:
         key = "secrets" if engine == "rootless" else "rootful_secrets"
-        print(json.dumps(state.get(key, [])))
+        # Guest-local --quiet emits IDs only; --format json is instead a
+        # literal Go template. Both write nothing for a healthy empty store.
+        for secret in state.get(key, []):
+            print(secret["ID"] if local else "json")
+
+
+def guest_records(engine, resource, default):
+    if state.get("fail_guest_inventory") == [engine, resource]:
+        fail("sensitive guest inspection diagnostic")
+    if state.get("malformed_guest_inventory") == [engine, resource]:
+        return {"sensitive": "invalid guest metadata"}
+    key = resource if engine == "rootless" else "rootful_" + resource
+    return state.get(key, default)
+
+
+def list_guest_quiet(engine, resource):
+    records = guest_records(engine, resource, [])
+    if not isinstance(records, list):
+        print(json.dumps(records))
+    else:
+        for _record in records:
+            print("synthetic-id")
+
+
+def list_networks(engine):
+    # Native v6.2.0 synthesizes an absent default anew per local process;
+    # a persisted replacement's Created field remains stable across calls.
+    network = {
+        "name": "podman",
+        "id": "2f259bab93aaaaa2542ba43ef33eb990d0999ee1b9924b557b7be53c0b7a1bb9",
+        "driver": "bridge",
+        "network_interface": "podman0",
+        "created": datetime.now(UTC).isoformat(),
+        "subnets": [{"subnet": "10.88.0.0/16", "gateway": "10.88.0.1"}],
+        "ipv6_enabled": False,
+        "internal": False,
+        "dns_enabled": False,
+        "ipam_options": {"driver": "host-local"},
+    }
+    if state.get("warn_network_inventory") == engine:
+        sys.stderr.write("sensitive unreadable network configuration")
+    print(json.dumps(guest_records(engine, "networks", [network])))
 
 
 def resume_writer(stage):
@@ -85,12 +132,16 @@ elif args[:2] == ["machine", "init"]:
         "Created": "recreated",
         "ConfigDir": {"Path": "/new-fixture"},
         "Rootful": False,
-        "SSHConfig": {"Port": 12346, "IdentityPath": "/new-fixture/key"},
+        "SSHConfig": {
+            "Port": 12346,
+            "IdentityPath": "/new-fixture/key",
+            "RemoteUsername": "core",
+        },
         "State": "stopped",
     }
     state["connection"] = {
         "Name": "rss-aggregator",
-        "URI": "ssh://new-fixture",
+        "URI": "ssh://core@new-fixture",
         "Identity": "/new-fixture/key",
     }
     save()
@@ -119,23 +170,106 @@ elif args == ["machine", "rm", "rss-aggregator"]:
         "rootful_secrets",
         "secret_payloads",
         "rootful_secret_payloads",
+        "artifacts",
+        "rootful_artifacts",
+        "networks",
+        "rootful_networks",
+        "pods",
+        "rootful_pods",
+        "external",
+        "rootful_external",
+        "guest_sentinel",
+        "build_cache",
+        "rootful_build_cache",
+        "secret_storage",
+        "rootful_secret_storage",
+        "intermediate_images",
+        "rootful_intermediate_images",
     ):
         state.pop(key, None)
     save()
-elif args[:3] == ["machine", "ssh", "rss-aggregator"]:
+elif args[:2] == ["machine", "ssh"]:
     if machine["State"] != "running" or state.get("unresponsive"):
         fail("source unavailable with sensitive diagnostics")
-    if args[3:] == ["sudo", "podman", "secret", "ls", "--format", "json"]:
-        list_secrets("rootful")
+    if args[2:4] == ["--username", "core"]:
+        assert args[4] == "rss-aggregator"
+        command = args[5:]
+    else:
+        assert args[2] == "rss-aggregator"
+        command = args[3:]
+    rootful = command[:1] == ["sudo"]
+    if rootful:
+        command = command[3:] if command[:3] == ["sudo", "-n", "--"] else command[1:]
+    engine = "rootful" if rootful else "rootless"
+    command = shlex.split(" ".join(command))
+    if command[:2] == ["podman", "--log-level=warn"]:
+        command = ["podman", *command[2:]]
+    if command[:1] == ["find"]:
+        assert command[1] == "-H"
+        if command[-4:] == ["-name", "buildah-cache-*", "-print", "-quit"]:
+            list_guest_quiet(engine, "build_cache")
+        else:
+            assert command[-5:] == ["!", "-name", "secrets.lock", "-print", "-quit"]
+            list_guest_quiet(engine, "secret_storage")
         raise SystemExit(0)
-    kind = (
-        "rootful_volumes"
-        if "volume" in args
-        else "rootful_images"
-        if "images" in args
-        else "rootful"
-    )
-    print(json.dumps(state.get(kind, [])))
+    if command[:2] == ["podman", "--remote=false"]:
+        if command[2:] == ["info", "--format", "json"]:
+            print(
+                json.dumps(
+                    state.get(
+                        engine + "_info",
+                        {
+                            "host": {
+                                "serviceIsRemote": False,
+                                "security": {"rootless": not rootful},
+                                "networkBackend": "netavark",
+                            },
+                            "version": {"Version": "6.2.0"},
+                            "store": {
+                                "transientStore": False,
+                                "imageCopyTmpDir": "/var/tmp",
+                                "graphRoot": "/var/lib/containers/storage"
+                                if rootful
+                                else "/var/home/core/.local/share/containers/storage",
+                            },
+                        },
+                    )
+                )
+            )
+            raise SystemExit(0)
+        if command[2:] == ["network", "ls", "--format", "json"]:
+            list_networks(engine)
+            raise SystemExit(0)
+        if command[2:] == ["artifact", "ls", "--quiet"]:
+            list_guest_quiet(engine, "artifacts")
+            raise SystemExit(0)
+        if command[2:] == ["pod", "ps", "--quiet"]:
+            list_guest_quiet(engine, "pods")
+            raise SystemExit(0)
+    if command == ["podman", "--remote=false", "secret", "ls", "--quiet"]:
+        list_secrets("rootful" if rootful else "rootless", local=True)
+        raise SystemExit(0)
+    if command == ["podman", "secret", "ls", "--format", "json"]:
+        list_secrets("rootful" if rootful else "rootless")
+        raise SystemExit(0)
+    if command[:2] == ["podman", "--remote=false"]:
+        command = ["podman", *command[2:]]
+    operations = {
+        ("podman", "ps", "--format", "json"): "rootful",
+        ("podman", "ps", "--all", "--external", "--format", "json"): "rootful",
+        ("podman", "volume", "ls", "--format", "json"): "rootful_volumes",
+        ("podman", "images", "--all", "--format", "json"): "rootful_images",
+    }
+    kind = operations.get(tuple(command))
+    if not rootful or kind is None:
+        fail("UNEXPECTED GUEST OPERATION: " + " ".join(command))
+    records = state.get(kind, [])
+    if "--external" in args:
+        external = guest_records(engine, "external", [])
+        records = records + external if isinstance(external, list) else external
+    if "--all" in args and "images" in args:
+        records += state.get("rootful_intermediate_images", [])
+    print(json.dumps(records))
 elif args[:2] == ["--connection", "rss-aggregator"]:
     if machine["State"] != "running":
         fail("engine unavailable")
@@ -143,15 +277,15 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     if args == ["secret", "ls", "--format", "json"]:
         list_secrets("rootless")
     elif args[0] == "ps":
-        print(
-            json.dumps(
-                [
-                    {"Names": [name]}
-                    for name, container in state["containers"].items()
-                    if "--all" in args or container["State"]["Running"]
-                ]
-            )
-        )
+        records = [
+            {"Names": [name]}
+            for name, container in state["containers"].items()
+            if "--all" in args or container["State"]["Running"]
+        ]
+        if "--external" in args:
+            external = guest_records("rootless", "external", [])
+            records = records + external if isinstance(external, list) else external
+        print(json.dumps(records))
     elif args[:2] == ["image", "inspect"]:
         image = state["image"]
         print(
@@ -197,7 +331,10 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     elif args[:2] == ["volume", "ls"]:
         print(json.dumps([{"Name": name} for name in state["volumes"]]))
     elif args[0] == "images":
-        print(json.dumps(state.get("images", [{"Id": "fixture-image"}])))
+        images = state.get("images", [{"Id": "fixture-image"}])
+        if "--all" in args:
+            images += state.get("intermediate_images", [])
+        print(json.dumps(images))
     elif args[:2] == ["volume", "exists"]:
         raise SystemExit(0 if args[2] in state["volumes"] else 1)
     elif args[:2] == ["volume", "inspect"]:
@@ -241,6 +378,9 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
             save()
         if state.get("secret_state_during_export"):
             state.update(state["secret_state_during_export"])
+            save()
+        if state.get("guest_state_during_export"):
+            state.update(state["guest_state_during_export"])
             save()
     elif args[:2] == ["volume", "import"]:
         if state.get("fail_import"):

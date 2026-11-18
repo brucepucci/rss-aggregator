@@ -491,14 +491,27 @@ Keep preview output private: it contains local identities/paths, not backup cont
    contain only labelled app/preflight containers, **exactly the selected volume**
    and pinned image(s). Additional recovery volumes must be deliberately retained
    elsewhere or separately handled; labels alone do not make them disposable. The
-   rootful engine must be completely empty, including stopped containers, volumes,
-   images and secrets. **Neither engine may contain Podman secrets**: the project
-   owns none and the instance backup does not preserve them. Cleanup lists only
-   secret metadata on both explicitly targeted engines; it never reads payloads or
-   reports secret names. Retain the VM and arrange separate owner-reviewed secret
-   recovery/migration outside this workflow; do not delete secrets merely to pass
-   cleanup. Failed or malformed inspections also refuse, including the repeated
-   inspection after capture. Machine/rootless identity and the derived
+   rootful engine must have no containers (including external/build containers),
+   volumes, images (including intermediate images), pods, secrets or OCI artifacts.
+   **Neither engine may contain secrets, artifacts, pods, build caches or custom networks**:
+   the project owns none and the instance backup does not preserve them. Only a
+   verified stock built-in network baseline is disposable, not a network accepted
+   merely because its name is familiar. Automatic removal currently requires
+   **guest Podman 6.2.0, Netavark and non-transient storage**; other versions/backends,
+   persisted/reconfigured default networks or inspection warnings retain the VM.
+   Stock defaults are verified in two independent local inspections; see the
+   [audited inventory boundary](architecture.md#preview-first-removal-and-generation-retirement).
+   Cleanup reads metadata only, never secret payloads or cache contents, and does
+   not report unrelated resource names. Even empty/stale secret databases or driver
+   remnants require separate review rather than trusting native empty-list output.
+   Retain the VM and arrange
+   separate owner-reviewed recovery/migration outside this workflow; do not delete
+   unrelated resources merely to pass cleanup. Failed or malformed inspections also
+   refuse, including the repeated inspection after capture. Inventories cover the
+   two current engine contexts and effective/stock build-cache paths, not arbitrary
+   guest files, other users' engines or historical alternate stores. If such use is
+   known or uncertain, retain/recover the VM instead of treating a preview as proof
+   that those files are backed up. Machine/rootless identity and the derived
    root connection are checked; foreign connections/defaults must remain unchanged.
    If a project connection is default among others, explicitly choose the intended
    retained default with native Podman tooling after owner review, then preview anew.

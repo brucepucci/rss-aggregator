@@ -2,6 +2,7 @@
 
 import io
 import json
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -91,25 +92,21 @@ def test_vm_preview_lists_exact_targets_without_mutation(project):
         k: v for k, v in before.items() if k != "calls"
     }
     assert not any(call[0:2] == ["machine", "rm"] for call in after["calls"])
-    assert [
-        "--connection",
-        "rss-aggregator",
-        "secret",
-        "ls",
-        "--format",
-        "json",
-    ] in after["calls"]
-    assert [
-        "machine",
-        "ssh",
-        "rss-aggregator",
-        "sudo",
-        "podman",
-        "secret",
-        "ls",
-        "--format",
-        "json",
-    ] in after["calls"]
+    for user in ([], ["sudo", "-n", "--"]):
+        assert [
+            "machine",
+            "ssh",
+            "--username",
+            "core",
+            "rss-aggregator",
+            *user,
+            "podman",
+            "--log-level=warn",
+            "--remote=false",
+            "secret",
+            "ls",
+            "--quiet",
+        ] in after["calls"]
 
 
 def test_remove_vm_makes_fresh_backup_and_preserves_unrelated_state_and_repeats(
@@ -236,20 +233,245 @@ def test_vm_removal_preserves_unrelated_secrets(project, engine, stage, fault):
         call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
     )
     secret_calls = [call for call in after["calls"] if "secret" in call]
-    expected = (
-        ["--connection", "rss-aggregator"]
-        if engine == "rootless"
-        else ["machine", "ssh", "rss-aggregator", "sudo", "podman"]
-    ) + ["secret", "ls", "--format", "json"]
+    user = ["sudo", "-n", "--"] if engine == "rootful" else []
+    expected = [
+        "machine",
+        "ssh",
+        "--username",
+        "core",
+        "rss-aggregator",
+        *user,
+        "podman",
+        "--log-level=warn",
+        "--remote=false",
+        "secret",
+        "ls",
+        "--quiet",
+    ]
     assert expected in secret_calls
     assert all(
-        call[-4:] == ["secret", "ls", "--format", "json"] for call in secret_calls
+        call[:5] == ["machine", "ssh", "--username", "core", "rss-aggregator"]
+        and call[-4:] == ["--remote=false", "secret", "ls", "--quiet"]
+        for call in secret_calls
     )
     if stage == "export":
         locator = json.loads((project.state_dir / "last-backup.json").read_text())
         assert Path(locator["archive"]).is_file()
     else:
         assert not project.backups.exists()
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "export"])
+@pytest.mark.parametrize(
+    "resource",
+    ["artifacts", "networks", "pods", "external", "build_cache", "secret_storage"],
+)
+@pytest.mark.parametrize("fault", ["present", "inspection_failure", "malformed"])
+def test_vm_removal_preserves_independent_guest_resources(
+    project, engine, stage, resource, fault
+):
+    plan = preview(project, "remove-vm") if stage != "preview" else None
+    key = resource if engine == "rootless" else "rootful_" + resource
+    records = {
+        "artifacts": [{"Digest": "sha256:synthetic", "Name": "sensitive-artifact"}],
+        "networks": [{"name": "sensitive-network", "driver": "bridge"}],
+        "pods": [{"Id": "synthetic-pod", "Name": "sensitive-empty-pod"}],
+        "external": [{"Names": ["sensitive-build-container"]}],
+        "build_cache": ["/var/tmp/buildah-cache-1000/sensitive-cache"],
+        "secret_storage": ["sensitive-secret-metadata.json"],
+    }
+    added = {key: records[resource], "guest_sentinel": "sensitive-guest-bytes"}
+    if fault == "inspection_failure":
+        added["fail_guest_inventory"] = [engine, resource]
+    elif fault == "malformed":
+        added["malformed_guest_inventory"] = [engine, resource]
+    if stage == "export":
+        project.update(guest_state_during_export=added)
+    else:
+        project.update(**added)
+    before = project.engine()
+    source = Path(before["payload"]).read_bytes()
+    result = project.run(
+        "remove-vm", *(["--confirm", plan["confirmation"]] if plan else [])
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert "sensitive" not in result.stderr
+    after = project.engine()
+    assert after[key] == records[resource]
+    assert after["guest_sentinel"] == "sensitive-guest-bytes"
+    assert after["machine"] == before["machine"]
+    assert after["volumes"] == before["volumes"]
+    assert after["containers"] == before["containers"]
+    assert Path(after["payload"]).read_bytes() == source
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    assert not (project.state_dir / "removed-vm.json").exists()
+    if stage == "export":
+        locator = json.loads((project.state_dir / "last-backup.json").read_text())
+        assert Path(locator["archive"]).is_file()
+    else:
+        assert not project.backups.exists()
+
+
+def stock_network():
+    return {
+        "name": "podman",
+        "id": "2f259bab93aaaaa2542ba43ef33eb990d0999ee1b9924b557b7be53c0b7a1bb9",
+        "driver": "bridge",
+        "network_interface": "podman0",
+        "created": "2026-01-01T00:00:00Z",
+        "subnets": [{"subnet": "10.88.0.0/16", "gateway": "10.88.0.1"}],
+        "ipv6_enabled": False,
+        "internal": False,
+        "dns_enabled": False,
+        "ipam_options": {"driver": "host-local"},
+    }
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "export"])
+@pytest.mark.parametrize("fault", ["persisted", "custom_default"])
+def test_stock_named_network_is_not_implicitly_disposable(
+    project, engine, stage, fault
+):
+    plan = preview(project, "remove-vm") if stage != "preview" else None
+    network = stock_network()
+    if fault == "custom_default":
+        network["subnets"] = [{"subnet": "10.99.0.0/16", "gateway": "10.99.0.1"}]
+    key = "networks" if engine == "rootless" else "rootful_networks"
+    added = {key: [network]}
+    if stage == "export":
+        project.update(guest_state_during_export=added)
+    else:
+        project.update(**added)
+    result = project.run(
+        "remove-vm", *(["--confirm", plan["confirmation"]] if plan else [])
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    after = project.engine()
+    assert after[key] == [network]
+    assert after["machine"]["State"] == "running"
+    assert VOLUME in after["volumes"]
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "remote",
+        "privilege",
+        "version",
+        "backend",
+        "missing",
+        "malformed",
+        "warning",
+        "boolean",
+        "timestamp",
+        "unknown_field",
+    ],
+)
+def test_vm_preview_refuses_unverified_native_baselines(project, engine, fault):
+    info = {
+        "host": {
+            "serviceIsRemote": False,
+            "security": {"rootless": engine == "rootless"},
+            "networkBackend": "netavark",
+        },
+        "version": {"Version": "6.2.0"},
+        "store": {
+            "transientStore": False,
+            "imageCopyTmpDir": "/var/tmp",
+            "graphRoot": "/var/lib/containers/storage",
+        },
+    }
+    network = stock_network()
+    key = "networks" if engine == "rootless" else "rootful_networks"
+    if fault == "remote":
+        info["host"]["serviceIsRemote"] = True
+    elif fault == "privilege":
+        info["host"]["security"]["rootless"] = engine != "rootless"
+    elif fault == "version":
+        info["version"]["Version"] = "unverified"
+    elif fault == "backend":
+        info["host"]["networkBackend"] = "unverified"
+    elif fault == "missing":
+        del info["host"]["serviceIsRemote"]
+    elif fault == "malformed":
+        info["version"] = ["sensitive-invalid-metadata"]
+    elif fault == "warning":
+        project.update(warn_network_inventory=engine)
+    elif fault == "boolean":
+        network["dns_enabled"] = 0
+        project.update(**{key: [network]})
+    elif fault == "timestamp":
+        network["created"] = "sensitive-invalid-timestamp"
+        project.update(**{key: [network]})
+    else:
+        network["sensitive-unknown-field"] = True
+        project.update(**{key: [network]})
+    project.update(**{engine + "_info": info})
+    result = project.run("remove-vm")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "sensitive" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert project.engine()["machine"]["State"] == "running"
+    assert not project.backups.exists()
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "export"])
+def test_intermediate_images_are_not_implicitly_disposable(project, engine, stage):
+    plan = preview(project, "remove-vm") if stage != "preview" else None
+    key = (
+        "intermediate_images" if engine == "rootless" else "rootful_intermediate_images"
+    )
+    added = {key: [{"Id": "sensitive-build-cache"}]}
+    project.update(
+        **({"guest_state_during_export": added} if stage == "export" else added)
+    )
+    result = project.run(
+        "remove-vm", *(["--confirm", plan["confirmation"]] if plan else [])
+    )
+    assert result.returncode == 1
+    after = project.engine()
+    assert after[key] == added[key]
+    assert after["machine"]["State"] == "running"
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    assert "sensitive" not in result.stdout + result.stderr
+
+
+def test_discarded_remote_secret_error_is_not_local_absence(project):
+    project.update(fail_secret_inventory="rootless")
+    remote = subprocess.run(
+        [
+            str(Path(project.env["PATH"]) / "podman"),
+            "--connection",
+            "rss-aggregator",
+            "secret",
+            "ls",
+            "--format",
+            "json",
+        ],
+        env=project.env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert remote.returncode == 0 and remote.stdout == ""
+    result = project.run("remove-vm")
+    assert result.returncode == 1 and result.stdout == ""
+    assert "inspection failed" in result.stderr
+    assert "sensitive" not in result.stderr
+    assert project.engine()["machine"]["State"] == "running"
 
 
 def test_delete_volume_is_separate_previewed_confirmed_and_never_prunes_backups(

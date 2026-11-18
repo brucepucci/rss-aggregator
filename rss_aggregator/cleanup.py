@@ -5,13 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import tempfile
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
+
+
+STOCK_NETWORK = {
+    "name": "podman",
+    "id": "2f259bab93aaaaa2542ba43ef33eb990d0999ee1b9924b557b7be53c0b7a1bb9",
+    "driver": "bridge",
+    "network_interface": "podman0",
+    "subnets": [{"subnet": "10.88.0.0/16", "gateway": "10.88.0.1"}],
+    "ipv6_enabled": False,
+    "internal": False,
+    "dns_enabled": False,
+    "ipam_options": {"driver": "host-local"},
+}
 
 
 def confirmation(plan: dict[str, Any], identity: Any) -> str:
@@ -31,18 +46,30 @@ class Cleanup:
         self.runtime = runtime
         self.machine, self.app, self.check = MACHINE, APP, CHECK
         self.failure = RuntimeFailure
+        self.guest_user = ""
 
-    def _json(self, *args: str) -> Any:
-        """Read native metadata without copying sensitive native diagnostics."""
+    def _json(
+        self, *args: str, object_result: bool = False, quiet: bool = False
+    ) -> Any:
+        """Read typed metadata; optionally refuse even warning diagnostics."""
         result = self.runtime._run("podman", *args, check=False)
-        if result.returncode:
+        if result.returncode or (quiet and result.stderr):
             raise self.failure(
                 "Cleanup inspection failed; resources retained. Inspect the explicitly named VM locally; recover an unavailable source without deleting it."
             )
-        records = json.loads(result.stdout)
-        if not isinstance(records, list) or any(
-            not isinstance(item, dict) for item in records
-        ):
+        try:
+            records = json.loads(result.stdout)
+        except ValueError:
+            raise self.failure(
+                "Malformed cleanup inventory; resources retained."
+            ) from None
+        valid = (
+            isinstance(records, dict)
+            if object_result
+            else isinstance(records, list)
+            and all(isinstance(item, dict) for item in records)
+        )
+        if not valid:
             raise self.failure("Malformed cleanup inventory; resources retained.")
         return records
 
@@ -117,38 +144,173 @@ class Cleanup:
             raise self.failure("Resource ownership changed; cleanup refused.")
         return info
 
+    def _guest(self, rootful: bool, *args: str, native: bool = True) -> tuple[str, ...]:
+        """Target the named guest, quoting arguments for native SSH shell joining."""
+        user = ("sudo", "-n", "--") if rootful else ()
+        engine = ("podman", "--log-level=warn", "--remote=false") if native else ()
+        return (
+            "machine",
+            "ssh",
+            "--username",
+            self.guest_user,
+            self.machine,
+            *user,
+            *engine,
+            *(shlex.quote(arg) for arg in args),
+        )
+
+    def _empty_guest(self, rootful: bool, *args: str, native: bool = True) -> None:
+        """Require a successful, diagnostic-free, exactly empty metadata listing."""
+        result = self.runtime._run(
+            "podman", *self._guest(rootful, *args, native=native), check=False
+        )
+        if result.returncode or result.stderr:
+            raise self.failure("Cleanup inspection failed; resources retained.")
+        if result.stdout:
+            raise self.failure(
+                "Unbacked guest resources or malformed metadata; VM removal refused. Retain the VM for separate owner-reviewed recovery."
+            )
+
+    def _guest_baseline(self, rootful: bool) -> str:
+        """Verify engine/storage/network baselines and return its graph root."""
+        info = self._json(
+            *self._guest(rootful, "info", "--format", "json"),
+            object_result=True,
+            quiet=True,
+        )
+        host = info.get("host", {})
+        if (
+            not isinstance(host, dict)
+            or host.get("serviceIsRemote") is not False
+            or not isinstance(host.get("security"), dict)
+            or host["security"].get("rootless") is not (not rootful)
+            or host.get("networkBackend") != "netavark"
+            or not isinstance(info.get("version"), dict)
+            or info["version"].get("Version") != "6.2.0"
+        ):
+            raise self.failure(
+                "Unverified guest engine mode/version/backend; VM removal refused."
+            )
+        store = info.get("store")
+        if (
+            not isinstance(store, dict)
+            or store.get("transientStore") is not False
+            or not isinstance(store.get("imageCopyTmpDir"), str)
+            or not PurePosixPath(store["imageCopyTmpDir"]).is_absolute()
+            or not isinstance(store.get("graphRoot"), str)
+            or not PurePosixPath(store["graphRoot"]).is_absolute()
+        ):
+            raise self.failure("Unverified guest storage metadata; VM removal refused.")
+        # Buildah RUN --mount=type=cache is neither an image nor a volume.
+        # Inspect names only in the current effective temp dir and stock paths.
+        for directory in sorted({store["imageCopyTmpDir"], "/var/tmp", "/tmp"}):
+            self._empty_guest(
+                rootful,
+                "find",
+                "-H",
+                directory,
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-name",
+                "buildah-cache-*",
+                "-print",
+                "-quit",
+                native=False,
+            )
+        created = []
+        # v6.2.0 Netavark synthesizes its absent stock default with time.Now()
+        # per local process. Persisted replacements retain Created, even with
+        # the same name, fixed ID and configuration. Never accept name alone.
+        for _ in range(2):
+            networks = self._json(
+                *self._guest(rootful, "network", "ls", "--format", "json"),
+                quiet=True,
+            )
+            if len(networks) != 1:
+                raise self.failure("Unrelated networks exist; VM removal refused.")
+            network = networks[0].copy()
+            timestamp = network.pop("created", None)
+            if json.dumps(network, sort_keys=True) != json.dumps(
+                STOCK_NETWORK, sort_keys=True
+            ) or not isinstance(timestamp, str):
+                raise self.failure("Unverified network baseline; VM removal refused.")
+            try:
+                moment = datetime.fromisoformat(timestamp)
+            except ValueError:
+                raise self.failure(
+                    "Malformed network metadata; resources retained."
+                ) from None
+            if moment.tzinfo is None:
+                raise self.failure("Malformed network metadata; resources retained.")
+            created.append(moment)
+        if created[1] <= created[0]:
+            raise self.failure(
+                "Persisted or unverified default network; VM removal refused."
+            )
+        return store["graphRoot"]
+
     def _resources(self, owner: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-        """Reject unbacked secrets, extra volumes, foreign containers and images."""
+        """Reject independent unbacked guest resources and foreign instance state."""
         runtime = self.runtime
         connection = ("--connection", self.machine)
-        for args in (
-            ("ps", "--all"),
-            ("volume", "ls"),
-            ("images",),
-            ("secret", "ls"),
+        username = owner["machine"].get("SSHConfig", {}).get("RemoteUsername")
+        if (
+            not isinstance(username, str)
+            or not username
+            or username == "root"
+            or urlsplit(owner["connection"]["URI"]).username != username
         ):
-            if self._json(
-                "machine",
-                "ssh",
-                self.machine,
-                "sudo",
-                "podman",
-                *args,
-                "--format",
-                "json",
-            ):
+            raise self.failure(
+                "Unverified rootless guest identity; resources retained."
+            )
+        self.guest_user = username
+        graph_roots = {
+            rootful: self._guest_baseline(rootful) for rootful in (True, False)
+        }
+        for args in (
+            ("ps", "--all", "--external"),
+            ("volume", "ls"),
+            ("images", "--all"),
+        ):
+            if self._json(*self._guest(True, *args, "--format", "json")):
                 raise self.failure(
                     "Unrelated rootful resources exist; VM removal refused."
                 )
         # The instance archive covers no engine secrets. List metadata only;
         # never inspect payloads or include secret names in reports/receipts.
-        if self._json(*connection, "secret", "ls", "--format", "json"):
-            raise self.failure(
-                "Unrelated rootless secrets exist; VM removal refused. The instance backup does not preserve Podman secrets."
+        for rootful in (True, False):
+            for args in (
+                ("secret", "ls", "--quiet"),
+                ("artifact", "ls", "--quiet"),
+                ("pod", "ps", "--quiet"),
+            ):
+                self._empty_guest(rootful, *args)
+            # Native secret List can swallow a failed database stat. Require
+            # the just-opened manager directory to contain only its lockfile;
+            # even empty/stale DBs and orphaned drivers require owner review.
+            self._empty_guest(
+                rootful,
+                "find",
+                "-H",
+                str(PurePosixPath(graph_roots[rootful]) / "secrets"),
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "!",
+                "-name",
+                "secrets.lock",
+                "-print",
+                "-quit",
+                native=False,
             )
-        containers = self._json(*connection, "ps", "--all", "--format", "json")
+        containers = self._json(
+            *connection, "ps", "--all", "--external", "--format", "json"
+        )
         volumes = self._json(*connection, "volume", "ls", "--format", "json")
-        images = self._json(*connection, "images", "--format", "json")
+        images = self._json(*connection, "images", "--all", "--format", "json")
         details = []
         names = []
         for item in sorted(containers, key=lambda item: str(item["Names"])):
@@ -186,6 +348,7 @@ class Cleanup:
             "containers": sorted(names),
             "volumes": volume_names,
             "images": sorted(set(image_ids)),
+            "networks": {"rootless": ["podman"], "rootful": ["podman"]},
         }, [
             details,
             {
