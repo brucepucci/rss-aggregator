@@ -24,6 +24,7 @@ class PackageProject:
                 {
                     "packages": {"podman": "6.2.0", "libkrun": "1.0", "shared": "2.0"},
                     "dependents": {},
+                    "autoremove_candidates": ["libkrun", "shared"],
                     "machines": [],
                     "connections": [],
                     "calls": [],
@@ -130,6 +131,44 @@ def test_apply_requires_candidate_specific_external_use_acknowledgment(project):
     ] == [
         ["brew", "uninstall", "--formula", "podman"],
     ]
+
+
+@pytest.mark.parametrize("inherited", [None, "", "0", "false", "1"])
+def test_uninstall_disables_implicit_autoremove_and_preserves_unconfirmed_packages(
+    project, inherited
+):
+    if inherited is None:
+        project.env.pop("HOMEBREW_NO_AUTOREMOVE", None)
+    else:
+        project.env["HOMEBREW_NO_AUTOREMOVE"] = inherited
+    ledgers = {
+        path.name: path.read_bytes() for path in project.state_dir.glob("*.json")
+    }
+    report = project.preview()
+    assert report["targets"] == {"package": "podman", "version": "6.2.0"}
+    assert project.state()["packages"] == {
+        "podman": "6.2.0",
+        "libkrun": "1.0",
+        "shared": "2.0",
+    }
+    removed = project.run(
+        "remove-package",
+        "podman",
+        "--confirm",
+        report["confirmation"],
+        "--unused-elsewhere",
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert json.loads(removed.stdout)["status"] == "removed"
+    # One confirmed formula must not authorize removal of either sentinel:
+    # a baseline package or a project dependency without its own consent.
+    assert project.state()["packages"] == {"libkrun": "1.0", "shared": "2.0"}
+    assert project.state()["uninstall_environments"] == [
+        {"HOMEBREW_NO_AUTOREMOVE": "1"}
+    ]
+    assert {
+        path.name: path.read_bytes() for path in project.state_dir.glob("*.json")
+    } == ledgers
 
 
 @pytest.mark.parametrize("package", ["podman", "libkrun"])

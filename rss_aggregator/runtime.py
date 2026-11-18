@@ -242,7 +242,9 @@ class Runtime:
         informational output to diagnostics rather than the JSON result stream.
         Short-lived native work inherits the lease by default. VM launchers must
         disable inheritance so their long-lived helpers cannot retain it; the
-        Python caller still holds the lock throughout VM startup.
+        Python caller still holds the lock throughout VM startup. Implicit
+        Homebrew autoremove stays disabled even when native dependent checks
+        are restored for explicit package removal.
         """
         env = dict(
             os.environ,
@@ -250,6 +252,7 @@ class Runtime:
             HOMEBREW_NO_INSTALL_UPGRADE="1",
             HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK="1",
             HOMEBREW_NO_INSTALL_CLEANUP="1",
+            HOMEBREW_NO_AUTOREMOVE="1",
         )
         if dependency_checks:
             env.pop("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", None)

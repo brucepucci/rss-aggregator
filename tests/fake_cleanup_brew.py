@@ -53,6 +53,20 @@ if program == "brew":
         if state.get("dependents", {}).get(args[-1]):
             fail()
         state["packages"].pop(args[-1], None)
+        no_autoremove = os.environ.get("HOMEBREW_NO_AUTOREMOVE", "")
+        state.setdefault("uninstall_environments", []).append(
+            {"HOMEBREW_NO_AUTOREMOVE": no_autoremove}
+        )
+        # Model uninstall's global orphan sweep, not just explicit removal.
+        if not no_autoremove.strip() or no_autoremove.lower() in (
+            "false",
+            "no",
+            "off",
+            "nil",
+            "0",
+        ):
+            for package in state.get("autoremove_candidates", []):
+                state["packages"].pop(package, None)
     else:
         fail()
 elif program == "podman":

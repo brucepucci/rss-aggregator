@@ -229,6 +229,32 @@ def test_cleanup_partial_setup_and_missing_source_never_expands_scope(project):
     assert not (project.state_dir / "removed-vm.json").exists()
 
 
+@pytest.mark.parametrize(
+    "command", [("remove-vm",), ("delete-volume", "absent-recovery")]
+)
+def test_absent_cleanup_targets_ignore_invalid_confirmation_without_mutation(
+    project, command
+):
+    if command == ("remove-vm",):
+        project.update(machine=None, connection=None, volumes={}, containers={})
+    before = project.engine()
+    ledgers = {
+        path.name: path.read_bytes() for path in project.state_dir.glob("*.json")
+    }
+    result = project.run(*command, "--confirm", "old-confirmation")
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "absent"
+    assert report["preview"] is True
+    assert {
+        key: value for key, value in project.engine().items() if key != "calls"
+    } == {key: value for key, value in before.items() if key != "calls"}
+    assert {
+        path.name: path.read_bytes() for path in project.state_dir.glob("*.json")
+    } == ledgers
+    assert not project.backups.exists()
+
+
 def test_recreate_after_removal_retires_only_generation_bound_records(project):
     from rss_aggregator.runtime import Runtime
 

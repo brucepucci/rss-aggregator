@@ -18,8 +18,10 @@ future explicit recovery contract; it is not silently included here.
 Archives contain secrets. Keep them outside Git with private permissions and
 transport/store them as credentials. Permissions are not encryption. Integrity
 checks are not signatures: restore only archives you trust. Neither OPML nor the
-VM-native volume itself is an instance backup. The project does not prune archives,
-upload to a cloud service, or delete a VM/volume.
+VM-native volume itself is an instance backup. Backup and restore do not delete an
+existing VM/volume; separately guarded VM removal and inactive-volume deletion are
+supported through [safe cleanup](operations.md#safe-cleanup). The project does not
+prune archives or upload them to a cloud service.
 
 ## Create a backup
 

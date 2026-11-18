@@ -620,7 +620,10 @@ that no other project/manual tool has adopted it. Unknown external usage means r
 3. Only when eligible and genuinely unused elsewhere, run
    `rss remove-package podman --unused-elsewhere --confirm '<CURRENT-PREVIEW-SHA256>'`.
    Both assertions are required. Apply rechecks native inventories/versions/identity
-   before normal `brew uninstall --formula`, with native dependent checks **enabled**.
+   before normal `brew uninstall --formula`, with native dependent checks **enabled**
+   and `HOMEBREW_NO_AUTOREMOVE=1` forced in the subprocess regardless of inherited
+   settings. This suppresses Homebrew's implicit global orphan sweep; installation's
+   no-cleanup setting alone does not prevent uninstall-time autoremove.
    There is no force, ignore-dependencies, autoremove or cleanup; native refusal is
    not a reason to bypass dependencies. It does not reverse historical upgrades.
 4. Preview each remaining ledger addition **again**, one plain formula name at a time,

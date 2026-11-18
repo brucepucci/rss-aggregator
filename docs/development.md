@@ -592,13 +592,19 @@ uninstall host packages or consume production data. Maintain coverage for:
   to a fresh name before any empty app start; selection/compatible-image gates remain.
 - Separate nonforce irreversible deletion only for explicit unselected labelled
   volumes with zero mounts/no stopped-container attachment; no automatic backup,
-  other resources/archives retained and already-absent behavior.
+  other resources/archives retained and already-absent behavior. Verified absent VM,
+  volume and package targets return successful absence JSON even with invalid/stale
+  confirmation; absent packages do not require unused-elsewhere attestation.
 - One plain formula per preview/apply; initial baseline and additions ledgers,
   unchanged installed versions, fresh recursive formula/cask optional/build/test
   dependents and no Podman machines/connections. Require both per-candidate external
   adoption attestation and current full-plan digest; recheck immediately before
   uninstall, retain native dependent checks and preserve ledgers/other packages on
-  refusal. Removing Podman first does not authorize a dependency sweep.
+  refusal. Model Homebrew's implicit uninstall-time global autoremove and verify that
+  `HOMEBREW_NO_AUTOREMOVE=1` is forced for unset, empty, false and enabled inherited
+  settings: both baseline and unconfirmed project-dependency sentinels must survive.
+  Native dependent checks must still reject late adoption. Removing Podman first
+  does not authorize a dependency sweep.
 
 **Not established by these deterministic checks:** actual disposable VM
 remove/recreate/restore with authenticated original user, subscriptions, article
