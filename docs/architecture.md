@@ -349,8 +349,11 @@ removal procedure. No recursive directory/cache cleanup is provided. See
 [operations](operations.md#safe-cleanup) for unavailable-VM preservation/provider
 recovery and interrupted-removal handling, and [configuration](configuration.md#managed-local-records)
 for records. Deterministic guards are not real disposable VM remove/recreate/
-authenticated-state acceptance, native host uninstall or sentinel-preservation proof;
-these remain [unrun native evidence](development.md#cleanup-verification-and-remaining-native-evidence).
+authenticated-state acceptance, native host uninstall or sentinel-preservation proof.
+Select the [native drill separately](development.md#cleanup-verification-and-remaining-native-evidence)
+and record revision-specific outcomes in the issue/PR. Its retained machine-name
+and connection/default comparisons do not establish full preservation of every
+unrelated resource or native package-uninstall behavior.
 
 ## Decisions
 

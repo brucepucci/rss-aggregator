@@ -572,6 +572,10 @@ uninstall host packages or consume production data. Maintain coverage for:
 - Native inspection-only previews (except the existing lock), exact targets,
   retained resources and no preview destination creation; stale confirmations
   after resource/ownership/image/directory/connection changes must refuse.
+- The actual native-drill setup path must accept its generated disposable machine
+  name through a controlled Podman executable enforcing the native 30-character
+  limit. Stop at the controlled VM-start boundary; this is setup compatibility,
+  not a substitute for native recovery or authenticated-state evidence.
 - Running owned source, exactly selected labelled volume, only labelled reserved
   containers/pinned images, empty rootful engine including stopped resources,
   derived-root/default-connection validation and removed captured jobs.
@@ -596,14 +600,15 @@ uninstall host packages or consume production data. Maintain coverage for:
   uninstall, retain native dependent checks and preserve ledgers/other packages on
   refusal. Removing Podman first does not authorize a dependency sweep.
 
-**NOT RUN / not established by these deterministic checks:** actual disposable VM
+**Not established by these deterministic checks:** actual disposable VM
 remove/recreate/restore with authenticated original user, subscriptions, article
 content and read/unread plus starred/unstarred state; real host Homebrew uninstall;
 or native unrelated-sentinel preservation. Earlier source-absent recovery and
 ordinary VM-restart evidence do not prove VM teardown/generation retirement. Default
-fixture passes must not be described as these native acceptance results.
+fixture passes must not be described as these native acceptance results. Select the
+native drill separately and retain its revision-specific outcomes in the issue/PR.
 
-A future real check requires explicit owner approval, an independent verified backup,
+An owner-coordinated real check requires explicit approval, an independent verified backup,
 exclusively disposable resources, a private expected-state record and a preservation
 inventory. Follow [the operator runbook](operations.md#safe-cleanup), including job
 removal, fresh removal-time capture, setup/restore-before-start and authenticated
@@ -613,7 +618,7 @@ commands, sanitized results and all unrun checks in the issue/PR handoff. Do not
 real sentinel preservation from substitute inventories. Manual residual/backup review
 is not automatic pruning or secure-erasure evidence. No new settings are introduced.
 
-The explicitly selected native drill is available but **NOT RUN**:
+Run only the explicitly selected native drill:
 
 ```sh
 uv run --locked pytest tests/integration/test_live_cleanup.py::test_disposable_vm_remove_recreate_restore_preserves_authenticated_state -m live -q
@@ -623,11 +628,14 @@ It requires macOS/Apple Silicon virtualization, preinstalled Homebrew Podman, th
 reviewed compatible image configuration, internet/public-feed access and an approved
 idle-host window with **no running Podman machine**. Unlike ordinary FreshRSS live
 tests, it creates a uniquely named fresh owned VM with private temporary ownership,
-backup destination and synthetic user; it never borrows the owner's existing VM or
+backup destination and synthetic user. The `rss-cleanup-<16-hex>` machine name is
+28 characters, within Podman's 30-character limit. It never borrows the owner's existing VM or
 fabricates its owner record. It uses loopback/namespaced job labels without real
 job activation, removes/recreates its disposable VM, restores before empty startup,
-and compares authenticated article/read/star state and retained connection/machine
-inventories. Failed drills retain namespaced resources/state for inspection, not
+and compares authenticated article/read/star state, retained machine names and
+connection/default inventories. These comparisons do not inspect every unrelated
+guest volume/image or prove preservation of all host state. Failed drills retain
+namespaced resources/state for inspection, not
 forced fallback cleanup. Keep any retained artifacts private. This is not a real
 host-uninstall test, unrelated-sentinel proof, cross-host recovery or permission to
 run against production; coordinate prerequisites and preservation before selection.
@@ -715,8 +723,9 @@ Remaining limits:
 - Private/paid-feed authorization acceptance remains unverified; Linux server
   deployment remains a later phase. Preview-first owned VM removal, separate
   inactive-volume deletion and per-formula removal are implemented with deterministic
-  guards; real disposable removal/recreation/authenticated recovery and real host
-  uninstall/sentinel proof remain unperformed as described in
+  guards. Disposable removal/recreation/authenticated recovery requires the separately
+  selected native drill and revision-specific evidence. Actual host uninstall and
+  full unrelated-resource preservation are not established by that drill; see
   [cleanup verification](#cleanup-verification-and-remaining-native-evidence).
   Global prune/reset, automatic backup pruning and cache/directory sweeps remain unsupported.
 - [Issue #7](https://github.com/brucepucci/rss-aggregator/issues/7) owns broader

@@ -61,7 +61,9 @@ def test_disposable_vm_remove_recreate_restore_preserves_authenticated_state(
         "Podman must already be installed through Homebrew",
     )
     token = secrets.token_hex(8)
-    name = "rss-aggregator-test-cleanup-" + token
+    name = (
+        "rss-cleanup-" + token
+    )  # 28 characters; Podman machine names allow at most 30.
     expect(
         not any(m["Name"] == name for m in initial["machines"]),
         "Disposable machine name collision",

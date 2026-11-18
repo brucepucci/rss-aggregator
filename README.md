@@ -22,8 +22,9 @@ checks without container restart; the owner then confirmed
 Intentional-stop across reboot, detailed client-state checks, natural daily backup
 timing, power/outage behavior and overall production acceptance remain outstanding;
 no pre-unlock availability is promised. Preview-first [safe cleanup and recreation](docs/operations.md#safe-cleanup)
-is available; real disposable-VM removal/recreation and authenticated recovery remain
-unverified. Always-on Linux deployment and paid-feed authorization remain future/unverified work.
+is available with a separately selected disposable-VM recovery drill. Native host
+uninstall and broader unrelated-resource preservation remain unverified. Always-on
+Linux deployment and paid-feed authorization remain future/unverified work.
 Readers cannot synchronize while the instance is stopped; explicit stop persists
 until explicit start.
 
@@ -285,8 +286,9 @@ To recover after successful removal: `setup`, then `restore ARCHIVE --volume NEW
 **before any empty `start`**, then `select-volume NEW` and `start`, using the recorded
 compatible image. Verify fresh login, subscriptions, article content and read/star
 state. Unavailable or partially removed VMs require inspection/recovery, never a
-data-loss override or fabricated ownership records. Real remove/recreate/full-state
-acceptance and real host-uninstall/sentinel preservation are not yet demonstrated.
+data-loss override or fabricated ownership records. Use the [selected native drill](docs/development.md#cleanup-verification-and-remaining-native-evidence)
+for revision-specific full-state acceptance; default tests alone do not establish
+it or prove real host-uninstall/broader unrelated-resource preservation.
 
 ### How do I move the aggregator to another machine?
 

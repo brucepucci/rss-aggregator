@@ -23,6 +23,56 @@ def preview(project, *command):
     return json.loads(result.stdout)
 
 
+def test_native_drill_bootstraps_a_machine_within_podmans_name_limit(tmp_path):
+    import subprocess
+    import sys
+
+    from tests.test_commands import ROOT, CommandFixture
+
+    command = CommandFixture(tmp_path)
+    native = tmp_path / "podman-state.json"
+    native.write_text(json.dumps({"machines": [], "details": {}, "connections": []}))
+    packages = tmp_path / "packages.json"
+    packages.write_text(json.dumps({"packages": {"podman": "6.2.0"}}))
+    command.env.update(FAKE_PODMAN_STATE=str(native), FAKE_BREW_INSTALLED=str(packages))
+    command.tool("brew", (ROOT / "tests/fake_bootstrap_brew.py").read_text())
+    command.tool(
+        "podman",
+        "import sys\n"
+        "if sys.argv[1:3] == ['machine', 'start']: raise SystemExit('controlled drill start boundary')\n"
+        + (ROOT / "tests/fake_bootstrap_podman.py").read_text(),
+    )
+    # Import under the real platform first: selecting Darwin before urllib is
+    # imported on Linux would request the unavailable native _scproxy module.
+    script = """
+import sys
+from pathlib import Path
+import pytest
+from rss_aggregator import RuntimeFailure
+from tests.integration.test_live_cleanup import test_disposable_vm_remove_recreate_restore_preserves_authenticated_state as drill
+sys.platform = 'darwin'
+with pytest.MonkeyPatch.context() as patch:
+    try:
+        drill(Path(sys.argv[1]), patch)
+    except RuntimeFailure as error:
+        assert 'controlled drill start boundary' in str(error), str(error)
+    else:
+        raise AssertionError('Controlled native fixture unexpectedly started a VM')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "drill")],
+        cwd=ROOT,
+        env=command.env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    machine = json.loads(native.read_text())["machines"]
+    assert len(machine) == 1 and len(machine[0]["Name"]) <= 30
+    assert machine[0]["Running"] is False
+
+
 def test_vm_preview_lists_exact_targets_without_mutation(project):
     before = project.engine()
     report = preview(project, "remove-vm")

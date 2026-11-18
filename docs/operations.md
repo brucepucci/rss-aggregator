@@ -579,9 +579,12 @@ empty infrastructure is not recovery acceptance. Re-enable only explicitly wante
 jobs after successful application/private-access verification with fresh captures.
 Retain the archive and retired audit evidence.
 
-Real disposable VM remove/recreate/authenticated recovery remains **NOT RUN**; earlier
-source-absent recovery tests are not proof of this whole path. Deterministic tests
-also do not establish real host-uninstall or unrelated-sentinel preservation.
+Use the [separately selected native drill](development.md#cleanup-verification-and-remaining-native-evidence)
+to verify disposable VM remove/recreate/authenticated recovery and retain
+revision-specific outcomes in the issue/PR. Earlier source-absent recovery and
+default deterministic tests do not prove this whole path. The native drill compares
+retained machine names and connection/default inventories, but does not uninstall
+host packages or fully inspect every unrelated resource.
 
 ### Permanently delete an inactive volume
 
