@@ -579,12 +579,21 @@ uninstall host packages or consume production data. Maintain coverage for:
 - Running owned source, exactly selected labelled volume, only labelled reserved
   containers/pinned images, empty rootful engine including stopped resources,
   derived-root/default-connection validation and removed captured jobs.
+- Rootless/rootful standalone secret sentinels must survive refusal at preview,
+  apply admission and post-export inspection. Model native VM deletion as destroying
+  guest secret storage; any secret, failed metadata command or malformed inventory
+  must retain the VM/data. Assert only explicit-engine `secret ls --format json`
+  calls, no payload reads and no secret names/payloads/native diagnostics in output.
+  Empty secret inventories must still allow normal guarded removal.
 - Fresh export plus independent archive/checksum validation before VM deletion,
   backup/inspection/stop/rm failures, unavailable/absent/partially initialized
   sources, resources arriving during export, prior archive preservation and no
   force/reset/prune. A previous archive or `no_data` never permits removal.
 - Resume the unchanged owned writer after export copies its bytes and during the
-  final connection inventory. Model native VM shutdown as stopping even running
+  final connection inventory (the third post-export connection read: `_vm_plan`
+  reads once directly and once through `_owner`). Assert the native-call trace
+  places the injection after plan inspection and immediately before the final idle
+  check, with the removal receipt retained. Model native VM shutdown as stopping even running
   containers, not as an application-writer safeguard. Assert post-capture changes
   are missing from the archive but retained in the source; refusal must precede
   native VM stop/removal, leave the resumed writer untouched and retain maintenance.

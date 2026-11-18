@@ -118,10 +118,15 @@ class Cleanup:
         return info
 
     def _resources(self, owner: dict[str, Any]) -> tuple[dict[str, Any], Any]:
-        """Reject every additional volume, foreign container and unrecognized image."""
+        """Reject unbacked secrets, extra volumes, foreign containers and images."""
         runtime = self.runtime
         connection = ("--connection", self.machine)
-        for args in (("ps", "--all"), ("volume", "ls"), ("images",)):
+        for args in (
+            ("ps", "--all"),
+            ("volume", "ls"),
+            ("images",),
+            ("secret", "ls"),
+        ):
             if self._json(
                 "machine",
                 "ssh",
@@ -135,6 +140,12 @@ class Cleanup:
                 raise self.failure(
                     "Unrelated rootful resources exist; VM removal refused."
                 )
+        # The instance archive covers no engine secrets. List metadata only;
+        # never inspect payloads or include secret names in reports/receipts.
+        if self._json(*connection, "secret", "ls", "--format", "json"):
+            raise self.failure(
+                "Unrelated rootless secrets exist; VM removal refused. The instance backup does not preserve Podman secrets."
+            )
         containers = self._json(*connection, "ps", "--all", "--format", "json")
         volumes = self._json(*connection, "volume", "ls", "--format", "json")
         images = self._json(*connection, "images", "--format", "json")

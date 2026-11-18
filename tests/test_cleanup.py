@@ -91,6 +91,25 @@ def test_vm_preview_lists_exact_targets_without_mutation(project):
         k: v for k, v in before.items() if k != "calls"
     }
     assert not any(call[0:2] == ["machine", "rm"] for call in after["calls"])
+    assert [
+        "--connection",
+        "rss-aggregator",
+        "secret",
+        "ls",
+        "--format",
+        "json",
+    ] in after["calls"]
+    assert [
+        "machine",
+        "ssh",
+        "rss-aggregator",
+        "sudo",
+        "podman",
+        "secret",
+        "ls",
+        "--format",
+        "json",
+    ] in after["calls"]
 
 
 def test_remove_vm_makes_fresh_backup_and_preserves_unrelated_state_and_repeats(
@@ -175,6 +194,62 @@ def test_vm_removal_failures_preserve_all_resources_and_prior_archives(project, 
     assert archive.read_bytes() == original
     assert "sensitive" not in result.stdout + result.stderr
     assert not any(call[:2] == ["machine", "rm"] for call in after["calls"])
+
+
+@pytest.mark.parametrize("engine", ["rootless", "rootful"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "export"])
+@pytest.mark.parametrize("fault", ["present", "inspection_failure", "malformed"])
+def test_vm_removal_preserves_unrelated_secrets(project, engine, stage, fault):
+    plan = preview(project, "remove-vm") if stage != "preview" else None
+    key = "secrets" if engine == "rootless" else "rootful_secrets"
+    payload_key = (
+        "secret_payloads" if engine == "rootless" else "rootful_secret_payloads"
+    )
+    secret_state = {
+        key: [{"ID": "synthetic-secret-id", "Name": "sensitive-secret-name"}],
+        payload_key: {"synthetic-secret-id": "sensitive-secret-payload"},
+    }
+    if fault == "inspection_failure":
+        secret_state["fail_secret_inventory"] = engine
+    elif fault == "malformed":
+        secret_state["malformed_secret_inventory"] = engine
+    if stage == "export":
+        project.update(secret_state_during_export=secret_state)
+    else:
+        project.update(**secret_state)
+    before = project.engine()
+    source = Path(before["payload"]).read_bytes()
+    result = project.run(
+        "remove-vm", *(["--confirm", plan["confirmation"]] if plan else [])
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert "sensitive" not in result.stderr
+    after = project.engine()
+    assert after[key] == secret_state[key]
+    assert after[payload_key] == secret_state[payload_key]
+    assert after["machine"] == before["machine"]
+    assert after["volumes"] == before["volumes"]
+    assert after["containers"] == before["containers"]
+    assert Path(after["payload"]).read_bytes() == source
+    assert not any(
+        call[:2] in (["machine", "stop"], ["machine", "rm"]) for call in after["calls"]
+    )
+    secret_calls = [call for call in after["calls"] if "secret" in call]
+    expected = (
+        ["--connection", "rss-aggregator"]
+        if engine == "rootless"
+        else ["machine", "ssh", "rss-aggregator", "sudo", "podman"]
+    ) + ["secret", "ls", "--format", "json"]
+    assert expected in secret_calls
+    assert all(
+        call[-4:] == ["secret", "ls", "--format", "json"] for call in secret_calls
+    )
+    if stage == "export":
+        locator = json.loads((project.state_dir / "last-backup.json").read_text())
+        assert Path(locator["archive"]).is_file()
+    else:
+        assert not project.backups.exists()
 
 
 def test_delete_volume_is_separate_previewed_confirmed_and_never_prunes_backups(
@@ -431,6 +506,35 @@ def test_vm_removal_refuses_resumed_writer_and_preserves_post_capture_data(
     result = project.run("remove-vm", "--confirm", plan["confirmation"])
     after = project.engine()
     assert after["writer_resumed"] is True
+    if stage == "final_inventory":
+        calls = after["calls"]
+        export_index = next(
+            i
+            for i, call in enumerate(calls)
+            if call[:4] == ["--connection", "rss-aggregator", "volume", "export"]
+        )
+        resumed_index = after["writer_resumed_call_index"]
+        reads = [
+            i
+            for i in range(export_index + 1, resumed_index + 1)
+            if calls[i] == ["system", "connection", "list", "--format", "json"]
+        ]
+        assert len(reads) == 3 and reads[-1] == resumed_index
+        assert any(
+            call[:4] == ["--connection", "rss-aggregator", "image", "inspect"]
+            for call in calls[reads[1] : reads[2]]
+        )
+        assert (project.state_dir / "removed-vm.json").exists()
+        assert calls[resumed_index + 1] == [
+            "machine",
+            "ssh",
+            "rss-aggregator",
+            "sudo",
+            "podman",
+            "ps",
+            "--format",
+            "json",
+        ]
     with tarfile.open(after["payload"]) as source:
         assert source.extractfile("users/alice/post-capture.txt").read() == (
             b"synthetic post-capture change"

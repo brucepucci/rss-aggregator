@@ -277,7 +277,8 @@ Use the [cleanup and recovery runbook](docs/operations.md#safe-cleanup), not a g
 Podman reset or directory sweep. `stop` retains data; `replace` retains its volume.
 `remove-vm` defaults to inspection and requires explicit current-plan confirmation,
 removed captured jobs and a fresh independently validated external backup before
-VM deletion. Packages and archives remain. Optional `remove-package` is separately
+VM deletion. Secrets on either Podman engine block removal: the instance backup
+preserves none. Packages and archives remain. Optional `remove-package` is separately
 previewed/confirmed per project-added formula and requires an unused-elsewhere
 attestation; `delete-volume` is separate **irreversible**, unselected-volume deletion
 with **no automatic backup**. Backup deletion is manual exact-file review only.

@@ -491,8 +491,14 @@ Keep preview output private: it contains local identities/paths, not backup cont
    contain only labelled app/preflight containers, **exactly the selected volume**
    and pinned image(s). Additional recovery volumes must be deliberately retained
    elsewhere or separately handled; labels alone do not make them disposable. The
-   rootful engine must be completely empty, including stopped containers, volumes
-   and images. Inspection failures refuse. Machine/rootless identity and the derived
+   rootful engine must be completely empty, including stopped containers, volumes,
+   images and secrets. **Neither engine may contain Podman secrets**: the project
+   owns none and the instance backup does not preserve them. Cleanup lists only
+   secret metadata on both explicitly targeted engines; it never reads payloads or
+   reports secret names. Retain the VM and arrange separate owner-reviewed secret
+   recovery/migration outside this workflow; do not delete secrets merely to pass
+   cleanup. Failed or malformed inspections also refuse, including the repeated
+   inspection after capture. Machine/rootless identity and the derived
    root connection are checked; foreign connections/defaults must remain unchanged.
    If a project connection is default among others, explicitly choose the intended
    retained default with native Podman tooling after owner review, then preview anew.

@@ -299,8 +299,13 @@ create a destination or rewrite records (the existing lock is opened for writing
 
 VM removal requires a running accessible owned machine, exactly the selected
 labelled volume, only reserved owner-labelled app/preflight containers and pinned
-images, and an entirely empty rootful engine, including stopped containers/volumes/
-images. Machine/rootless and derived-root connection identities are validated.
+images, no rootless secrets, and an entirely empty rootful engine, including stopped
+containers/volumes/images and secrets. Both explicitly targeted engines are checked
+with metadata-only `secret ls --format json` during preview, apply admission and
+post-capture plan inspection. Any secret or failed/malformed inventory refuses:
+this project owns no engine secrets and the selected-volume archive preserves none.
+Secret names/payloads are not included in reports or receipts; payloads are never
+requested. Machine/rootless and derived-root connection identities are validated.
 Foreign connections/defaults remain unchanged; a project default among other
 connections refuses instead of letting native removal select another default.
 Captured jobs must first be removed by supervision-remove/backup-disable. Confirmation

@@ -24,6 +24,16 @@ def fail(message):
     raise SystemExit(125)
 
 
+def list_secrets(engine):
+    if state.get("fail_secret_inventory") == engine:
+        fail("sensitive secret inspection diagnostic")
+    if state.get("malformed_secret_inventory") == engine:
+        print(json.dumps({"sensitive": "invalid secret metadata"}))
+    else:
+        key = "secrets" if engine == "rootless" else "rootful_secrets"
+        print(json.dumps(state.get(key, [])))
+
+
 def resume_writer(stage):
     if state.get("resume_writer_at") != stage or state.get("writer_resumed"):
         return
@@ -34,6 +44,7 @@ def resume_writer(stage):
         info.size = len(content)
         archive.addfile(info, io.BytesIO(content))
     state["writer_resumed"] = True
+    state["writer_resumed_call_index"] = len(state["calls"]) - 1
     save()
 
 
@@ -55,9 +66,10 @@ elif args == ["machine", "list", "--format", "json"]:
 elif args == ["system", "connection", "list", "--format", "json"]:
     if "connection_reads_after_export" in state:
         state["connection_reads_after_export"] += 1
-        # The first post-export read belongs to _vm_plan; the second captures
-        # retained foreign connections just before the receipt and VM stop.
-        if state["connection_reads_after_export"] == 2:
+        # _vm_plan reads connections twice: its inventory, then _owner's
+        # inventory. Read three captures retained foreign connections just
+        # before the receipt and final idle check.
+        if state["connection_reads_after_export"] == 3:
             resume_writer("final_inventory")
         save()
     print(
@@ -102,10 +114,20 @@ elif args == ["machine", "rm", "rss-aggregator"]:
     state["machine"] = state["connection"] = None
     state["volumes"] = {}
     state["containers"] = {}
+    for key in (
+        "secrets",
+        "rootful_secrets",
+        "secret_payloads",
+        "rootful_secret_payloads",
+    ):
+        state.pop(key, None)
     save()
 elif args[:3] == ["machine", "ssh", "rss-aggregator"]:
     if machine["State"] != "running" or state.get("unresponsive"):
         fail("source unavailable with sensitive diagnostics")
+    if args[3:] == ["sudo", "podman", "secret", "ls", "--format", "json"]:
+        list_secrets("rootful")
+        raise SystemExit(0)
     kind = (
         "rootful_volumes"
         if "volume" in args
@@ -118,7 +140,9 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
     if machine["State"] != "running":
         fail("engine unavailable")
     args = args[2:]
-    if args[0] == "ps":
+    if args == ["secret", "ls", "--format", "json"]:
+        list_secrets("rootless")
+    elif args[0] == "ps":
         print(
             json.dumps(
                 [
@@ -214,6 +238,9 @@ elif args[:2] == ["--connection", "rss-aggregator"]:
             save()
         if state.get("add_volume_during_export"):
             state["volumes"]["appeared-during-export"] = {"Labels": {}}
+            save()
+        if state.get("secret_state_during_export"):
+            state.update(state["secret_state_during_export"])
             save()
     elif args[:2] == ["volume", "import"]:
         if state.get("fail_import"):
