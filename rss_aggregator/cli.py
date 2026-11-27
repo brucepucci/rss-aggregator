@@ -87,7 +87,7 @@ def verify() -> None:
 
 @main.command()
 def stop() -> None:
-    """Stop native writers and verify a complete shutdown backup."""
+    """Stop writers and verify a full instance backup, even if already stopped."""
     _execute("stop")
 
 

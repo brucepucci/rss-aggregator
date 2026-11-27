@@ -28,6 +28,10 @@ REGISTRATION = "supervision.json"
 RECOVERY_STATE = "supervision-recovery.json"
 JOB_VERSION = 2
 JOB_INSPECTION_TIMEOUT = 5
+ENDPOINT_ACTION = (
+    "Use the running service's port and access mode; remove and explicitly recapture "
+    "supervision before deliberate endpoint changes."
+)
 
 
 class NativeJob:
@@ -406,8 +410,20 @@ class Supervision:
             }
         try:
             self._check_job(record)
-            self.job.check(record)
             self.runtime._owned(require_current=False, verify=False)
+            if result["intent"] == "running":
+                # Classify an endpoint mismatch even if it introduces an
+                # uncaptured dependency (for example, a new private route).
+                with self.job.environment(record):
+                    conflict = self._endpoint_observation()
+                if conflict is not None:
+                    return {
+                        **result,
+                        "state": "configuration_conflict",
+                        "observed": conflict,
+                        "action": ENDPOINT_ACTION,
+                    }
+            self.job.check(record)
             session = self.job.launch(record, "print", self.job.domain)
             if session.returncode:
                 return {
@@ -442,6 +458,12 @@ class Supervision:
                 **result,
                 "state": state,
                 "action": "Only explicit rss start enables running intent; backups and supervision do not.",
+            }
+        if result["observed"]["availability"] == "configuration_conflict":
+            return {
+                **result,
+                "state": "configuration_conflict",
+                "action": ENDPOINT_ACTION,
             }
         if result["observed"]["availability"] == "healthy":
             return {
@@ -561,11 +583,33 @@ class Supervision:
             "recovery": self._attempts(),
         }
 
+    def _endpoint_observation(self) -> dict[str, Any] | None:
+        """Summarize a live listener or access conflict without claiming readiness."""
+        live = self.runtime._live()
+        if live is None:
+            return None
+        plan, _ = live
+        if (
+            plan.get("port") == self.runtime._port()
+            and plan.get("private") is PrivateAccess(self.runtime).enabled()
+        ):
+            return None
+        return {
+            "availability": "configuration_conflict",
+            "runtime": "installed",
+            "application": "running",
+            "reason": "configuration_conflict",
+            "action": ENDPOINT_ACTION,
+        }
+
     def _observe(self) -> dict[str, Any]:
         """Check existing readiness without calling start or altering forwarding."""
         from rss_aggregator.runtime import RuntimeFailure
 
         try:
+            conflict = self._endpoint_observation()
+            if conflict is not None:
+                return conflict
             result = self.runtime._status()
             ready = (
                 result["runtime"] == "installed"
@@ -683,6 +727,8 @@ class Supervision:
             raise ValueError(
                 "RSS_BACKUP_DIR must be absolute when captured for supervision."
             )
+        if self._endpoint_observation() is not None:
+            raise ValueError(f"Supervision configuration_conflict. {ENDPOINT_ACTION}")
         captured = self.job.capture(
             owner, destination.resolve() if destination else None
         )

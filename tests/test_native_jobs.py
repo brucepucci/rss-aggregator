@@ -148,7 +148,7 @@ def _ledger(checkout, name, value):
 
 @contextmanager
 def _owned_writer(checkout, *, instance=None):
-    nonce = "synthetic-writer"
+    nonce = "e" * 32
     selection = checkout.state / "selected-instance.json"
     if instance is None:
         instance = (

@@ -85,23 +85,28 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   reaches the port of the previously private service. Subsequent automatic
   backup resumptions retain this read-only check, not authority to publish.
   If safety cannot be confirmed, writers stay stopped and the foreign route is
-  preserved. Backup never resumes intentional stop. A preflight refusal can
-  leave existing serving state untouched. A resumption
+  preserved. Backup never resumes intentional stop. If selection and serving
+  instance disagree, backup refuses before quiescence: it does not switch
+  instances. Compare `instance` and `live_instance` in `rss status`, stop the
+  identified service, then confirm the intended selection while idle. A resumption
   failure can leave a verified archive with the app stopped; check both results
   before retrying.
 - Normal `stop` sets stopped intent and tries to persist shutdown evidence before
   quiescence, but attempts to close owned resources even if the write or route
   withdrawal fails. If runtime ownership cannot be verified, `stop` still
   replaces valid running intent with stopped intent but refuses to touch
-  unidentified writers or forwarding. Restore access to the original receipt
-  and retry `stop`.
+  unidentified writers or forwarding. Established state keeps a shutdown
+  failure even after the receipt returns. Restore the original receipt and
+  retry `stop`; simply restoring the receipt does not prove shutdown or capture.
   Forwarding discovery is bounded; discovery failure leaves forwarding
   unconfirmed, not permission to alter foreign rules. If stopped intent could not
   be saved, running intent may still be in force. Fix the write failure and
   retry `stop` before reconciling.
-  Selection does not gate quiescence; capture runs afterward and verifies a
-  complete archive when selected data exist. An archive failure **after**
-  quiescing leaves writers stopped; a failed or interrupted quiescence is not
+  Selection does not gate quiescence. A matching owned generation and instance
+  can identify the affected data while a former controller's web child drains.
+  Capture only runs after writer exit is proved; an already idle stop can create
+  another full ZIP. An archive failure **after** quiescing leaves writers stopped;
+  a failed or interrupted quiescence is not
   proof that writers or forwarding stopped. Inspect `unresolved_shutdowns` and
   `evidence_problems` in `backup-status`, correct the cause, and retry `stop` for
   a verified archive of the affected instance. A shutdown backup of another
@@ -142,15 +147,16 @@ uv run --locked rss backup-status
 
 Reconciliation authenticates the hold against the ownership receipt even when
 runtime files are missing. It requires proof that writers and owned forwarding
-are already stopped. For an explicit-stop hold, stopped intent must also be
-recorded; if it is not, correct the problem and retry `stop`. Reconciliation does
+are already stopped. Stopped intent must also be recorded for an explicit-stop
+hold or when a later stop request superseded the backup's intent. If that intent
+is not durable, correct the problem and retry `stop`. Reconciliation does
 not stop or restart anything, repair runtime files,
 or clear outstanding shutdown evidence. Once the hold is released, use `setup`
 with the matching pin if runtime files are missing. Inspect before activating.
 If reconciliation reports active resources, use guarded `stop` to quiesce before retrying;
 `stop` records stopped intent before releasing or reconciling the hold. For a
-**backup** hold, a later supervisor tick may honor a retained running intent
-once the hold is released. Stop on a busy lease, uncertain forwarding or invalid record and
+**backup** hold with no superseding stop, a later supervisor tick may honor
+retained running intent once the hold is released. Stop on a busy lease, uncertain forwarding or invalid record and
 inspect locally. Do not edit journals, kill unidentified processes or force-clear
 a hold.
 
@@ -171,10 +177,11 @@ uv run --locked rss backup-enable --hour 3 --minute 0 &&
 Default policy is **03:00 UTC daily**, adjustable with `--hour`/`--minute`.
 Launchd requests checks at load and every 15 minutes while the session and host
 are available. Eligible failures retry after at least 15 minutes, at most three
-attempts for a UTC target; contention is a defer, not success or a spent attempt.
-Wakeup considers only the most recent elapsed slot since registration, including
-one on the preceding UTC date if the wake crosses midnight. It does not replay
-older slots or work scheduled before registration. No wake-from-sleep, pre-login
+attempts for a UTC slot per instance and registration; contention is a defer,
+not success or a spent attempt. Wakeup considers only the most recent elapsed
+slot since registration, including one on the preceding UTC date if the wake
+crosses midnight. Selecting another instance and returning does not reset a
+completed slot or retry budget. Clock rollback does not replay earlier slots. No wake-from-sleep, pre-login
 or power setting is installed. A job captures absolute checkout/Python, private
 state and non-secret settings; it does not use `.env` or invoke uv. The owned job
 can be disabled without erasing archives or intent. The complete plist is staged
@@ -184,9 +191,9 @@ ledger is valid and any loaded job matches it; a busy, changed or foreign job is
 not overwritten. Follow
 [removal and recapture safeguards](operations.md#upgrade-installed-mac-jobs-safely)
 for changes. Recapture starts a new `registration_id`, even with identical
-settings. Wait for a successful `daily_attempt` with that ID after `registered_at`
-and verify `daily_archive_available`; an earlier registration's evidence is
-retained but does not count. After eligible daily work has run, check protection:
+settings. Wait for a successful `daily_target_attempt` with that ID after
+`registered_at` and verify `daily_archive_available`; an earlier registration's
+evidence is retained until the new one starts work, but does not count. After eligible daily work has run, check protection:
 
 ```sh
 uv run --locked rss backup-status --check
@@ -204,8 +211,9 @@ uv run --locked rss backup-disable
 true. Ordinary `backup-status` is inspection, not an assurance of protection.
 Check registration, `scheduler_problem`, due/missed/deferred work, latest attempt
 and verified publication, archive availability, age/overdue, `resumption` and
-`maintenance_required`. A damaged runtime layout does not erase readable archive
-or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
+`maintenance_required`. Treat `resumption` as an attempt's outcome, not proof
+of a current hold or restart. A damaged runtime layout does not erase readable
+archive or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
 and protection is false. Evidence records are read independently: for example, an
 unreadable attempt appears as `latest_attempt: null` with its record named in
 `evidence_problems`; a separately readable verified archive remains visible.

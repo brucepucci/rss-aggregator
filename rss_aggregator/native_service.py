@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from http.client import RemoteDisconnected
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -22,6 +22,8 @@ FETCH_TIMEOUT = 600
 FETCH_TIMED_OUT = 2
 _FETCH_DRAIN_GRACE = 120
 _FETCH_TERM_GRACE = 10
+WRITER_LEASES = ("writers.lock", "controller.lock", "fetch.lock")
+WRITER_LEASE_RECORD = "writer-leases.json"
 INI = """\
 session.upload_progress.enabled = Off
 expose_php = Off
@@ -104,26 +106,101 @@ def read(target: Path) -> Any:
         return json.load(record)
 
 
+def _lease_identity(info: os.stat_result, expected: tuple[int, int] | None) -> None:
+    """Reject foreign lease files and check a recorded file when one is expected."""
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or (
+            expected is not None
+            and (
+                stat.S_IMODE(info.st_mode) != 0o600
+                or (info.st_dev, info.st_ino) != expected
+            )
+        )
+    ):
+        raise ValueError("Unexpected managed lease file; inspect local ownership.")
+
+
 @contextmanager
-def lease(path: Path) -> Iterator[int | None]:
-    """Hold a nonblocking, inherited flock; close instead of explicitly unlocking."""
-    fd = os.open(path, os.O_NOFOLLOW | os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o600)
+def lease(
+    path: Path, *, expected: tuple[int, int] | None = None
+) -> Iterator[int | None]:
+    """Hold an inherited flock without creating an already registered lease."""
+    flags = os.O_NOFOLLOW | os.O_RDWR | os.O_NONBLOCK
+    if expected is None:
+        flags |= os.O_CREAT
+    else:
+        _lease_identity(path.lstat(), expected)
+    fd = os.open(path, flags, 0o600)
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_nlink != 1
-        ):
-            raise ValueError("Unexpected managed lease file; inspect local ownership.")
+        _lease_identity(os.fstat(fd), expected)
+        locked = False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
         except BlockingIOError:
-            yield None
-        else:
-            yield fd
+            pass
+        if expected is not None:
+            # Never infer a lock result for a different file installed during open.
+            _lease_identity(path.lstat(), expected)
+        yield fd if locked else None
+    finally:
+        # The descriptor may be shared with descendants; do not explicitly unlock it.
+        os.close(fd)
+
+
+def install_writer_leases(staging: Path, state: Path) -> None:
+    """Publish stable lease paths only during initial, command-serialized setup."""
+    identities = {}
+    for name in WRITER_LEASES:
+        fd = os.open(staging / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            identities[name] = os.fstat(fd).st_ino
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    save(staging / WRITER_LEASE_RECORD, identities)
+    for name in (*WRITER_LEASES, WRITER_LEASE_RECORD):
+        # Publish on the same filesystem without replacing a race-appeared path.
+        os.link(staging / name, state / name, follow_symlinks=False)
+        (staging / name).unlink()
+    fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
     finally:
         os.close(fd)
+
+
+class WriterLeases:
+    """Inspect installed writer leases independently of generation/PID metadata."""
+
+    def __init__(self, state: Path) -> None:
+        """Require a complete identity record and extant private paths."""
+        self.state = state
+        record = read(state / WRITER_LEASE_RECORD)
+        if not isinstance(record, dict) or record.keys() != set(WRITER_LEASES):
+            raise ValueError(
+                "Native writer lease identity record is missing or invalid."
+            )
+        # Device IDs may change on reboot or remount. Check that each lease is
+        # on the *current* state device while requiring the installed inode.
+        device = state.stat().st_dev
+        self.identities: dict[str, tuple[int, int]] = {}
+        for name, inode in record.items():
+            if type(inode) is not int or inode <= 0:
+                raise ValueError("Invalid native writer lease identity.")
+            expected = (device, inode)
+            _lease_identity((state / name).lstat(), expected)
+            self.identities[name] = expected
+
+    @contextmanager
+    def hold(self, name: str) -> Iterator[int | None]:
+        """Open a registered lease without creating or accepting a replacement."""
+        with lease(self.state / name, expected=self.identities[name]) as fd:
+            yield fd
 
 
 def environment(state: Path, data: Path) -> dict[str, str]:
@@ -229,7 +306,10 @@ def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
 
 
 def _caretaker(
-    mode: str, *args: str, fds: tuple[int, ...]
+    mode: str,
+    *args: str,
+    fds: tuple[int, ...],
+    stdout: int | BinaryIO = subprocess.DEVNULL,
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start a detached writer parent and return the caller's sole pipe write end."""
     listening, owner = os.pipe()
@@ -237,7 +317,7 @@ def _caretaker(
         return subprocess.Popen(
             [sys.executable, "-I", "-B", str(Path(__file__).resolve()), mode, *args],
             stdin=listening,
-            stdout=subprocess.DEVNULL,
+            stdout=stdout,
             stderr=subprocess.DEVNULL,
             pass_fds=fds,
             start_new_session=True,
@@ -295,79 +375,93 @@ def _watch_web(state: Path, nonce: str, instance: str, writer_fd: int) -> None:
 
 
 def _drain(
-    web: subprocess.Popen[bytes] | None,
-    fetch: subprocess.Popen[bytes] | None,
-    fetch_deadline: float,
+    web: subprocess.Popen[bytes] | None, fetch: subprocess.Popen[bytes] | None
 ) -> str | None:
-    """Await the web caretaker and drain fetching without pausing its deadline."""
-    now = time.monotonic()
-    fetch_term_at = now + _FETCH_DRAIN_GRACE
-    fetch_stop_at = min(fetch_term_at + _FETCH_TERM_GRACE, fetch_deadline)
-    fetch_term_sent = False
-    last_fetch = None
-    while web is not None or fetch is not None:
-        now = time.monotonic()
-        if fetch is not None:
-            if (code := fetch.poll()) is not None:
-                last_fetch = "completed" if code == 0 else "failed"
-                fetch = None
-            elif now >= fetch_stop_at:
-                _kill_and_reap(fetch)
-                last_fetch = "failed"
-                fetch = None
-            elif now >= fetch_term_at and not fetch_term_sent:
-                fetch.terminate()
-                fetch_term_sent = True
-        if web is not None and web.poll() is not None:
-            web = None
-        if web is not None or fetch is not None:
-            time.sleep(0.25)
-    return last_fetch
+    """Reap caretakers after closing their owner pipes, never killing their timers."""
+    if web is not None:
+        web.wait()
+    if fetch is not None:
+        return "completed" if fetch.wait() == 0 else "failed"
+    return None
 
 
-def _fetch(
-    binary: Path, source: Path, env: dict[str, str], *fds: int
-) -> subprocess.Popen[bytes]:
-    """Start upstream feed fetching with all serialization leases inherited."""
-    return subprocess.Popen(
-        [str(binary), "php-cli", "app/actualize_script.php"],
-        cwd=source,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        pass_fds=fds,
+def _start_fetch(
+    state: Path, data: Path, fetch_fd: int, deadline: float, *writer_fds: int
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start the independent fetch deadline with the caller's writer leases only."""
+    return _caretaker(
+        "fetch",
+        str(state),
+        str(data),
+        str(fetch_fd),
+        str(deadline),
+        *(str(fd) for fd in writer_fds),
+        fds=(fetch_fd, *writer_fds),
     )
 
 
 def foreground_fetch(state: Path, data: Path, fetch_fd: int, timeout: int) -> int:
     """Await a detached fetch caretaker without giving it the caller's command lock."""
-    deadline = time.monotonic() + timeout
-    fetch, owner = _caretaker(
-        "fetch", str(state), str(data), str(fetch_fd), str(deadline), fds=(fetch_fd,)
-    )
+    fetch, owner = _start_fetch(state, data, fetch_fd, time.monotonic() + timeout)
     try:
         return fetch.wait()
     finally:
         os.close(owner)
 
 
-def _watch_fetch(state: Path, data: Path, fetch_fd: int, deadline: float) -> int:
+def foreground_php(
+    state: Path,
+    data: Path,
+    writer_fd: int,
+    timeout: int,
+    args: tuple[str, ...],
+    *,
+    output: int | BinaryIO = subprocess.DEVNULL,
+) -> int:
+    """Wait for independent preparation or configuration under its writer lease."""
+    operation, owner = _caretaker(
+        "php",
+        str(state),
+        str(data),
+        str(writer_fd),
+        str(time.monotonic() + timeout),
+        *args,
+        fds=(writer_fd,),
+        stdout=output,
+    )
+    try:
+        return operation.wait()
+    finally:
+        os.close(owner)
+
+
+def _watch_php(
+    state: Path,
+    data: Path,
+    deadline: float,
+    fds: tuple[int, ...],
+    args: tuple[str, ...],
+    *,
+    stdout: int = subprocess.DEVNULL,
+) -> int:
     """Enforce the original deadline, also bounding the drain after caller loss."""
     if time.monotonic() >= deadline:
         return FETCH_TIMED_OUT
     if _owner_gone(0):
         return 1
-    fetch = _fetch(
-        state / "runtime/frankenphp",
-        state / "runtime/FreshRSS",
-        environment(state, data),
-        fetch_fd,
+    writer = subprocess.Popen(
+        [str(state / "runtime/frankenphp"), "php-cli", *args],
+        cwd=state / "runtime/FreshRSS",
+        env=environment(state, data),
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=subprocess.DEVNULL,
+        pass_fds=fds,
     )
     orphan_term_at = None
     terminated = False
     try:
-        while (code := fetch.poll()) is None:
+        while (code := writer.poll()) is None:
             now = time.monotonic()
             if now >= deadline:
                 return FETCH_TIMED_OUT
@@ -377,13 +471,13 @@ def _watch_fetch(state: Path, data: Path, fetch_fd: int, deadline: float) -> int
                     deadline = min(deadline, orphan_term_at + _FETCH_TERM_GRACE)
             else:
                 if now >= orphan_term_at and not terminated:
-                    fetch.terminate()
+                    writer.terminate()
                     terminated = True
                 time.sleep(min(0.25, deadline - now))
         return int(code != 0)
     finally:
-        if fetch.poll() is None:
-            _kill_and_reap(fetch)
+        if writer.poll() is None:
+            _kill_and_reap(writer)
 
 
 def _scheduled(now: float, last_slot: int) -> int | None:
@@ -399,10 +493,7 @@ def serve(state: Path, writer_fd: int) -> None:
         raise ValueError("Native service generation changed before startup.")
     nonce = plan["nonce"]
     home = state / "service"
-    source = state / "runtime/FreshRSS"
-    binary = state / "runtime/frankenphp"
     data = state / "instances" / plan["instance"] / "data"
-    env = environment(state, data)
     config = home / ("Caddyfile-" + nonce)
     receipt = state / "service-status.json"
     request = state / "stop-service.json"
@@ -414,8 +505,7 @@ def serve(state: Path, writer_fd: int) -> None:
         "last_fetch": None,
     }
     web = fetch = None
-    web_owner = None
-    fetch_deadline = 0.0
+    web_owner = fetch_owner = None
     stopping = False
     approved = False
     acknowledgement = acknowledgement_path(home, nonce)
@@ -432,20 +522,15 @@ def serve(state: Path, writer_fd: int) -> None:
             if stop is not None and stop["nonce"] == nonce:
                 stopping = True
                 break
-            if fetch is not None:
-                outcome = None
-                if (code := fetch.poll()) is not None:
-                    outcome = "completed" if code == 0 else "failed"
-                elif time.monotonic() >= fetch_deadline:
-                    _kill_and_reap(fetch)
-                    outcome = "failed"
+            if fetch is not None and (code := fetch.poll()) is not None:
+                os.close(fetch_owner)
+                fetch = fetch_owner = None
+                if code == FETCH_TIMED_OUT:
                     # Do not replay a slot reached while the timed-out writer
                     # was still being stopped (including wall-clock jumps).
                     slot = max(slot, int(time.time()) // PERIOD)
-                if outcome is not None:
-                    status["last_fetch"] = outcome
-                    save(receipt, {**status, "web": "started", "scheduler": "running"})
-                    fetch = None
+                status["last_fetch"] = "completed" if code == 0 else "failed"
+                save(receipt, {**status, "web": "started", "scheduler": "running"})
             if not approved:
                 if time.monotonic() >= approval_deadline:
                     break
@@ -456,10 +541,15 @@ def serve(state: Path, writer_fd: int) -> None:
             if due is not None:
                 slot = due
                 if approved and fetch is None and initialized(data):
-                    with lease(state / "fetch.lock") as fetch_fd:
+                    with WriterLeases(state).hold("fetch.lock") as fetch_fd:
                         if fetch_fd is not None:
-                            fetch_deadline = time.monotonic() + FETCH_TIMEOUT
-                            fetch = _fetch(binary, source, env, writer_fd, fetch_fd)
+                            fetch, fetch_owner = _start_fetch(
+                                state,
+                                data,
+                                fetch_fd,
+                                time.monotonic() + FETCH_TIMEOUT,
+                                writer_fd,
+                            )
             time.sleep(0.25)
     finally:
         # Close the ordinary HTTP gate before draining existing writers.
@@ -468,7 +558,9 @@ def serve(state: Path, writer_fd: int) -> None:
         finally:
             if web_owner is not None:
                 os.close(web_owner)
-            if (outcome := _drain(web, fetch, fetch_deadline)) is not None:
+            if fetch_owner is not None:
+                os.close(fetch_owner)
+            if (outcome := _drain(web, fetch)) is not None:
                 status["last_fetch"] = outcome
         config.unlink(missing_ok=True)
         approval_path(home, nonce).unlink(missing_ok=True)
@@ -486,13 +578,16 @@ if __name__ == "__main__":
     os.umask(0o077)
     if sys.argv[1] == "web":
         _watch_web(Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]))
-    elif sys.argv[1] == "fetch":
+    elif sys.argv[1] in ("fetch", "php"):
+        fetch = sys.argv[1] == "fetch"
         sys.exit(
-            _watch_fetch(
+            _watch_php(
                 Path(sys.argv[2]),
                 Path(sys.argv[3]),
-                int(sys.argv[4]),
                 float(sys.argv[5]),
+                (int(sys.argv[4]), *(map(int, sys.argv[6:]) if fetch else ())),
+                ("app/actualize_script.php",) if fetch else tuple(sys.argv[6:]),
+                stdout=subprocess.DEVNULL if fetch else 1,
             )
         )
     else:

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.error import URLError
 
+from rss_aggregator.native_service import WriterLeases, install_writer_leases
+
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
 
@@ -562,9 +564,16 @@ class NativeInstall:
             )
         if owner is None:
             self._require_initial_state(device)
-        elif _optional_stat(self.root) is not None:
-            self._verify_release(self.root, owner, device)
-            return owner
+        else:
+            try:
+                WriterLeases(self.state)
+            except (OSError, ValueError):
+                raise NativeInstallError(
+                    "Native writer state is unconfirmed; writer lease evidence is missing or damaged. Inspect the state directory locally."
+                ) from None
+            if _optional_stat(self.root) is not None:
+                self._verify_release(self.root, owner, device)
+                return owner
 
         with tempfile.TemporaryDirectory(
             prefix=".native-install-", dir=self.state
@@ -587,6 +596,7 @@ class NativeInstall:
                         "A native ownership receipt appeared during setup; refusing replacement."
                     )
                 self._require_initial_state(device, staging=staging)
+                install_writer_leases(staging, self.state)
                 (staging / self.owner_path.name).rename(self.owner_path)
             (staging / "runtime").rename(self.root)
         return new_owner

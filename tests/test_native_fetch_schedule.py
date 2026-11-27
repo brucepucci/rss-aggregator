@@ -26,7 +26,6 @@ TIMEOUT_CONTROLLER = (
     + """
 import json
 import runpy
-import subprocess
 import time
 from unittest.mock import patch
 
@@ -34,13 +33,6 @@ control = Path(sys.argv[1]) / 'service'
 clock = (0, 0)
 ack = None
 pause = time.sleep
-
-class Process(subprocess.Popen):
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
-        if args[1] == 'php-cli':
-            with (control / 'scheduled-pids').open('a') as history:
-                print(self.pid, file=history)
 
 
 def sleep(_):
@@ -58,22 +50,19 @@ with (
     patch('time.time', lambda: clock[0]),
     patch('time.monotonic', lambda: clock[1]),
     patch('time.sleep', sleep),
-    patch.object(subprocess, 'Popen', Process),
+    patch.object(sys, 'executable', str(Path.cwd() / '.venv/bin/python')),
 ):
     runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
 """
 )
 
 
-def test_native_controller_fetches_once_in_an_eligible_utc_slot(tmp_path):
-    state = tmp_path / "state"
-    (state / "service").mkdir(parents=True, mode=0o700)
-    data = state / "instances/default/data"
-    data.mkdir(parents=True)
-    for name in ("applied_migrations.txt", "config.php"):
-        (data / name).touch()
+def test_native_controller_fetches_once_in_an_eligible_utc_slot(scheduled_checkout):
+    checkout = scheduled_checkout
+    state = checkout.state
+    checkout.control.mkdir(mode=0o700)
     (state / "service.json").write_text(
-        json.dumps({"nonce": NONCE, "port": 18080, "instance": "default"})
+        json.dumps({"nonce": NONCE, "port": 18080, "instance": "reader"})
     )
     (state / "service" / f"approved-{NONCE}.json").touch()
 
@@ -98,7 +87,7 @@ def test_native_controller_fetches_once_in_an_eligible_utc_slot(tmp_path):
                 str(writer.fileno()),
                 str(controller.fileno()),
             ],
-            env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            env=checkout.environment,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -131,13 +120,12 @@ def drive_controller(state):
             return cls
 
         def __init__(self, args, *, stdin, **_):
-            if args[1:3] == ["-I", "-B"]:
-                assert args[4] == "web"
+            assert args[1:3] == ["-I", "-B"]
+            if args[4] == "web":
                 self.parent = os.dup(stdin)
                 self.returncode = None
             else:
-                assert Path(args[0]) == state / "runtime/frankenphp"
-                assert args[1:] == ["php-cli", "app/actualize_script.php"]
+                assert args[4] == "fetch"
                 print(
                     datetime.fromtimestamp(
                         first_poll + elapsed, timezone.utc
@@ -149,6 +137,10 @@ def drive_controller(state):
             if self.returncode is None and select.select([self.parent], [], [], 0)[0]:
                 os.close(self.parent)
                 self.returncode = 0
+            return self.returncode
+
+        def wait(self):
+            assert self.poll() is not None
             return self.returncode
 
     with (
@@ -180,15 +172,16 @@ def test_scheduled_timeout_reaps_owned_fetch(scheduled_checkout, stopping):
     )
     (state / "security.json").write_text(json.dumps({"nonce": NONCE}))
 
-    def advance(wall, elapsed):
+    def advance(wall, elapsed, *, wait_for_controller=True):
         temporary = control / "clock.tmp"
         temporary.write_text(json.dumps([wall, elapsed]))
         temporary.replace(control / "clock")
-        _wait_for(
-            lambda: (control / "ack").exists()
-            and json.loads((control / "ack").read_text()) == [wall, elapsed],
-            f"controller did not acknowledge wall={wall}, elapsed={elapsed}",
-        )
+        if wait_for_controller:
+            _wait_for(
+                lambda: (control / "ack").exists()
+                and json.loads((control / "ack").read_text()) == [wall, elapsed],
+                f"controller did not acknowledge wall={wall}, elapsed={elapsed}",
+            )
 
     def request_stop():
         stop = control / "stop.tmp"
@@ -240,6 +233,10 @@ def test_scheduled_timeout_reaps_owned_fetch(scheduled_checkout, stopping):
         assert not history.exists(), "approval must not replay the missed slot"
         advance(2400, 10)
         _wait_for((control / "fetch-started").exists, "fetch did not start")
+        _wait_for(
+            lambda: history.exists() and history.stat().st_size,
+            "disposable fetch PID was not published",
+        )
         pid = int(history.read_text())
 
         # A wall-clock jump past intervening slots isn't a deadline. Manual
@@ -255,13 +252,13 @@ def test_scheduled_timeout_reaps_owned_fetch(scheduled_checkout, stopping):
             (control / "hold-web").touch()
             request_stop()
             _wait_for((control / "web-draining").exists, "web drain did not begin")
-            advance(6000, 610)
-            assert _exited(pid), "shutdown failed to enforce the fetch deadline"
+            advance(6000, 610, wait_for_controller=False)
+            _wait_for(lambda: _exited(pid), "shutdown missed the fetch deadline")
             assert process.poll() is None, "web should still be draining"
             return
 
         advance(6000, 610)
-        assert status() == "failed"
+        _wait_for(lambda: status() == "failed", "fetch timeout was not reported")
         assert _exited(pid), "the timed-out fetch child was not reaped"
         assert history.read_text().splitlines() == [str(pid)]
 

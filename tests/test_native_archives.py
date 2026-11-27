@@ -507,14 +507,16 @@ def test_shutdown_backups_use_installed_pin_even_after_checkout_pin_change(insta
 @contextmanager
 def controlled_writers(state, port=8080, *, private=False):
     # Hold the real filesystem leases until stop is requested; never run web/PHP.
+    nonce = "a" * 32
     for filename, value in {
         "service.json": {
-            "nonce": "synthetic",
+            "nonce": nonce,
+            "instance": "source",
             "url": f"http://127.0.0.1:{port}",
             "port": port,
             "private": private,
         },
-        "service-status.json": {"nonce": "synthetic", "web": "started"},
+        "service-status.json": {"nonce": nonce, "web": "started"},
     }.items():
         path = state / filename
         path.write_text(json.dumps(value))
@@ -529,8 +531,12 @@ def controlled_writers(state, port=8080, *, private=False):
         observed_stop, finished = threading.Event(), threading.Event()
 
         def acknowledge_stop():
+            request = state / "stop-service.json"
             while not finished.is_set():
-                if (state / "stop-service.json").exists():
+                if (
+                    request.exists()
+                    and json.loads(request.read_text())["nonce"] == nonce
+                ):
                     observed_stop.set()
                     break
                 finished.wait(0.01)
@@ -795,6 +801,12 @@ def test_backup_remains_verified_when_startup_after_capture_fails(
     assert status["maintenance_required"] is True
     assert status["latest_success"]["verified"] is True
     assert Path(status["latest_success"]["archive"]).is_file()
+
+    assert run(cli, "backup-reconcile")["resumed"] is False
+    reconciled = run(cli, "backup-status")
+    assert reconciled["maintenance_required"] is False
+    assert reconciled["resumption"] == "failed"
+    assert run(cli, "status")["application"] == "stopped"
 
 
 def test_lost_default_is_not_reprovisioned_after_first_start_attempt(installed):

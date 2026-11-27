@@ -1,13 +1,15 @@
 """Exercise stop and upgrade evidence through the disposable native CLI."""
 
 import fcntl
+import json
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from tests import test_native_install, test_native_jobs
-from tests.test_native_jobs import _refused, _restore_fixture, _success
+from tests.test_native_jobs import _ledger, _refused, _restore_fixture, _success
 
 checkout = test_native_install.checkout
 jobs = test_native_jobs.jobs
@@ -37,7 +39,9 @@ def test_stop_preserves_restart_veto_without_a_readable_receipt(
         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         before = {path.name for path in jobs.state.iterdir()}
         _refused(jobs, "stop")
-        assert {path.name for path in jobs.state.iterdir()} == before
+        assert {path.name for path in jobs.state.iterdir()} == before | {
+            "backup-shutdown.json"
+        }
         if damage == "missing":
             assert not receipt.exists()
         else:
@@ -48,12 +52,108 @@ def test_stop_preserves_restart_veto_without_a_readable_receipt(
     result = _success(jobs, "supervision-tick")
     assert result["state"] == "intentionally_stopped"
     assert result["recovery"]["attempts"] == 0
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    pending = _success(jobs, "backup-status")["unresolved_shutdown"]
+    assert (pending["instance"], pending["outcome"]) == (None, "failed")
+
+
+@pytest.mark.parametrize("damaged_hold", [False, True])
+def test_receipt_loss_blocks_protection_until_the_verified_stop_retry(
+    jobs, damaged_hold
+):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _refused(jobs, "start")
+    _success(jobs, "backup-due")
+    before = _success(jobs, "backup-status", "--check")
+    generation = before["latest_success"]["writer_generation"]
+    assert generation is not None
+    data = jobs.state / "instances/reader/data/feed-cache"
+    data.write_bytes(b"changed synthetic reading state")
+    nonce = uuid4().hex
+    receipt = jobs.state / "native-owner.json"
+    _ledger(
+        jobs,
+        "service.json",
+        {
+            "nonce": nonce,
+            "instance": "reader",
+            "owner": json.loads(receipt.read_text())["token"],
+            "writer_generation": generation,
+        },
+    )
+    _ledger(jobs, "service-status.json", {"nonce": nonce, "web": "started"})
+    bad_hold = jobs.state / "maintenance.json"
+    if damaged_hold:
+        bad_hold.write_text("{")
+        bad_hold.chmod(0o600)
+    parked = receipt.rename(jobs.state.parent / "parked-ownership.json")
+    with (
+        (jobs.state / "writers.lock").open("rb") as writer,
+        (jobs.state / "controller.lock").open("rb") as controller,
+    ):
+        for lock in (writer, controller):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            _refused(jobs, "stop")
+            assert not (jobs.state / "stop-service.json").exists()
+        finally:
+            parked.rename(receipt)
+        check = jobs.run("backup-status", "--check")
+        assert check.returncode == 1, check.stdout
+        failed = json.loads(check.stdout)
+        assert failed["protected"] is False
+        assert failed["unresolved_shutdown"]["outcome"] == "failed"
+        assert failed["unresolved_shutdown"]["instance"] == "reader"
+        assert failed["unresolved_shutdown"]["writer_generation"] == generation
+        assert failed["latest_success"] == before["latest_success"]
+
+    if damaged_hold:
+        _refused(jobs, "backup-reconcile")
+        assert bad_hold.read_text() == "{"
+        bad_hold.rename(jobs.state.parent / "preserved-hold.json")
+    stopped = _success(jobs, "stop")["backup"]
+    assert stopped["verified"] is True
+    report = _success(jobs, "backup-status", "--check")
+    assert report["unresolved_shutdowns"] == []
+    assert report["latest_success"]["archive"] == stopped["archive"]
 
 
 def test_stop_does_not_dirty_a_fresh_setup_path(checkout):
     _refused(checkout, "stop")
     assert {path.name for path in checkout.state.iterdir()} == {"command.lock"}
     _success(checkout, "setup")
+
+
+def test_stop_does_not_adopt_an_unrelated_runtime_without_a_receipt(checkout):
+    checkout.state.mkdir(mode=0o700)
+    unrelated = checkout.state / "runtime"
+    unrelated.mkdir(mode=0o700)
+    marker = unrelated / "existing-data"
+    marker.write_text("unrelated state")
+    _refused(checkout, "stop")
+    assert {path.name for path in checkout.state.iterdir()} == {
+        "command.lock",
+        "runtime",
+    }
+    assert marker.read_text() == "unrelated state"
+    assert "Refusing to adopt" in _refused(checkout, "setup")
+
+
+def test_receipt_loss_in_an_established_empty_installation_stays_unidentified(jobs):
+    receipt = jobs.state / "native-owner.json"
+    parked = receipt.rename(jobs.state.parent / "parked-ownership.json")
+    try:
+        _refused(jobs, "stop")
+        assert not receipt.exists()
+        assert not (jobs.state / "operator-intent.json").exists()
+    finally:
+        parked.rename(receipt)
+    pending = _success(jobs, "backup-status")["unresolved_shutdown"]
+    assert (pending["instance"], pending["outcome"]) == (None, "failed")
+    assert _success(jobs, "stop")["backup"] == {"status": "no_data"}
+    assert _success(jobs, "backup-status")["unresolved_shutdown"] == pending
 
 
 @pytest.mark.parametrize(
@@ -94,6 +194,42 @@ def test_interrupted_stop_hold_requires_durable_stopped_intent(jobs, intent_stat
     assert result["reconciled"] is True and result["resumed"] is False
     assert "honor existing running intent" not in result["action"]
     assert _success(jobs, "supervision-tick")["state"] == "intentionally_stopped"
+
+
+def test_later_stop_vetoes_reconciliation_of_an_existing_backup_hold(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "supervision-install")
+    _refused(jobs, "start")  # The synthetic PHP command refuses application work.
+    jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = "maintenance.json"
+    assert jobs.run("backup").returncode == 71
+    jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = "backup-shutdown.json"
+    assert jobs.run("stop").returncode == 71
+    del jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"]
+
+    assert (
+        _success(jobs, "backup-status")["unresolved_shutdown"]["instance"] == "reader"
+    )
+    assert "retry rss stop" in _refused(jobs, "backup-reconcile")
+    assert "maintenance" in _refused(jobs, "supervision-tick")
+    assert _success(jobs, "supervision-status")["recovery"]["attempts"] == 0
+
+    assert "backup-reconcile" in _refused(jobs, "stop")
+    result = _success(jobs, "backup-reconcile")
+    assert result["reconciled"] is True and result["resumed"] is False
+    assert "honor existing running intent" not in result["action"]
+    assert _success(jobs, "supervision-tick")["state"] == "intentionally_stopped"
+
+    # The prior failed shutdown is still unresolved, but the explicit restart
+    # and a separate hold must not inherit its veto (even on the same clock tick).
+    _refused(jobs, "start")
+    jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = "maintenance.json"
+    assert jobs.run("backup").returncode == 71
+    del jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"]
+    assert (
+        "honor existing running intent" in _success(jobs, "backup-reconcile")["action"]
+    )
+    assert _success(jobs, "supervision-status")["intent"] == "running"
 
 
 @pytest.mark.parametrize(
@@ -157,12 +293,9 @@ def test_confirmed_upgrade_rejects_absent_generation_even_without_newer_evidence
     _refused(jobs, "start")
     instance = jobs.state / "instances/reader"
     (instance / "data/feed-cache").write_bytes(b"new synthetic reading state")
-    owner = jobs.state / "native-owner.json"
-    parked = owner.rename(jobs.state.parent / "parked-ownership.json")
-    try:
-        _refused(jobs, "stop")  # Retains stopped intent but cannot capture evidence.
-    finally:
-        parked.rename(owner)
+    # Isolate the generation check without requesting a new shutdown, which
+    # would now durably preserve the failed attempt even if the receipt were lost.
+    _ledger(jobs, "operator-intent.json", {"version": 1, "intent": "stopped"})
     (instance / "writer-generation.json").unlink()
     report = _success(jobs, "backup-status")
     assert report["latest_success"] == old_success

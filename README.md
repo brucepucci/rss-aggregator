@@ -108,7 +108,7 @@ return nonzero. A successful status query alone does not establish health.
 | --- | --- |
 | `setup` | Install or check the reviewed native runtime without starting it. |
 | `start` / `verify` | Start and record running intent, or restart/recheck an already running service without changing intent. |
-| `status` / `fetch` | Inspect the selected instance, listener and scheduler, or fetch publisher feeds now subject to cache/backoff. |
+| `status` / `fetch` | Compare selected and serving instances, inspect the listener and scheduler, or fetch publisher feeds subject to cache/backoff. |
 | `stop` / `backup` | Stop writers and verify a shutdown backup, or back up and attempt to resume the prior serving mode. |
 | `backup-status --check` | Check eligible daily protection, archive readability and freshness, unresolved shutdowns, maintenance and resumption. |
 | `supervision-status` | Inspect optional recovery, intent and failures. |
@@ -143,7 +143,7 @@ See the [full configuration reference](docs/configuration.md).
   failed or interrupted shutdown; inspect `backup-status` and retry `stop` after
   correcting the problem. If the affected instance is unknown, preserve the
   evidence and follow the [recovery guidance](docs/backup-restore.md#consistency-and-failure-behavior).
-- **Lost instance selection:** do not start or back up a substitute instance.
+- **Lost or conflicting instance selection:** do not start or back up a substitute instance.
   Use [operator troubleshooting](docs/operations.md#common-troubleshooting) to
   confirm and reselect the intended data while stopped.
 - **Stale daily backups or interrupted maintenance:** use `backup-status --check`

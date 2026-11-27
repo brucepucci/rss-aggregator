@@ -231,8 +231,8 @@ def test_setup_publishes_private_pinned_runtime_idempotently(checkout):
     assert json.loads(again.stdout)["token"] == owner["token"]
 
 
-@pytest.mark.parametrize("command", ["status", "start"])
-def test_inspection_or_refused_start_does_not_spoil_fresh_setup(checkout, command):
+@pytest.mark.parametrize("command", ["status", "start", "verify", "backup"])
+def test_inspection_or_refused_command_does_not_spoil_fresh_setup(checkout, command):
     before = checkout.run(command)
     if command == "status":
         assert before.returncode == 0, before.stderr
@@ -242,8 +242,10 @@ def test_inspection_or_refused_start_does_not_spoil_fresh_setup(checkout, comman
             "http_ready": False,
         }
     else:
-        assert before.returncode == 1 and "run rss setup" in before.stderr
-    assert all(p.name == "command.lock" for p in checkout.state.iterdir())
+        assert before.returncode == 1 and not before.stdout
+    assert {p.name for p in checkout.state.iterdir()} == {"command.lock"}
+    if command != "status":
+        assert "run rss setup" in before.stderr
 
     installed = checkout.run("setup")
     assert installed.returncode == 0, installed.stderr
@@ -260,13 +262,16 @@ def test_parent_setup_refusal_preserves_child_shutdown(checkout):
 
     # Control only the writer process: the CLI must observe its real filesystem
     # leases and request its shutdown for this generation.
+    nonce = "1" * 32
     for name, record in {
         "service.json": {
-            "nonce": "synthetic",
+            "nonce": nonce,
+            "instance": "default",
             "port": 18080,
+            "private": False,
             "url": "http://127.0.0.1:18080",
         },
-        "service-status.json": {"nonce": "synthetic", "web": "started"},
+        "service-status.json": {"nonce": nonce, "web": "started"},
     }.items():
         path = checkout.state / name
         path.write_text(json.dumps(record))
@@ -300,7 +305,7 @@ def test_parent_setup_refusal_preserves_child_shutdown(checkout):
         ):
             time.sleep(0.01)
         assert request.exists(), "Stop must request shutdown of the active writer."
-        assert json.loads(request.read_text()) == {"nonce": "synthetic"}
+        assert json.loads(request.read_text()) == {"nonce": nonce}
     stopped = shutdown.result()
     assert stopped.returncode == 0, stopped.stderr
     result = json.loads(stopped.stdout)

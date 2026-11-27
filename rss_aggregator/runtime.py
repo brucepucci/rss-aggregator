@@ -294,22 +294,46 @@ class Runtime:
             raise RuntimeFailure("RSS_PORT must be an integer between 1024 and 65535.")
         return port
 
+    def _writer_lease_state(self) -> Literal["web", "php", "idle"]:
+        """Prove exclusion of a web generation and standalone PHP independently."""
+        try:
+            leases = service.WriterLeases(self.state_dir)
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is None:
+                    return "web"
+                if controller is None:
+                    raise RuntimeFailure(
+                        "Native writer state is unconfirmed; controller and writer leases disagree. Inspect the state directory locally."
+                    )
+                with leases.hold("fetch.lock") as fetch:
+                    return "php" if fetch is None else "idle"
+        except (OSError, ValueError):
+            raise RuntimeFailure(
+                "Native writer state is unconfirmed; writer lease evidence is missing or damaged. Inspect the state directory locally."
+            ) from None
+
     def _idle(self) -> bool:
-        """Prove neither a web generation nor a separately supervised fetch can write."""
-        with service.lease(self.state_dir / "writers.lock") as writer:
-            if writer is None:
-                return False
-            with service.lease(self.state_dir / "fetch.lock") as fetch:
-                return fetch is not None
+        """Prove only a healthy, wholly unlocked writer lease set is idle."""
+        try:
+            return self._writer_lease_state() == "idle"
+        except RuntimeFailure:
+            return False
 
     def _live(self) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """Read the current generation only with a held writer lease and matching evidence."""
-        with service.lease(self.state_dir / "writers.lock") as writer:
-            if writer is not None:
-                return None
-        with service.lease(self.state_dir / "controller.lock") as controller:
-            if controller is not None:
-                return None
+        """Read the current generation only with held writer and controller leases."""
+        try:
+            leases = service.WriterLeases(self.state_dir)
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is not None or controller is not None:
+                    return None
+        except (OSError, ValueError):
+            return None
         plan = service.read(self.state_dir / "service.json")
         receipt = service.read(self.state_dir / "service-status.json")
         if (
@@ -321,23 +345,49 @@ class Runtime:
             return plan, receipt
         return None
 
+    def _draining_writer_plan(self) -> dict[str, Any] | None:
+        """Observe generation evidence from a held web lease without proving readiness."""
+        try:
+            leases = service.WriterLeases(self.state_dir)
+            with leases.hold("writers.lock") as writer:
+                if writer is not None:
+                    return None
+        except (OSError, ValueError):
+            return None
+        plan = service.read(self.state_dir / "service.json")
+        receipt = service.read(self.state_dir / "service-status.json")
+        if (
+            isinstance(plan, dict)
+            and isinstance(plan.get("nonce"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", plan["nonce"])
+            and isinstance(receipt, dict)
+            and receipt.get("nonce") == plan["nonce"]
+            and receipt.get("web") == "started"
+        ):
+            return plan
+        return None
+
     def _stop_writers(self) -> None:
         """Request web generation stop and prove that all writer leases release."""
-        if self._idle():
+        lease_state = self._writer_lease_state()
+        if lease_state == "idle":
             return
-        with service.lease(self.state_dir / "writers.lock") as writer:
-            if writer is None:
-                plan = service.read(self.state_dir / "service.json")
-                if not plan:
-                    raise RuntimeFailure(
-                        "Unidentified native writer lease; inspect the instance locally."
-                    )
-                self._save("stop-service.json", {"nonce": plan["nonce"]})
-        # Orphaned foreground fetches drain independently; a startup fetch may
-        # have acquired only fetch.lock, before any web generation exists.
+        if lease_state == "web":
+            plan = service.read(self.state_dir / "service.json")
+            if (
+                not isinstance(plan, dict)
+                or not isinstance(plan.get("nonce"), str)
+                or not re.fullmatch(r"[a-f0-9]{32}", plan["nonce"])
+            ):
+                raise RuntimeFailure(
+                    "Unidentified native writer lease; inspect the instance locally."
+                )
+            self._save("stop-service.json", {"nonce": plan["nonce"]})
+        # Startup PHP may have acquired only fetch.lock, before a web generation
+        # exists. Its caretaker retains that lease through its own deadline.
         deadline = time.monotonic() + 165
         while time.monotonic() < deadline:
-            if self._idle():
+            if self._writer_lease_state() == "idle":
                 return
             time.sleep(0.2)
         raise RuntimeFailure(
@@ -435,40 +485,49 @@ class Runtime:
                 return
             sync_directory(path.parent)
 
-    def _php(self, *args: str, timeout_seconds: int = 120) -> bytes:
-        """Run bounded native PHP with a lease and never surface upstream output in errors."""
-        binary = self.state_dir / "runtime/frankenphp"
-        with service.lease(self.state_dir / "fetch.lock") as operation_lock:
+    def _php(
+        self, *args: str, timeout_seconds: int = 120, capture_output: bool = False
+    ) -> bytes:
+        """Run bounded PHP without exporting its output or inheriting the command lease."""
+        with service.WriterLeases(self.state_dir).hold("fetch.lock") as operation_lock:
             if operation_lock is None:
                 raise RuntimeFailure(
                     "A feed fetch is already in progress; retry after it completes."
                 )
             try:
-                result = subprocess.run(
-                    [str(binary), "php-cli", *args],
-                    cwd=self.state_dir / "runtime/FreshRSS",
-                    env=service.environment(self.state_dir, self.data_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=timeout_seconds,
-                    umask=0o077,
-                    check=False,
-                    pass_fds=tuple(
-                        fd
-                        for fd in (self._command_lock_fd, operation_lock)
-                        if fd is not None
-                    ),
-                )
-            except subprocess.TimeoutExpired:
-                raise RuntimeFailure(
-                    f"FreshRSS PHP operation timed out after {timeout_seconds} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
-                ) from None
-        if result.returncode:
+                if capture_output:
+                    # An unnamed file avoids blocking the caretaker if the caller exits.
+                    with tempfile.TemporaryFile() as output:
+                        code = service.foreground_php(
+                            self.state_dir,
+                            self.data_dir,
+                            operation_lock,
+                            timeout_seconds,
+                            args,
+                            output=output,
+                        )
+                        output.seek(0)
+                        payload = output.read(128 * 1024)
+                else:
+                    code = service.foreground_php(
+                        self.state_dir,
+                        self.data_dir,
+                        operation_lock,
+                        timeout_seconds,
+                        args,
+                    )
+                    payload = b""
+            except OSError:
+                code = 1
+        if code == service.FETCH_TIMED_OUT:
+            raise RuntimeFailure(
+                f"FreshRSS PHP operation timed out after {timeout_seconds} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
+            )
+        if code:
             raise RuntimeFailure(
                 "FreshRSS PHP operation failed; inspect the instance locally (logs may contain secrets)."
             )
-        return result.stdout
+        return payload
 
     def _configure(self, origin: str) -> None:
         """Enforce form authentication, the API and SQLite before opening the listener."""
@@ -488,7 +547,7 @@ class Runtime:
             "echo json_encode([$c->auth_type,$c->allow_anonymous,$c->allow_anonymous_refresh,"
             '$c->api_enabled,$c->base_url,$c->disable_update,$c->db["type"]??null]);'
         )
-        if json.loads(self._php("-r", code)) != [
+        if json.loads(self._php("-r", code, capture_output=True)) != [
             "form",
             False,
             False,
@@ -518,20 +577,30 @@ class Runtime:
     ) -> dict[str, Any]:
         """Spawn a detached lease-holding worker and record its forwarding guard."""
         self._check_port(port)
+        owner, installed = self._ownership_receipt()
+        instance = self.instance
+        generation = Recovery(self).shutdown_generation(
+            instance, owner, installed, require_record=True
+        )
+        if generation is None:
+            raise RuntimeFailure("Cannot launch without a recorded writer generation.")
         nonce = uuid.uuid4().hex
         plan = {
             "nonce": nonce,
             "startup_gate": True,
-            "instance": self.instance,
+            "instance": instance,
+            "owner": owner["token"],
+            "writer_generation": generation,
             "port": port,
             "url": origin,
             "private": private,
             "check_private_backend": private or check_private_backend,
             "runtime": self._identity(),
         }
+        leases = service.WriterLeases(self.state_dir)
         with (
-            service.lease(self.state_dir / "writers.lock") as writer,
-            service.lease(self.state_dir / "controller.lock") as controller,
+            leases.hold("writers.lock") as writer,
+            leases.hold("controller.lock") as controller,
         ):
             if writer is None or controller is None:
                 raise RuntimeFailure(
@@ -704,6 +773,8 @@ class Runtime:
         access = PrivateAccess(self)
         private = access.enabled() if private_https is None else private_https
         live = self._live()
+        if live and not explicit:
+            self._require_live_selection(live[0].get("instance"), self.instance)
         # A live plan's obligation belongs to its backend, not to Serve authority.
         if live and live[0].get("port") == port:
             check_private_backend = (
@@ -845,11 +916,16 @@ class Runtime:
         """Report installed pin, selected data, writer readiness and private forwarding."""
         if not os.path.lexists(self.state_dir / "runtime"):
             # Inspection of an unused root must not manufacture writer evidence.
-            leases_present = any(
+            writer_evidence = any(
                 os.path.lexists(self.state_dir / name)
-                for name in ("writers.lock", "fetch.lock")
+                for name in (
+                    "native-owner.json",
+                    "service.json",
+                    service.WRITER_LEASE_RECORD,
+                    *service.WRITER_LEASES,
+                )
             )
-            idle = not leases_present or self._idle()
+            idle = not writer_evidence or self._idle()
             return {
                 "runtime": "absent",
                 "application": "stopped" if idle else "unconfirmed",
@@ -858,9 +934,11 @@ class Runtime:
         owner, _ = self._owned(require_current=False, verify=False)
         live = self._live()
         plan, receipt = live or ({}, {})
+        selected = self.instance
         security = service.read(self.state_dir / "security.json")
         ready = bool(
             live
+            and plan.get("instance") == selected
             and isinstance(security, dict)
             and security.get("nonce") == plan["nonce"]
             and plan.get("runtime") == self._identity()
@@ -874,17 +952,33 @@ class Runtime:
             else "stopped"
             if self._idle()
             else "unconfirmed",
-            "instance": self.instance,
+            "instance": selected,
             "http_ready": ready,
             "scheduler": self._scheduler(receipt),
             "forwarding": PrivateAccess(self).status(owner),
-            **({"url": plan["url"], "port": plan["port"]} if live else {}),
+            **(
+                {
+                    "url": plan["url"],
+                    "port": plan["port"],
+                    "live_instance": plan.get("instance"),
+                }
+                if live
+                else {}
+            ),
         }
+
+    @staticmethod
+    def _require_live_selection(live_instance: Any, selected: str) -> None:
+        """Do not treat an observed writer as the selected instance on disagreement."""
+        if live_instance != selected:
+            raise RuntimeFailure(
+                "The live FreshRSS instance differs from the selected instance; run rss stop or explicitly start the intended instance."
+            )
 
     def _actualize(self) -> dict[str, Any]:
         """Run the upstream fetcher without bypassing TTL, backoff or cache."""
         timeout = service.FETCH_TIMEOUT
-        with service.lease(self.state_dir / "fetch.lock") as fetch:
+        with service.WriterLeases(self.state_dir).hold("fetch.lock") as fetch:
             if fetch is None:
                 raise RuntimeFailure(
                     "A feed fetch is already in progress; retry after it completes."
@@ -908,7 +1002,10 @@ class Runtime:
     def _fetch(self) -> dict[str, Any]:
         """Fetch immediately for the selected and verified running instance."""
         self._owned()
-        if not self._status()["http_ready"]:
+        status = self._status()
+        if status["application"] == "running":
+            self._require_live_selection(status["live_instance"], status["instance"])
+        if not status["http_ready"]:
             raise RuntimeFailure("Start a verified native service before fetching.")
         if not service.initialized(self.data_dir):
             return {"status": "installer_pending"}
@@ -916,9 +1013,11 @@ class Runtime:
 
     def _verify(self) -> dict[str, Any]:
         """Recheck security and readiness by reopening the currently owned listener."""
+        self._ownership_receipt()
         live = self._live()
         if live is None:
             raise RuntimeFailure("Start the owned service before verifying it.")
+        self._require_live_selection(live[0].get("instance"), self.instance)
         return {
             **self._start(
                 private_https=live[0]["private"],

@@ -80,13 +80,13 @@ Startup (including a restart via `verify` or backup resumption) and manual
 `fetch` allow up to **10 minutes** for the complete foreground fetch. A timeout
 fails the operation without emitting upstream output; inspect logs and slow feeds
 locally. On a restart timeout, serving may remain stopped; check `status` and, if
-resuming a backup, `backup-status` before retrying. If the invoking CLI exits
-unexpectedly, a foreground fetch is still bounded and keeps writer exclusion
-until the child exits; `stop` or backup may wait for that drain.
-The scheduler and manual fetch serialize to avoid overlapping fetches. Scheduled
-fetches have the same 10-minute execution budget; on timeout the controller stops
-and reaps its child, reports a failed `last_fetch` in `status`, and can try again
-at a later eligible slot. When the instance is stopped, neither the service nor
+resuming a backup, `backup-status` before retrying. Startup PHP preparation and configuration each have a **120-second**
+budget. If the invoking CLI exits, those operations and foreground fetching
+retain independent deadlines and writer exclusion until the child exits.
+The scheduler and manual fetch serialize to avoid overlap. Scheduled fetches
+have the same 10-minute budget as foreground fetching. The caretaker still
+terminates and reaps the writer if the controller exits; a surviving controller
+reports a timeout as a failed `last_fetch` and can try again at a later slot. When the instance is stopped, neither the service nor
 its feed scheduler runs. Reader
 synchronization does not fetch feeds. Archiving policies can remove older articles;
 check the user/category/feed settings before changing them.
@@ -105,7 +105,10 @@ intent may remain. Fix the intent-write failure and retry `stop` before releasin
 any hold. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
 for resumption, daily checks and interrupted maintenance; a failed explicit
 `backup` has different resumption behavior. A local archive alone does not prove
-host-loss recovery.
+host-loss recovery. `application: unconfirmed` is not proof of idle writers.
+Wait for a managed writer to drain and retry `stop`; if lease evidence is missing
+or changed, preserve the state and inspect with the owner. Do not recreate or
+remove a lease, kill an unidentified process, or force a capture.
 
 ## Opt-in Mac startup and recovery
 
@@ -139,7 +142,11 @@ plist/receipt edits. Removal does not stop FreshRSS,
 change intent or delete data/archives. An intentionally stopped or unset instance
 is not eligible for automatic start. Only `start` enables running intent; `stop`
 records stopped intent even when a later step fails, once the command lock is held.
-Temporary maintenance/verification does not change it.
+Temporary maintenance/verification does not change it. Installation refuses a
+captured port or access mode different from a running service. If those settings
+later disagree, `supervision-status` reports `configuration_conflict` for running
+intent; a tick does not restart the listener or spend a retry. Follow the
+procedure below to correct and recapture the configuration deliberately.
 
 ### Upgrade installed Mac jobs safely
 
@@ -371,16 +378,20 @@ Never share raw logs, URLs, tokens, database files or copied journals.
 
 - **Setup/pin drift:** preserve receipts and paths. Confirm native arm64 execution,
   reviewed manifest, expected permissions and available storage; do not substitute
-  host software or delete a record to adopt a path.
+  host software or delete a record to adopt a path. A first setup interrupted
+  before ownership publication can leave staged lease paths in an unowned root.
+  Preserve it for inspection and choose a fresh private state path rather than
+  hand-creating a receipt or lease registry.
 - **Port/forwarding ownership:** inspect the port and route locally, including
   known proxy targets. Preserve unrelated software. Follow the reviewed port
   change and job recapture procedures rather than forcing a bind.
-- **Lost or unreadable selection:** `stop` still attempts to quiesce owned
-  resources but refuses a backup until the intended instance is known. Preserve
-  data and records, confirm which complete instance is intended, and run
-  `rss select-instance NAME` while idle with no maintenance hold. Retry `stop`
-  for a verified archive before restarting. Do not remove the selection guard
-  or use `default` as a substitute for a missing reader.
+- **Lost, unreadable or conflicting selection:** `stop` still attempts to
+  quiesce owned resources. A confirmed writer identity can authorize its own
+  shutdown archive but does not correct selection. Preserve data and records,
+  confirm which complete instance is intended, and run `rss select-instance NAME`
+  while idle with no maintenance hold. Retry a failed `stop` for the affected
+  instance before restarting. Do not remove the selection guard or use `default`
+  as a substitute for a missing reader.
 - **Writer or backup hold:** confirm idle state via the supported
   [reconciliation](backup-restore.md#interrupted-maintenance-and-reconciliation).
   Do not unlink lock files, clear holds or kill unidentified processes.

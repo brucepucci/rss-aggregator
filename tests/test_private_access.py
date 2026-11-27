@@ -190,6 +190,17 @@ def native(installed_checkout, tmp_path, monkeypatch):
     checkout, owner = installed_checkout
     state = tmp_path / "state"
     shutil.copytree(checkout.state, state)
+    # A copied disposable fixture represents a separate initialized installation.
+    # Its kernel lease files have different inodes than the template's files.
+    registry = state / "writer-leases.json"
+    registry.write_text(
+        json.dumps(
+            {
+                name: (state / name).stat().st_ino
+                for name in json.loads(registry.read_text())
+            }
+        )
+    )
     assert not (state / "instances").exists()
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("PATH", str(tmp_path))
@@ -719,10 +730,11 @@ def http_response(request, body, status=200, headers=None):
 
 @pytest.fixture
 def ready_native(native, monkeypatch):
-    nonce = "synthetic-generation"
+    nonce = "a" * 32
     for name, value in {
         "service.json": {
             "nonce": nonce,
+            "instance": "default",
             "port": PORT,
             "url": ORIGIN,
             "runtime": manifest_identity(native.manifest),
@@ -791,34 +803,31 @@ def controlled_web(native, monkeypatch):
 
     native.lose_generation = lose_generation
     native.data = native.state / "instances/default/data"
-    native.web_auth = True
+    native.web_probe_overrides = {}
     native.acknowledge = True
     native.launches = 0
     native.fetch_result = lambda: 0
 
-    def run(args, **kwargs):
-        nonlocal origin
-        if args[0] != str(native.state / "runtime/frankenphp"):
-            return native.api.run_cli(args, **kwargs)
-        if args[2] == "-r":
-            output = json.dumps(["form", False, False, True, origin, True, "sqlite"])
-        else:
-            if args[2] == "cli/reconfigure.php":
-                origin = args[args.index("--base-url") + 1]
-            assert args[2] in (
-                "cli/prepare.php",
-                "cli/reconfigure.php",
-            )
-            output = ""
-        return subprocess.CompletedProcess(args, 0, output.encode(), b"")
-
     def spawn(args, *, pass_fds, **kwargs):
+        nonlocal origin
         if args[1:3] == ["-I", "-B"]:
-            assert Path(args[3]).name == "native_service.py" and args[4] == "fetch"
+            assert Path(args[3]).name == "native_service.py"
             assert args[5] == str(native.state) and args[6] == str(native.data)
             assert pass_fds == (int(args[7]),)
-            assert kwargs["stdout"] == kwargs["stderr"] == subprocess.DEVNULL
-            return SimpleNamespace(wait=native.fetch_result)
+            assert kwargs["stderr"] == subprocess.DEVNULL
+            if args[4] == "fetch":
+                assert kwargs["stdout"] == subprocess.DEVNULL
+                return SimpleNamespace(wait=native.fetch_result)
+            assert args[4] == "php"
+            operation = args[9]
+            if operation == "-r":
+                result = ["form", False, False, True, origin, True, "sqlite"]
+                kwargs["stdout"].write(json.dumps(result).encode())
+            elif operation == "cli/reconfigure.php":
+                origin = args[args.index("--base-url") + 1]
+            else:
+                assert operation == "cli/prepare.php"
+            return SimpleNamespace(wait=lambda: 0)
         assert args[2:4] == ["-m", "rss_aggregator.native_service"]
         assert not handles
         handles.extend(os.dup(fd) for fd in pass_fds)
@@ -867,7 +876,8 @@ def controlled_web(native, monkeypatch):
                     "sqlite": True,
                     "loaded_ini": str(native.state / "service/php.ini"),
                     "initialized": (native.data / "applied_migrations.txt").is_file(),
-                    "authenticated_settings": native.web_auth,
+                    "authenticated_settings": True,
+                    **native.web_probe_overrides,
                 }
             ).encode()
             return http_response(request, body)
@@ -889,7 +899,6 @@ def controlled_web(native, monkeypatch):
         def bind(self, address):
             assert address == ("127.0.0.1", PORT)
 
-    monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setattr(socket, "socket", Listener)
     monkeypatch.setattr(
@@ -1462,6 +1471,32 @@ def test_repeat_start_observes_installer_completion(controlled_web, monkeypatch)
     assert not native.api.posts
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [("php", "8.5.0"), ("sapi", "cli"), ("upload_progress", "1")],
+    ids=["php-version", "web-sapi", "upload-progress-enabled"],
+)
+def test_private_start_refuses_mismatched_effective_web_php(
+    controlled_web, monkeypatch, field, value
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    assert not result_json(native.run(["start"]))["security"]["initialized"]
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    original = copy.deepcopy(native.api.config)
+    native.web_probe_overrides[field] = value
+
+    refused(native.run(["start"]), "Effective web PHP settings")
+
+    status = result_json(native.run(["status"]))
+    assert (status["application"], status["http_ready"]) == ("stopped", False)
+    assert status["forwarding"]["status"] == "unconfigured"
+    assert not (native.state / "service/__rss_probe.php").exists()
+    assert not native.api.posts
+    assert native.api.config == original
+
+
 @pytest.mark.parametrize("repeated", [False, True], ids=["first-start", "repeat-start"])
 def test_private_start_refuses_failed_effective_authentication(
     controlled_web, monkeypatch, repeated
@@ -1473,7 +1508,7 @@ def test_private_start_refuses_failed_effective_authentication(
     monkeypatch.setenv("RSS_TAILSCALE", "1")
     if repeated:
         assert result_json(native.run(["start"]))["security"]["initialized"]
-    native.web_auth = False
+    native.web_probe_overrides["authenticated_settings"] = False
     refused(native.run(["start"]), "Effective web PHP settings")
     status = result_json(native.run(["status"]))
     assert status["application"] == "stopped"

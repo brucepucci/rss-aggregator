@@ -35,8 +35,16 @@ if args == ['version']:
     print('FrankenPHP v1.14.0 PHP 8.6.0 Caddy v2.11.9')
 elif args[:3] == ['php-cli', '-n', '-r']:
     print('8.6.0')
-elif args[:2] == ['php-cli', 'cli/reconfigure.php']:
-    (control / 'base-url').write_text(args[args.index('--base-url') + 1])
+elif args[0] == 'php-cli' and args[1] in ['cli/prepare.php', 'cli/reconfigure.php']:
+    operation = Path(args[1]).stem
+    if (control / ('hold-' + operation)).exists():
+        signal.alarm(60)
+        (control / (operation + '-pid')).write_text(str(os.getpid()))
+        (control / (operation + '-started')).touch()
+        while not (control / (operation + '-release')).exists():
+            time.sleep(0.02)
+    if operation == 'reconfigure':
+        (control / 'base-url').write_text(args[args.index('--base-url') + 1])
 elif args[:2] == ['php-cli', '-r']:
     print(json.dumps(['form', False, False, True, (control / 'base-url').read_text(), True, 'sqlite']))
 elif args == ['php-cli', 'app/actualize_script.php']:
@@ -83,7 +91,9 @@ import json
 import os
 import runpy
 import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -98,11 +108,34 @@ if sys.argv[1:4] == ['-I', '-m', 'rss_aggregator.native_service']:
     control = Path(sys.argv[4]) / 'service'
     (control / 'controller-pid').write_text(str(os.getpid()))
     sys.argv = sys.argv[3:]
-    runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
+    with (
+        patch('time.time', lambda: 1200 if (control / 'next-slot').exists() else 0),
+        patch.object(sys, 'executable', __file__),
+    ):
+        runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
     raise SystemExit(0)
 if sys.argv[1:3] == ['-I', '-B'] and Path(sys.argv[3]).name == 'native_service.py':
     sys.argv = sys.argv[3:]
-    runpy.run_path(sys.argv[0], run_name='__main__')
+    control = Path(sys.argv[2]) / 'service'
+    monotonic = time.monotonic
+    clock = control / 'clock'
+    scheduled = sys.argv[1] == 'fetch' and len(sys.argv) > 6
+
+    def caretaker_clock():
+        if clock.exists():
+            return json.loads(clock.read_text())[1]
+        offset = control / 'advance-deadline'
+        return monotonic() + (int(offset.read_text()) if offset.exists() else 0)
+
+    class Process(subprocess.Popen):
+        def __init__(self, args, **kwargs):
+            super().__init__(args, **kwargs)
+            if scheduled and clock.exists():
+                with (control / 'scheduled-pids').open('a') as history:
+                    print(self.pid, file=history)
+
+    with patch('time.monotonic', caretaker_clock), patch.object(subprocess, 'Popen', Process):
+        runpy.run_path(sys.argv[0], run_name='__main__')
     raise SystemExit(0)
 assert sys.argv[1:5] == ['-I', '-B', '-m', 'rss_aggregator']
 sys.argv = ['rss', *sys.argv[5:]]
@@ -185,6 +218,11 @@ class ProcessCheckout(Checkout):
     @property
     def control(self):
         return self.state / "service"
+
+    def advance_deadline(self, seconds):
+        temporary = self.control / "advance-deadline.tmp"
+        temporary.write_text(str(seconds))
+        temporary.replace(self.control / "advance-deadline")
 
     def popen(self, *args):
         return subprocess.Popen(
@@ -332,7 +370,94 @@ def test_inflight_fetch_prevents_backup_after_controller_death(process_checkout)
     assert Path(saved["archive"]).is_file()
 
 
-def test_stop_reaps_acknowledged_web_after_controller_death(process_checkout):
+@pytest.mark.parametrize("damage", ["other_instance", "unreadable"])
+def test_live_selection_disagreement_refuses_capture_without_switching(
+    process_checkout, damage
+):
+    checkout = process_checkout
+    source = _success(checkout, "backup")["archive"]
+    _success(checkout, "restore", source, "--instance", "standby")
+    _success(checkout, "select-instance", "standby")
+    selection = checkout.state / "selected-instance.json"
+    standby = selection.read_bytes()
+    _success(checkout, "select-instance", "reader")
+    reader = selection.read_bytes()
+    _success(checkout, "start")
+    plan = checkout.state / "service.json"
+    live = plan.read_bytes()
+    archives = set(checkout.backups.glob("*.zip"))
+    broken_selection = standby if damage == "other_instance" else b"{"
+    selection.write_bytes(broken_selection)
+    try:
+        if damage == "other_instance":
+            mismatch = _success(checkout, "status")
+            assert mismatch["instance"] == "standby"
+            assert mismatch["live_instance"] == "reader"
+            assert mismatch["http_ready"] is False
+        else:
+            assert checkout.run("status").returncode == 1
+        for operation in ("fetch", "backup", "verify"):
+            result = checkout.run(operation)
+            assert result.returncode == 1 and not result.stdout, result.stdout
+            assert "selection" in result.stderr or "selected instance" in result.stderr
+        assert plan.read_bytes() == live
+        assert set(checkout.backups.glob("*.zip")) == archives
+
+        stopped = _success(checkout, "stop")
+        assert stopped["backup"]["verified"] is True
+        evidence = _success(checkout, "backup-status")
+        assert evidence["latest_attempt"]["instance"] == "reader"
+        assert evidence["latest_success"]["instance"] == "reader"
+        assert evidence["unresolved_shutdowns"] == []
+        assert selection.read_bytes() == broken_selection
+    finally:
+        selection.write_bytes(reader)
+        if _success(checkout, "status")["application"] != "stopped":
+            _success(checkout, "stop")
+
+
+def test_scheduled_fetch_deadline_survives_controller_death(process_checkout):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    nonce = json.loads((checkout.state / "service.json").read_text())["nonce"]
+    controller = int((checkout.control / "controller-pid").read_text())
+    release_web = checkout.control / ("web-release-" + nonce)
+    try:
+        (checkout.control / "next-slot").touch()
+        _wait_for(
+            (checkout.control / "fetch-started").exists,
+            "scheduled fetch did not start",
+        )
+        fetch = int((checkout.control / "fetch-pid").read_text())
+        os.kill(controller, signal.SIGKILL)
+        web = int((checkout.control / ("web-pid-" + nonce)).read_text())
+        _wait_for(lambda: _exited(web), "the web caretaker did not reap its child")
+
+        result = checkout.run("backup")
+        assert result.returncode == 1 and not result.stdout
+        assert "writer state is unconfirmed" in result.stderr
+        assert not _exited(fetch)
+        assert not list(checkout.backups.glob("*.zip"))
+
+        checkout.advance_deadline(601)
+        _wait_for(lambda: _exited(fetch), "the scheduled fetch deadline was lost")
+        assert not (checkout.control / "fetch-finished").exists()
+        saved = _success(checkout, "backup")
+        assert saved["verified"] is True
+        assert Path(saved["archive"]).is_file()
+    finally:
+        release_web.touch()
+        (checkout.control / "fetch-release").touch()
+        _wait_for(
+            lambda: _success(checkout, "status")["application"] == "stopped",
+            "disposable writer did not exit",
+        )
+
+
+@pytest.mark.parametrize("generation_matches", [True, False])
+def test_stop_reaps_acknowledged_web_after_controller_death(
+    process_checkout, generation_matches
+):
     checkout = process_checkout
     assert _success(checkout, "start")["application"] == "running"
     assert _success(checkout, "status")["http_ready"] is True
@@ -341,6 +466,9 @@ def test_stop_reaps_acknowledged_web_after_controller_death(process_checkout):
     web = int((checkout.control / ("web-pid-" + nonce)).read_text())
     release_web = checkout.control / ("web-release-" + nonce)
     (checkout.control / "hold-web").touch()
+    if not generation_matches:
+        generation = checkout.state / "instances/reader/writer-generation.json"
+        generation.write_text(json.dumps({"writer_generation": None}))
     try:
         os.kill(controller, signal.SIGKILL)
         _wait_for(
@@ -350,22 +478,39 @@ def test_stop_reaps_acknowledged_web_after_controller_death(process_checkout):
         assert not list(checkout.control.glob("acknowledged-*.json"))
         assert not _exited(web)
         assert _success(checkout, "status")["application"] == "unconfirmed"
-        release_web.touch()
-        _wait_for(
-            lambda: _success(checkout, "status")["application"] == "stopped",
-            "the approved writer was not reaped",
-        )
-        assert _exited(web)
         with checkout.popen("stop") as stop:
             try:
+                _wait_for(
+                    lambda: (checkout.state / "backup-shutdown.json").exists()
+                    or stop.poll() is not None,
+                    "stop did not reach the shutdown guard",
+                )
+                assert stop.poll() is None, stop.communicate()
+                evidence = _success(checkout, "backup-status")
+                assert evidence["busy"] is True
+                expected_instance = "reader" if generation_matches else None
+                assert evidence["unresolved_shutdown"]["instance"] == expected_instance
+                assert not _exited(web)
+                assert not list(checkout.backups.glob("*.zip"))
+                release_web.touch()
                 out, err = stop.communicate(timeout=5)
             finally:
                 if stop.poll() is None:
                     stop.kill()
+        assert _exited(web), "stop published before the draining writer was reaped"
+        evidence = _success(checkout, "backup-status")
+        assert evidence["latest_success"]["instance"] == "reader"
+        if generation_matches:
             assert stop.returncode == 0, err
-        result = json.loads(out)
-        assert result["application"] == "stopped"
-        assert result["backup"]["verified"] is True
+            result = json.loads(out)
+            assert result["application"] == "stopped"
+            assert result["already_stopped"] is False
+            assert result["backup"]["verified"] is True
+            assert evidence["unresolved_shutdowns"] == []
+        else:
+            assert stop.returncode == 1 and not out
+            assert "shutdown identity could not be confirmed" in err
+            assert evidence["unresolved_shutdown"]["instance"] is None
         assert not list(checkout.control.glob("acknowledged-*.json"))
         assert _success(checkout, "status")["http_ready"] is False
     finally:
@@ -425,6 +570,61 @@ def test_stop_waits_for_foreground_fetch_deadline_after_cli_death(process_checko
         )
 
 
+@pytest.mark.parametrize("operation", ["prepare", "reconfigure"])
+def test_configuration_remains_excluded_and_bounded_after_start_dies(
+    process_checkout, operation
+):
+    checkout = process_checkout
+    if operation == "prepare":
+        data = checkout.state / "instances/reader/data"
+        for name in ("applied_migrations.txt", "config.php"):
+            (data / name).unlink()
+    checkout.control.mkdir(mode=0o700)
+    (checkout.control / f"hold-{operation}").touch()
+    try:
+        with checkout.popen("start") as start:
+            try:
+                _wait_for(
+                    (checkout.control / f"{operation}-started").exists,
+                    f"{operation} did not start",
+                )
+                pid = int((checkout.control / f"{operation}-pid").read_text())
+            finally:
+                if start.poll() is None:
+                    start.kill()
+            assert start.wait(timeout=5) == -signal.SIGKILL
+
+        status = _success(checkout, "status")
+        assert (status["application"], status["http_ready"]) == ("unconfirmed", False)
+        result = checkout.run("backup")
+        assert result.returncode == 1 and not result.stdout
+        assert "writer state is unconfirmed" in result.stderr
+        assert not list(checkout.backups.glob("*.zip"))
+
+        with checkout.popen("stop") as stop:
+            try:
+                _wait_for(
+                    lambda: (checkout.state / "backup-shutdown.json").exists()
+                    or stop.poll() is not None,
+                    "stop did not reach the shutdown guard",
+                )
+                assert stop.poll() is None and not _exited(pid)
+                assert not list(checkout.backups.glob("*.zip"))
+                checkout.advance_deadline(121)
+                out, err = stop.communicate(timeout=5)
+            finally:
+                if stop.poll() is None:
+                    stop.kill()
+            assert _exited(pid), f"{operation} deadline was lost"
+            # Until a web generation exists, shutdown cannot identify the PHP
+            # writer. Nevertheless, the verified archive must follow actual exit.
+            assert stop.returncode == 1 and not out
+            assert "shutdown identity could not be confirmed" in err
+            assert list(checkout.backups.glob("*.zip"))
+    finally:
+        (checkout.control / f"{operation}-release").touch()
+
+
 def test_startup_fetch_blocks_backup_even_without_a_web_generation(process_checkout):
     checkout = process_checkout
     checkout.control.mkdir(mode=0o700)
@@ -478,6 +678,41 @@ def test_foreground_timeout_reports_safe_error_after_reaping_writer(process_chec
     finally:
         (checkout.control / "fetch-release").touch()
         assert _success(checkout, "stop")["application"] == "stopped"
+
+
+@pytest.mark.parametrize(
+    "name", ["writers.lock", "controller.lock", "fetch.lock", "writer-leases.json"]
+)
+@pytest.mark.parametrize("replaced", [False, True], ids=["missing", "replaced"])
+def test_damaged_installed_lease_is_not_idle_evidence(process_checkout, name, replaced):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    initial = _success(checkout, "stop")
+    archives = {Path(initial["backup"]["archive"])}
+    path = checkout.state / name
+    path.rename(checkout.control / "previous-lease")
+    if replaced:
+        path.touch(mode=0o600)
+    assert _success(checkout, "status")["application"] == "unconfirmed"
+    for command in ("setup", "backup", "stop"):
+        result = checkout.run(command)
+        assert result.returncode == 1 and not result.stdout
+        assert "unconfirmed" in result.stderr
+        assert set(checkout.backups.glob("*.zip")) == archives
+        assert path.exists() == replaced, "inspection must never recreate a lease"
+
+
+def test_independent_held_controller_prevents_idle_backup(process_checkout):
+    checkout = process_checkout
+    assert _success(checkout, "status")["application"] == "stopped"
+    with lease(checkout.state / "controller.lock") as controller:
+        assert controller is not None
+        assert _success(checkout, "status")["application"] == "unconfirmed"
+        for command in ("backup", "stop"):
+            result = checkout.run(command)
+            assert result.returncode == 1 and not result.stdout
+            assert "unconfirmed" in result.stderr
+            assert not list(checkout.backups.glob("*.zip"))
 
 
 def _run_captured_job(definition):

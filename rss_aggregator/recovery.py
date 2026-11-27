@@ -196,10 +196,8 @@ class Recovery:
             self._private(directory, directory=True)
         return directory
 
-    def _data(
-        self, instance: str, owner: dict[str, Any], identity: dict[str, Any]
-    ) -> Path | None:
-        """Find complete data only when its private record matches owner and pin."""
+    def _provenance(self, instance: str) -> tuple[Path, dict[str, Any]] | None:
+        """Read the existing private instance and its independent provenance."""
         base = self._instances() / instance_name(instance)
         if not os.path.lexists(base):
             return None
@@ -220,8 +218,21 @@ class Recovery:
             or type(record.get("version")) is not int
             or record["version"] != 1
             or record.get("instance") != instance
-            or record.get("owner") != owner["token"]
+            or not isinstance(record.get("owner"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["owner"]) is None
         ):
+            raise self.failure("Instance record does not establish managed ownership.")
+        return base / "data", record
+
+    def _data(
+        self, instance: str, owner: dict[str, Any], identity: dict[str, Any]
+    ) -> Path | None:
+        """Find complete data only when its private record matches owner and pin."""
+        provenance = self._provenance(instance)
+        if provenance is None:
+            return None
+        data, record = provenance
+        if record["owner"] != owner["token"]:
             raise self.failure("Instance record does not establish managed ownership.")
         stored = record.get("identity")
         if (
@@ -232,7 +243,20 @@ class Recovery:
             raise self.failure(
                 "Instance requires its recorded FreshRSS release, source SHA-256 and platform before activation."
             )
-        return base / "data"
+        return data
+
+    def receipt_loss_identity(
+        self, instance: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read candidate backup evidence; never authorize writer control from it."""
+        provenance = self._provenance(instance)
+        if provenance is None:
+            return None
+        _data, record = provenance
+        installed = record.get("identity")
+        if not isinstance(installed, dict):
+            return None
+        return {"token": record["owner"]}, installed
 
     def _initial_absent(self, instance: str) -> bool:
         """Distinguish pristine state from a lost or interrupted instance."""
@@ -336,6 +360,20 @@ class Recovery:
         return self._read_generation(
             self._selected_data(), require_record=require_record
         )
+
+    def shutdown_generation(
+        self,
+        instance: str,
+        owner: dict[str, Any],
+        installed: dict[str, Any],
+        *,
+        require_record: bool = False,
+    ) -> str | None:
+        """Read owned instance evidence independently of layout and selection."""
+        data = self._data(instance, owner, installed)
+        if data is None:
+            raise self.failure("Shutdown instance data are absent.")
+        return self._read_generation(data, require_record=require_record)
 
     def _publish(
         self,
@@ -448,11 +486,13 @@ class Recovery:
         port = status.get("port") if was_running else None
         was_private = check_private_backend = False
         if was_running:
+            runtime._require_live_selection(status["live_instance"], instance)
             live = runtime._live()
             if (
                 live is None
                 or type(port) is not int
                 or not 1024 <= port <= 65535
+                or live[0].get("instance") != instance
                 or live[0].get("port") != port
                 or type(live[0].get("private")) is not bool
                 or type(live[0].get("check_private_backend", False)) is not bool
@@ -488,6 +528,7 @@ class Recovery:
                             "Cannot confirm writers are stopped; reconcile maintenance."
                         )
                     if was_running and maintenance.may_resume():
+                        runtime._require_live_selection(instance, runtime.instance)
                         maintenance.phase("resuming")
                         runtime._start(
                             private_https=was_private and withdrawn,
@@ -499,14 +540,16 @@ class Recovery:
                 if maintenance.pending():
                     maintenance.notice()
 
-    def capture_shutdown(self, *, already_stopped: bool) -> dict[str, Any]:
-        """Capture the shutdown archive after explicit stop proved writers idle."""
+    def capture_shutdown(
+        self, *, already_stopped: bool, instance: str | None
+    ) -> dict[str, Any]:
+        """Capture the identified instance, or only make an unattributed idle copy."""
         self._require_lock()
         runtime = self.runtime
         if not runtime._idle():
             raise self.failure("FreshRSS writers are still running; snapshot refused.")
         owner, installed = runtime._ownership_receipt()
-        instance = runtime.instance
+        instance = instance if instance is not None else runtime.instance
         data = self._data(instance, owner, installed)
         if data is None:
             if not self._initial_absent(instance):

@@ -50,6 +50,7 @@ class BackupSchedule:
         """Record an explicit backup's outcome separately from verified publication."""
         from rss_aggregator.recovery import Recovery
 
+        self.runtime._ownership_receipt()
         return self._attempt(Recovery(self.runtime).backup, "backup")
 
     @staticmethod
@@ -88,6 +89,10 @@ class BackupSchedule:
             record.get("outcome") in ("running", "failed", "interrupted")
             and self._dated(record, "started_at")
             and (
+                "supersedes_hold" not in record
+                or re.fullmatch(r"[0-9a-f]{64}", record["supersedes_hold"]) is not None
+            )
+            and (
                 "writer_generation" not in record
                 or (
                     instance is not None
@@ -96,7 +101,97 @@ class BackupSchedule:
             )
         )
 
-    def _valid_evidence(self, name: str, record: dict[str, Any]) -> bool:
+    @staticmethod
+    def _daily_ledger(record: dict[str, Any]) -> dict[str, Any]:
+        """Promote a legacy flat attempt in memory, without rewriting it on read."""
+        if "version" in record:
+            return record
+        instance = record["instance"]
+        return {
+            "version": 2,
+            "registration_id": record["registration_id"],
+            "policy_id": record["policy_id"],
+            "latest_instance": instance,
+            "targets": {
+                instance: {
+                    key: value
+                    for key, value in record.items()
+                    if key not in ("instance", "registration_id", "policy_id")
+                }
+            },
+        }
+
+    def _valid_daily(
+        self, record: dict[str, Any], schedule: dict[str, Any] | None
+    ) -> bool:
+        """Require complete, consistent evidence for all targets before replacement."""
+        from rss_aggregator.recovery import instance_name
+
+        if (
+            set(record)
+            != {"version", "registration_id", "policy_id", "latest_instance", "targets"}
+            or type(record["version"]) is not int
+            or record["version"] != 2
+            or record["registration_id"] is None
+            or not self._valid_generation(record["registration_id"])
+            or not re.fullmatch(r"[0-9a-f]{64}", record["policy_id"])
+        ):
+            return False
+        targets = record["targets"]
+        if (
+            not isinstance(targets, dict)
+            or instance_name(record["latest_instance"]) not in targets
+        ):
+            return False
+        current = schedule is not None and self._same_registration(record, schedule)
+        if current and record["policy_id"] != schedule["policy_id"]:
+            return False  # One registration cannot identify two captured policies.
+        registered_at = (
+            datetime.fromisoformat(schedule["registered_at"]) if current else None
+        )
+        for instance, attempt in targets.items():
+            instance_name(instance)
+            if not self._valid_daily_attempt(attempt):
+                return False
+            slot = datetime.fromisoformat(attempt["slot"])
+            if current and (
+                slot < registered_at
+                or (slot.hour, slot.minute) != (schedule["hour"], schedule["minute"])
+            ):
+                return False
+        return True
+
+    def _valid_daily_attempt(self, attempt: Any) -> bool:
+        """Require a real UTC slot, charged attempt and honest publication fields."""
+        fields = {"slot", "count", "attempted_at", "outcome"}
+        if not isinstance(attempt, dict):
+            return False
+        outcome = attempt["outcome"]
+        if outcome == "success":
+            fields.update(("archive", "sha256"))
+        if (
+            set(attempt) != fields
+            or outcome not in ("running", "success", "failed", "interrupted")
+            or type(attempt["count"]) is not int
+            or not 1 <= attempt["count"] <= MAX_ATTEMPTS
+            or (outcome == "success" and not self._archive_fields(attempt))
+        ):
+            return False
+        slot = datetime.fromisoformat(attempt["slot"])
+        attempted = datetime.fromisoformat(attempt["attempted_at"])
+        return (
+            slot.utcoffset() == attempted.utcoffset() == timedelta(0)
+            and slot.second == slot.microsecond == 0
+            and timedelta(0) <= attempted - slot < timedelta(days=1)
+        )
+
+    def _valid_evidence(
+        self,
+        name: str,
+        record: dict[str, Any],
+        *,
+        schedule: dict[str, Any] | None = None,
+    ) -> bool:
         """Validate fields used in each evidence view before using them."""
         outcome = record.get("outcome")
         if name == ATTEMPT:
@@ -117,9 +212,11 @@ class BackupSchedule:
                 and self._dated(record, "completed_at")
             )
         if name == SHUTDOWN:
-            if not isinstance(record.get("owner"), str) or not record["owner"]:
+            owner = record.get("owner")
+            version = record.get("version")
+            if version != 3 and (not isinstance(owner, str) or not owner):
                 return False
-            if record.get("version") == 1:
+            if version == 1:
                 return self._valid_shutdown(
                     {
                         "instance": None,
@@ -129,7 +226,7 @@ class BackupSchedule:
                 )
             pending = record.get("pending")
             return (
-                record.get("version") == 2
+                version in (2, 3)
                 and isinstance(pending, list)
                 and bool(pending)
                 and all(
@@ -137,26 +234,32 @@ class BackupSchedule:
                     for item in pending
                 )
                 and len({item["instance"] for item in pending}) == len(pending)
+                and (
+                    version == 2
+                    or (
+                        owner is None
+                        and len(pending) == 1
+                        and pending[0]["instance"] is None
+                    )
+                )
             )
         if name == DAILY:
-            return (
-                outcome in ("running", "success", "failed", "interrupted")
-                and type(record.get("count")) is int
-                and 1 <= record["count"] <= MAX_ATTEMPTS
-                and self._dated(record, "slot")
-                and self._dated(record, "attempted_at")
-                and (outcome != "success" or self._archive_fields(record))
-            )
+            return self._valid_daily(record, schedule)
         return outcome == "deferred" and self._dated(record, "at")
 
-    def _evidence(self, name: str) -> dict[str, Any] | None:
+    def _evidence(
+        self, name: str, *, schedule: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
         """Distinguish absent backup evidence from unreadable or invalid records."""
         try:
             record = self._read(name)
             if record is None and not os.path.lexists(self.runtime.state_dir / name):
                 return None
-            if isinstance(record, dict) and self._valid_evidence(name, record):
-                return record
+            if isinstance(record, dict):
+                if name == DAILY:
+                    record = self._daily_ledger(record)
+                if self._valid_evidence(name, record, schedule=schedule):
+                    return record
         except (OSError, ValueError, KeyError, TypeError, OverflowError):
             pass
         raise ValueError(
@@ -164,11 +267,15 @@ class BackupSchedule:
         )
 
     def _reported_evidence(
-        self, name: str, problems: dict[str, str]
+        self,
+        name: str,
+        problems: dict[str, str],
+        *,
+        schedule: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Keep one damaged evidence record from hiding other readable records."""
         try:
-            return self._evidence(name)
+            return self._evidence(name, schedule=schedule)
         except ValueError as error:
             problems[name] = str(error)
             return None
@@ -193,7 +300,7 @@ class BackupSchedule:
         from rss_aggregator.runtime import RuntimeFailure
 
         ledger = self._evidence(SHUTDOWN)
-        if ledger is not None and ledger["owner"] != owner["token"]:
+        if ledger is not None and ledger.get("owner") not in (None, owner["token"]):
             raise RuntimeFailure(
                 "Unrecognized shutdown evidence owner; inspect locally."
             )
@@ -251,31 +358,62 @@ class BackupSchedule:
         else:
             self._unlink_durable(self.runtime.state_dir / SHUTDOWN)
 
-    def _identify_shutdown(self) -> tuple[dict[str, Any], bool]:
-        """Prefer the live writer identity, falling back to selection only when idle."""
-        from rss_aggregator.recovery import Recovery, instance_name
-        from rss_aggregator.runtime import RuntimeFailure
-
-        record = {
+    def _unidentified_shutdown(self) -> dict[str, Any]:
+        """Prepare an unresolved stop without inferring its affected instance."""
+        return {
             "instance": None,
             "started_at": self.now.isoformat(),
             "outcome": "running",
         }
+
+    def _identify_shutdown(
+        self,
+        owner: dict[str, Any],
+        installed: dict[str, Any],
+        *,
+        receipt_lost: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
+        """Identify the writer independently of selection when its evidence matches."""
+        from rss_aggregator.recovery import Recovery, instance_name
+        from rss_aggregator.runtime import RuntimeFailure
+
+        record = self._unidentified_shutdown()
         already_stopped = False
         try:
             already_stopped = self.runtime._idle()
+            recovery = Recovery(self.runtime)
             if already_stopped:
-                record["instance"] = self.runtime.instance
-            elif live := self.runtime._live():
-                record["instance"] = instance_name(live[0]["instance"])
-            elif self.runtime._idle():
-                # The controller may exit between the lease and identity probes.
-                record["instance"] = self.runtime.instance
-            if (
-                record["instance"] is not None
-                and record["instance"] == self.runtime.instance
-            ):
-                record["writer_generation"] = Recovery(self.runtime).writer_generation()
+                instance = self.runtime.instance
+                if not receipt_lost:
+                    record["instance"] = instance
+                generation = recovery.shutdown_generation(
+                    instance, owner, installed, require_record=receipt_lost
+                )
+                record.update(instance=instance, writer_generation=generation)
+            else:
+                live = self.runtime._live()
+                plan = live[0] if live else self.runtime._draining_writer_plan()
+                if plan is None:
+                    return record, already_stopped
+                instance = instance_name(plan["instance"])
+                if "writer_generation" in plan and plan.get("owner") == owner["token"]:
+                    generation = recovery.shutdown_generation(
+                        instance, owner, installed, require_record=True
+                    )
+                    if (
+                        generation is not None
+                        and generation == plan["writer_generation"]
+                    ):
+                        record.update(instance=instance, writer_generation=generation)
+                elif live and not receipt_lost and "writer_generation" not in plan:
+                    # Old plans had no durable generation binding. Keep their
+                    # active controller's instance, but require the same selection
+                    # before treating its generation as covered by a shutdown.
+                    record["instance"] = instance
+                    if instance == self.runtime.instance:
+                        record["writer_generation"] = recovery.shutdown_generation(
+                            instance, owner, installed
+                        )
         except (
             RuntimeFailure,
             OSError,
@@ -330,6 +468,54 @@ class BackupSchedule:
             and (generation is not None or running.get("writer_generation") is None)
         )
 
+    def _record_receipt_loss(self) -> None:
+        """Preserve failure without accepting candidate evidence as shutdown authority."""
+        from rss_aggregator.recovery import Recovery
+        from rss_aggregator.runtime import RuntimeFailure
+
+        runtime = self.runtime
+        recovery = Recovery(runtime)
+        prior = self._evidence(SHUTDOWN)
+        identity = None
+        try:
+            plan = runtime._draining_writer_plan()
+            # Selection may establish which installation owns recorded data, but
+            # cannot identify an active writer if the generation evidence is absent.
+            candidate = plan["instance"] if plan is not None else runtime.instance
+            identity = recovery.receipt_loss_identity(candidate)
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            pass
+        if prior is None and identity is None:
+            try:
+                native_service.WriterLeases(runtime.state_dir)
+            except (OSError, ValueError):
+                # A fresh, unrelated or unrecognizable root supplies neither
+                # established lease evidence nor owned instance provenance.
+                return
+        record = self._unidentified_shutdown()
+        owner = prior.get("owner") if prior else None
+        if identity is not None and owner in (None, identity[0]["token"]):
+            record, _idle = self._identify_shutdown(*identity, receipt_lost=True)
+            owner = identity[0]["token"]
+        record["outcome"] = "failed"
+        try:
+            marker = self._read(MAINTENANCE)
+            if isinstance(marker, dict):
+                record["supersedes_hold"] = self._hold_identity(marker)
+        except (OSError, ValueError, TypeError):
+            # A bad hold already prevents reconciliation; preserve failure too.
+            pass
+        pending = [
+            entry
+            for entry in self._shutdown_records(prior)
+            if entry["instance"] != record["instance"]
+        ]
+        if owner is None:
+            # An ownerless entry must stay unidentified even after a receipt returns.
+            runtime._save(SHUTDOWN, {"version": 3, "owner": None, "pending": [record]})
+        else:
+            self._save_shutdowns({"token": owner}, [*pending, record])
+
     def shutdown(self) -> dict[str, Any]:
         """Keep unresolved stop evidence separate from archive and maintenance state."""
         from rss_aggregator.recovery import Recovery
@@ -337,20 +523,32 @@ class BackupSchedule:
 
         runtime = self.runtime
         try:
-            owner, _installed = runtime._ownership_receipt()
+            owner, installed = runtime._ownership_receipt()
         except (RuntimeFailure, OSError, ValueError):
-            # Revoke existing permission to restart, without claiming ownership
-            # or creating intent in a fresh path that has never granted it.
-            if self._has_intent("running"):
-                self._set_stopped_intent()
+            try:
+                self._record_receipt_loss()
+            except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+                runtime._diagnostic(
+                    "Could not persist receipt-loss shutdown evidence; inspect locally."
+                )
+            finally:
+                # Revoke existing permission only, without controlling writers or
+                # creating intent in a fresh path that has never granted it.
+                if self._has_intent("running"):
+                    self._set_stopped_intent()
             raise
         recorded = False
         settled = False
         try:
             try:
                 try:
-                    shutdown, already_stopped = self._identify_shutdown()
+                    shutdown, already_stopped = self._identify_shutdown(
+                        owner, installed
+                    )
                     try:
+                        if self.pending():
+                            _, marker = self._owned_maintenance()
+                            shutdown["supersedes_hold"] = self._hold_identity(marker)
                         self.begin(owner, "stop", shutdown=shutdown)
                     finally:
                         previous = self._owned_shutdowns(owner)
@@ -383,11 +581,15 @@ class BackupSchedule:
                 runtime._quiesce(owner)
             try:
                 self.phase("snapshot")
+                instance = (
+                    shutdown["instance"] if "writer_generation" in shutdown else None
+                )
                 result = self._attempt(
                     lambda: Recovery(runtime).capture_shutdown(
-                        already_stopped=already_stopped
+                        already_stopped=already_stopped, instance=instance
                     ),
                     "stop",
+                    instance=instance,
                 )
                 archive = result["backup"]
                 if archive.get("verified") and not self._covered_shutdown(
@@ -435,7 +637,11 @@ class BackupSchedule:
         return result
 
     def _attempt(
-        self, operation: Callable[[], dict[str, Any]], kind: str
+        self,
+        operation: Callable[[], dict[str, Any]],
+        kind: str,
+        *,
+        instance: str | None = None,
     ) -> dict[str, Any]:
         """Keep capture and resumption evidence even if selection is unreadable."""
         self._evidence(ATTEMPT)
@@ -446,7 +652,9 @@ class BackupSchedule:
             "instance": None,
         }
         try:
-            attempt["instance"] = self.runtime.instance
+            attempt["instance"] = (
+                instance if instance is not None else self.runtime.instance
+            )
             self.runtime._save(ATTEMPT, attempt)
             result = operation()
         except Exception:
@@ -525,8 +733,8 @@ class BackupSchedule:
         if "registration_id" in config or "registered_at" in config:
             if (
                 not config["active"]
-                or not isinstance(config.get("registration_id"), str)
-                or not config["registration_id"]
+                or config.get("registration_id") is None
+                or not self._valid_generation(config["registration_id"])
                 or datetime.fromisoformat(config["registered_at"]).utcoffset()
                 != timedelta(0)
             ):
@@ -563,6 +771,7 @@ class BackupSchedule:
                 "Scheduling requires a private owned RSS_STATE_DIR (0700); fix permissions explicitly."
             )
         existing = self._config()
+        daily = self._evidence(DAILY, schedule=existing)
         captured = self._job.capture(owner, directory)
         self._job.check(captured)
         encoded = self._job.definition(captured, RETRY_SECONDS)
@@ -637,7 +846,7 @@ class BackupSchedule:
             "job": str(self.job),
             "daily_utc": f"{hour:02}:{minute:02}",
             "next_expected_attempt": self._next(
-                config, self._read(DAILY), selected
+                config, self._target_attempt(daily, config, selected)
             ).isoformat(),
         }
 
@@ -650,6 +859,13 @@ class BackupSchedule:
             if os.path.lexists(self.job):
                 raise RuntimeFailure("Backup job is unowned; nothing removed.")
             return {"enabled": False}
+        # A structurally damaged daily ledger remains detectable without the
+        # schedule. Do not discard the only evidence of a cross-record conflict.
+        daily = self._reported_evidence(DAILY, {})
+        if daily and not self._valid_daily(daily, config):
+            raise RuntimeFailure(
+                "Daily evidence conflicts with this backup schedule; preserve both records and inspect locally before disabling."
+            )
         self._removable_definition(config)
         if (
             self._job.loaded(config)
@@ -702,50 +918,59 @@ class BackupSchedule:
             and datetime.fromisoformat(registered_at) <= slot
         )
 
+    @staticmethod
     def _same_registration(
-        self, daily: dict[str, Any] | None, config: dict[str, Any], selected: str | None
+        daily: dict[str, Any] | None, config: dict[str, Any]
     ) -> bool:
-        """Bind daily evidence to one successful registration and selected instance."""
+        """Match the activation ID independently of policy consistency validation."""
         return bool(
             daily
-            and selected is not None
             and config["active"]
-            and config.get("registration_id")
-            and daily.get("registration_id") == config["registration_id"]
-            and daily.get("policy_id") == config["policy_id"]
-            and daily.get("instance") == selected
+            and daily["registration_id"] == config.get("registration_id")
         )
 
-    def _same_target(
-        self,
-        daily: dict[str, Any] | None,
-        config: dict[str, Any],
-        slot: datetime,
-        selected: str | None,
-    ) -> bool:
-        """Apply the current attempt budget only to this registration's elapsed slot."""
-        return bool(
+    @staticmethod
+    def _daily_report(daily: dict[str, Any], instance: str) -> dict[str, Any]:
+        """Render one attempt with the same flat fields as the legacy record."""
+        return {
+            **daily["targets"][instance],
+            "instance": instance,
+            "policy_id": daily["policy_id"],
+            "registration_id": daily["registration_id"],
+        }
+
+    def _target_attempt(
+        self, daily: dict[str, Any] | None, config: dict[str, Any], selected: str | None
+    ) -> dict[str, Any] | None:
+        """Use only progress from the active registration for the selected instance."""
+        if (
             daily
-            and daily.get("slot") == slot.isoformat()
-            and self._same_registration(daily, config, selected)
-        )
+            and self._same_registration(daily, config)
+            and selected in daily["targets"]
+        ):
+            return self._daily_report(daily, selected)
+        return None
 
-    def _next(
-        self, config: dict[str, Any], daily: dict[str, Any] | None, selected: str
-    ) -> datetime:
-        """Describe the earliest daily/retry target (wakeup may lag 15 minutes)."""
+    def _next(self, config: dict[str, Any], attempt: dict[str, Any] | None) -> datetime:
+        """Predict the next slot or retry without reopening any older elapsed slot."""
         slot = self._slot(config)
-        following = slot + timedelta(days=1)
+        if attempt:
+            recorded = datetime.fromisoformat(attempt["slot"])
+            if slot <= recorded:
+                following = recorded + timedelta(days=1)
+                if attempt["outcome"] == "success" or attempt["count"] >= MAX_ATTEMPTS:
+                    return following
+                return min(
+                    following,
+                    datetime.fromisoformat(attempt["attempted_at"])
+                    + timedelta(seconds=RETRY_SECONDS),
+                )
         if not self._eligible(config, slot):
-            return following
-        if self._same_target(daily, config, slot, selected):
-            if daily.get("outcome") == "success" or daily["count"] >= MAX_ATTEMPTS:
-                return following
-            return min(
-                following,
-                datetime.fromisoformat(daily["attempted_at"])
-                + timedelta(seconds=RETRY_SECONDS),
+            activation = datetime.fromisoformat(config["registered_at"])
+            first = activation.replace(
+                hour=config["hour"], minute=config["minute"], second=0, microsecond=0
             )
+            return first if first >= activation else first + timedelta(days=1)
         return slot
 
     def deferred(self) -> None:
@@ -789,7 +1014,7 @@ class BackupSchedule:
         config = self._config()
         if not config or not config["active"]:
             return {"outcome": "disabled"}
-        daily = self._evidence(DAILY)
+        daily = self._evidence(DAILY, schedule=config)
         if not self._job_matches(config) or not self._job.loaded(config):
             raise RuntimeFailure(
                 "Backup job missing, changed or not registered; inspect backup-status and the owned schedule locally."
@@ -822,41 +1047,62 @@ class BackupSchedule:
                 "Backup job settings or captured dependencies changed; nothing started. Inspect rss backup-status."
             ) from None
         slot = self._slot(config)
-        same_target = self._same_target(daily, config, slot, selected)
-        next_attempt = self._next(config, daily, selected)
+        previous = self._target_attempt(daily, config, selected)
+        next_attempt = self._next(config, previous)
         if self.now < next_attempt:
             return {
                 "outcome": "not_due",
                 "next_expected_attempt": next_attempt.isoformat(),
             }
-        daily = {
+        same_slot = previous and datetime.fromisoformat(previous["slot"]) == slot
+        attempt = {
             "slot": slot.isoformat(),
-            "count": daily["count"] + 1 if same_target else 1,
+            "count": previous["count"] + 1 if same_slot else 1,
             "attempted_at": self.now.isoformat(),
             "outcome": "running",
-            "instance": selected,
+        }
+        # A new activation supersedes only validated evidence, and only when
+        # it starts work. Retain one progress entry per target in this registration.
+        daily = {
+            "version": 2,
             "policy_id": config["policy_id"],
             "registration_id": config["registration_id"],
+            "latest_instance": selected,
+            "targets": {
+                **(daily["targets"] if self._same_registration(daily, config) else {}),
+                selected: attempt,
+            },
         }
         self.runtime._save(DAILY, daily)
         try:
             with self._job.environment(config):
                 result = self.backup()
         except Exception:
-            self.runtime._save(DAILY, {**daily, "outcome": "failed"})
+            attempt["outcome"] = "failed"
+            self.runtime._save(DAILY, daily)
             raise RuntimeFailure(
                 "Daily backup failed. Inspect rss backup-status, destination/dependencies and maintenance locally; no private diagnostics are emitted by this command."
             ) from None
-        self.runtime._save(
-            DAILY,
-            {
-                **daily,
-                "outcome": "success",
-                "archive": result["archive"],
-                "sha256": result["sha256"],
-            },
+        attempt.update(
+            outcome="success", archive=result["archive"], sha256=result["sha256"]
         )
+        self.runtime._save(DAILY, daily)
         return {"outcome": "success", "backup": result}
+
+    def _interrupt_daily(self) -> None:
+        """Finalize a recorded daily interruption, leaving damaged evidence untouched."""
+        from rss_aggregator.runtime import RuntimeFailure
+
+        try:
+            daily = self._evidence(DAILY, schedule=self._config())
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # Bad scheduling evidence does not prevent safe hold reconciliation.
+            return
+        if daily:
+            latest = daily["targets"][daily["latest_instance"]]
+            if latest["outcome"] == "running":
+                latest["outcome"] = "interrupted"
+                self.runtime._save(DAILY, daily)
 
     def pending(self) -> bool:
         """Treat any durable maintenance presence, including malformed data, as a hold."""
@@ -882,6 +1128,7 @@ class BackupSchedule:
                 "operation": operation,
                 "phase": "preparing",
                 "started_at": self.now.isoformat(),
+                "hold_id": uuid4().hex,
                 **({"shutdown": shutdown} if shutdown is not None else {}),
             },
         )
@@ -926,6 +1173,11 @@ class BackupSchedule:
             )
         return owner, marker
 
+    @staticmethod
+    def _hold_identity(marker: dict[str, Any]) -> str:
+        """Bind a later stop to the retained hold, including pre-ID legacy holds."""
+        return hashlib.sha256(json.dumps(marker, sort_keys=True).encode()).hexdigest()
+
     def reconcile(self) -> dict[str, Any]:
         """Release the hold only after read-only proof of idle owned writers/forwarding."""
         from rss_aggregator.runtime import RuntimeFailure
@@ -937,9 +1189,21 @@ class BackupSchedule:
                 "action": "No maintenance hold exists.",
             }
         owner, marker = self._owned_maintenance()
-        if marker["operation"] == "stop" and not self._has_intent("stopped"):
+        problems: dict[str, str] = {}
+        ledger = self._reported_evidence(SHUTDOWN, problems)
+        owned_ledger = SHUTDOWN not in problems and (
+            ledger is None or ledger.get("owner") in (None, owner["token"])
+        )
+        pending = self._shutdown_records(ledger) if owned_ledger else []
+        hold = self._hold_identity(marker)
+        requires_stopped = (
+            marker["operation"] == "stop"
+            or not owned_ledger
+            or any(entry.get("supersedes_hold") == hold for entry in pending)
+        )
+        if requires_stopped and not self._has_intent("stopped"):
             raise RuntimeFailure(
-                "Explicit stop maintenance has no durable stopped intent; retry rss stop before rss backup-reconcile."
+                "Cannot exclude an explicit stop request without durable stopped intent; retry rss stop before rss backup-reconcile."
             )
         if not self.runtime._idle() or PrivateAccess(self.runtime).status(owner)[
             "status"
@@ -947,12 +1211,7 @@ class BackupSchedule:
             raise RuntimeFailure(
                 "Interrupted maintenance still has active writers or forwarding. Run rss stop to quiesce owned resources, then retry rss backup-reconcile."
             )
-        problems: dict[str, str] = {}
-        ledger = self._reported_evidence(SHUTDOWN, problems)
-        if SHUTDOWN not in problems and (
-            ledger is None or ledger["owner"] == owner["token"]
-        ):
-            pending = self._shutdown_records(ledger)
+        if owned_ledger:
             interrupted = [
                 {**item, "outcome": "interrupted"}
                 if item["outcome"] == "running"
@@ -986,12 +1245,10 @@ class BackupSchedule:
                 ATTEMPT,
                 {**attempt, "outcome": "interrupted", "resumption": "not_resumed"},
             )
-        daily = self._reported_evidence(DAILY, problems)
-        if daily and daily["outcome"] == "running":
-            self.runtime._save(DAILY, {**daily, "outcome": "interrupted"})
+        self._interrupt_daily()
         self.finish()
         action = "Writers and owned forwarding confirmed idle; hold released without changing intent."
-        if marker["operation"] != "stop":
+        if not requires_stopped:
             action += (
                 " A separately enabled supervisor may honor existing running intent."
             )
@@ -1098,39 +1355,54 @@ class BackupSchedule:
                 "outcome": "interrupted",
                 "action": "Run rss backup-reconcile before retrying; no automatic resumption.",
             }
-        daily = self._reported_evidence(DAILY, evidence_problems)
+        daily = self._reported_evidence(DAILY, evidence_problems, schedule=schedule)
+        latest_daily = (
+            self._daily_report(daily, daily["latest_instance"]) if daily else None
+        )
+        daily_target = (
+            self._target_attempt(daily, schedule, selected) if schedule else None
+        )
         defer = self._reported_evidence(DEFER, evidence_problems)
-        slot = self._slot(schedule) if schedule else None
-        same_target = bool(
-            schedule and slot and self._same_target(daily, schedule, slot, selected)
+        slot = (
+            self._slot(schedule)
+            if schedule and DAILY not in evidence_problems
+            else None
+        )
+        recorded_slot = (
+            datetime.fromisoformat(daily_target["slot"]) if daily_target else None
+        )
+        unattempted = slot is not None and (
+            recorded_slot is None or recorded_slot < slot
         )
         daily_due = bool(
             slot
             and self._eligible(schedule, slot)
-            and not (same_target and daily.get("outcome") == "success")
+            and (
+                unattempted
+                or (recorded_slot == slot and daily_target["outcome"] != "success")
+            )
         )
         missed = bool(
             daily_due
+            and unattempted
             and self.now > slot + timedelta(seconds=RETRY_SECONDS)
-            and not same_target
         )
         daily_archive = (
-            Path(daily["archive"])
-            if schedule
-            and self._same_registration(daily, schedule, selected)
-            and daily.get("outcome") == "success"
-            and daily.get("archive")
-            and daily.get("sha256")
+            Path(daily_target["archive"])
+            if daily_target and daily_target["outcome"] == "success"
             else None
         )
         daily_archive_available = self._archive_available(
-            daily_archive, "daily_attempt", archive_problems, follow_symlinks=False
+            daily_archive,
+            "daily_attempt" if daily_target == latest_daily else "daily_target_attempt",
+            archive_problems,
+            follow_symlinks=False,
         )
         daily_fresh = bool(
             daily_archive_available
             and 0
             <= (
-                self.now - datetime.fromisoformat(daily["attempted_at"])
+                self.now - datetime.fromisoformat(daily_target["attempted_at"])
             ).total_seconds()
             <= 26 * 3600
         )
@@ -1153,10 +1425,13 @@ class BackupSchedule:
             "registration_id": schedule.get("registration_id") if schedule else None,
             "busy": busy,
             "scheduler_problem": problem,
-            "next_expected_attempt": self._next(schedule, daily, selected).isoformat()
-            if schedule and selected is not None and schedule.get("registration_id")
+            "next_expected_attempt": self._next(schedule, daily_target).isoformat()
+            if slot is not None
+            and selected is not None
+            and schedule.get("registration_id")
             else None,
-            "daily_attempt": daily,
+            "daily_attempt": latest_daily,
+            "daily_target_attempt": daily_target,
             "daily_archive_available": daily_archive_available,
             "daily_due": daily_due,
             "missed": missed,
@@ -1190,6 +1465,5 @@ class BackupSchedule:
                 and not maintenance
                 and attempt
                 and attempt["outcome"] == "success"
-                and attempt.get("instance") == selected
             ),
         }

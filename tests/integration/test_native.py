@@ -3,15 +3,17 @@
 import json
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
 import time
+from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Event, Thread
 from urllib.parse import urlencode
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
 import pytest
 
@@ -19,6 +21,15 @@ pytestmark = pytest.mark.live
 ROOT = Path(__file__).resolve().parents[2]
 FEED_TTL = 1  # Seconds; used by both FreshRSS and the synthetic publisher's cache.
 FETCH_PERIOD = 20 * 60  # Seconds between UTC scheduler slots.
+FIXTURE_USER = "synthetic"
+WEB_PASSWORD = "fixture-web-only"
+API_PASSWORD = "fixture-api-only"
+WEB_FORM_CHALLENGE = (
+    "$v = json_decode(stream_get_contents(STDIN), true, flags: JSON_THROW_ON_ERROR);"
+    '$hash = crypt($v["password"], $v["salt1"]);'
+    "if (strlen($hash) !== 60) { exit(1); }"
+    'echo password_hash($hash . $v["nonce"], PASSWORD_BCRYPT, ["cost" => 4]);'
+)
 OBSERVE_STARTUP_GATE = """
 from rss_aggregator import native_service
 from rss_aggregator.cli import main
@@ -135,11 +146,11 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
 
     def api(state):
         result = invoke(
-            state, "api-check", "--loopback", data="synthetic\nfixture-api-only\n"
+            state, "api-check", "--loopback", data=f"{FIXTURE_USER}\n{API_PASSWORD}\n"
         )
         assert result["transport"] == "loopback"
         assert result["https_verified"] is False
-        assert "fixture-api-only" not in json.dumps(result)
+        assert API_PASSWORD not in json.dumps(result)
 
     def reader(path, *, token=None, form=None):
         headers = {"Authorization": f"GoogleLogin auth={token}"} if token else {}
@@ -151,16 +162,59 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
             return response.read()
 
-    def login():
+    def api_login():
         answer = reader(
             "accounts/ClientLogin",
-            form={"Email": "synthetic", "Passwd": "fixture-api-only"},
+            form={"Email": FIXTURE_USER, "Passwd": API_PASSWORD},
         )
         return next(
             line.removeprefix("Auth=")
             for line in answer.decode().splitlines()
             if line.startswith("Auth=")
         )
+
+    def assert_restored_web_login(state):
+        browser = build_opener(ProxyHandler({}), HTTPCookieProcessor(CookieJar()))
+
+        def web(path, fields=None):
+            data = urlencode(fields).encode() if fields is not None else None
+            with browser.open(
+                f"http://127.0.0.1:{port}{path}", data, timeout=5
+            ) as reply:
+                return reply.read().decode()
+
+        login_form = web("/i/")
+        assert 'id="passwordPlain"' in login_form
+        csrf = re.search(r'name="_csrf"\s+value="([0-9a-f]+)"', login_form)
+        assert csrf, "FreshRSS web login did not provide a CSRF token"
+        nonce = json.loads(web(f"/i/?c=javascript&a=nonce&user={FIXTURE_USER}"))
+        # Implement the pinned browser's double-bcrypt challenge without browser
+        # dependencies or reading the restored password hash from disk.
+        challenge = subprocess.run(
+            [
+                str(state / "runtime/frankenphp"),
+                "php-cli",
+                "-n",
+                "-r",
+                WEB_FORM_CHALLENGE,
+            ],
+            input=json.dumps({**nonce, "password": WEB_PASSWORD}),
+            capture_output=True,
+            text=True,
+            env=base,
+            timeout=30,
+            check=False,
+        )
+        assert challenge.returncode == 0, (
+            "Could not compute the synthetic web challenge"
+        )
+        web(
+            "/i/?c=auth&a=login",
+            {"username": FIXTURE_USER, "challenge": challenge.stdout, "_csrf": csrf[1]},
+        )
+        subscriptions = web("/i/?c=subscription&a=index")
+        assert 'id="passwordPlain"' not in subscriptions
+        assert "Synthetic publisher" in subscriptions
 
     def assert_fixture_subscription(auth):
         result = json.loads(
@@ -207,7 +261,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             first,
             "cli/do-install.php",
             "--default-user",
-            "synthetic",
+            FIXTURE_USER,
             "--db-type",
             "sqlite",
             "--base-url",
@@ -220,11 +274,11 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             first,
             "cli/create-user.php",
             "--user",
-            "synthetic",
+            FIXTURE_USER,
             "--password",
-            "fixture-web-only",
+            WEB_PASSWORD,
             "--api-password",
-            "fixture-api-only",
+            API_PASSWORD,
             "--feed-ttl-default",
             str(FEED_TTL),
         )
@@ -240,7 +294,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert serving["fetch"]["status"] == "completed"
         assert invoke(first, "start")["fetch"]["status"] == "already_running"
         api(first)
-        auth = login()
+        auth = api_login()
         assert_fixture_subscription(auth)
         assert items(auth).keys() == {"Fixture 1", "Fixture 2"}
 
@@ -300,6 +354,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         )
         assert invoke(first, "status")["application"] == "stopped"
         first.rename(tmp_path / "source-not-at-expected-path")
+        assert not first.exists()
         invoke(second, "setup")
         target = invoke(
             second, "restore", capture["archive"], "--instance", "recovered"
@@ -315,8 +370,9 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         ).returncode
         assert invoke(second, "select-instance", "recovered")["instance"] == "recovered"
         assert invoke(second, "start")["instance"] == "recovered"
+        assert_restored_web_login(second)
         api(second)
-        restored_auth = login()
+        restored_auth = api_login()
         assert_fixture_subscription(restored_auth)
         restored = items(restored_auth)
         for n in (1, 2, 3):
