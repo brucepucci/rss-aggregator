@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from rss_aggregator.serve_config import ServeConfigClient
+from rss_aggregator.serve_config import TAILSCALE_CLI_TIMEOUT, ServeConfigClient
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -41,6 +41,7 @@ class PrivateAccess:
         self.rejected = ServeConfigRejected
         self.path = runtime.state_dir / SERVE_RECORD
         self._serve_config: ServeConfigClient | None = None
+        self._publication: tuple[dict[str, Any], dict[str, Any], str] | None = None
 
     def _config_client(self) -> ServeConfigClient:
         """Reuse one discovered local daemon transport for conditional configuration."""
@@ -59,7 +60,13 @@ class PrivateAccess:
 
     def _query(self, *args: str) -> dict[str, Any]:
         """Read JSON without disclosing private Tailscale output in errors."""
-        result = self.runtime._run("tailscale", *args, check=False)
+        result = self.runtime._run(
+            "tailscale",
+            *args,
+            check=False,
+            inherit_lock=False,
+            timeout=TAILSCALE_CLI_TIMEOUT,
+        )
         if result.returncode:
             raise self.failure(
                 "Tailscale query failed; check the installed CLI, connection and local permissions."
@@ -127,10 +134,12 @@ class PrivateAccess:
             )
         return "https://" + host
 
-    def check_backend(self, port: int) -> None:
-        """Refuse known public forwarding without requiring or modifying Serve ownership."""
+    def check_backend(self, port: int, *, owner: dict[str, Any] | None = None) -> None:
+        """Refuse public forwarding and, when publishing, require the exact route."""
         config, _etag = self._config_client().read()
         self._check_public_backend(config, port)
+        if owner is not None and not self._validate(config, self._record(owner)):
+            raise self.failure("Project Serve forwarding changed during startup.")
 
     def _check_public_backend(self, config: dict[str, Any], port: int) -> None:
         """Refuse any enabled Funnel reaching this backend, regardless of port.
@@ -271,32 +280,55 @@ class PrivateAccess:
         config, etag = self._config_client().read()
         active = self._validate(config, record)
         if active:
-            replacement = copy.deepcopy(config)
-            replacement["TCP"].pop("443")
-            replacement["Web"].pop(record["host"] + ":443")
-            # False Funnel entries confer no access, but should not remain as a
-            # stale reference to a removed listener. Preserve all other ports.
-            replacement.get("AllowFunnel", {}).pop(record["host"] + ":443", None)
-            # Persist relinquished authority BEFORE the remote request: a local
-            # write failure must not leave stale authority after successful removal.
-            self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
-            try:
-                self._config_client().write(replacement, etag)
-            except self.rejected:
-                # Known rejection made no change; restore only prior local intent.
-                self.runtime._save(SERVE_RECORD, record)
-                raise
-            # An unknown removal outcome stays inactive for local inspection,
-            # never automatic adoption/deletion of a possibly recreated listener.
-            after, _etag = self._config_client().read()
-            if self._validate(after, record):
-                raise self.failure(
-                    "Project Serve forwarding did not stop; inspect it locally."
-                )
-            self._preserved(config, after)
+            self._withdraw(record, config, etag)
         else:
             self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
         return active
+
+    def _withdraw(
+        self, record: dict[str, Any], config: dict[str, Any], etag: str
+    ) -> None:
+        """Withdraw only the exact route in the supplied validated snapshot."""
+        replacement = copy.deepcopy(config)
+        replacement["TCP"].pop("443")
+        replacement["Web"].pop(record["host"] + ":443")
+        # False Funnel entries confer no access, but should not remain as a
+        # stale reference to a removed listener. Preserve all other ports.
+        replacement.get("AllowFunnel", {}).pop(record["host"] + ":443", None)
+        # Persist relinquished authority BEFORE the remote request: a local
+        # write failure must not leave stale authority after successful removal.
+        self.runtime._save(SERVE_RECORD, {**record, "phase": "inactive"})
+        try:
+            self._config_client().write(replacement, etag)
+        except self.rejected:
+            # Known rejection made no change; restore only prior local intent.
+            self.runtime._save(SERVE_RECORD, record)
+            raise
+        # An unknown removal outcome stays inactive for local inspection,
+        # never automatic adoption/deletion of a possibly recreated listener.
+        after, _etag = self._config_client().read()
+        if self._validate(after, record):
+            raise self.failure(
+                "Project Serve forwarding did not stop; inspect it locally."
+            )
+        self._preserved(config, after)
+
+    def rollback_start(self) -> None:
+        """Undo only a proved publication, conditional on its readback snapshot."""
+        if self._publication is None:
+            return
+        record, config, etag = self._publication
+        self._publication = None
+        current = self._record({"token": record["owner"]})
+        if (
+            not current
+            or current.get("phase") not in ("pending", "active")
+            or current != {**record, "phase": current["phase"]}
+        ):
+            raise self.failure(
+                "Startup forwarding ownership changed; no rollback sent."
+            )
+        self._withdraw(current, config, etag)
 
     def _preserved(self, before: dict[str, Any], after: dict[str, Any]) -> None:
         """Verify configuration outside the reserved listener was not altered."""
@@ -403,10 +435,12 @@ class PrivateAccess:
 
     def start(self, owner: dict[str, Any], port: int, origin: str) -> dict[str, Any]:
         """Publish the security-verified application with a durable ownership intent."""
-        self.prepare(owner, port)
+        self._publication = None
+        if self.prepare(owner, port) != origin:
+            raise self.failure("The Tailscale HTTPS origin changed during startup.")
         before, etag = self._config_client().read()
         previous = self._record(owner)
-        self._validate(before, previous)
+        already_active = self._validate(before, previous)
         self._check_public_backend(before, port)
         record = {
             "owner": owner["token"],
@@ -439,11 +473,13 @@ class PrivateAccess:
                         "retrying; no remote rollback was attempted."
                     ) from None
             raise
-        after, _etag = self._config_client().read()
+        after, published_etag = self._config_client().read()
         if not self._validate(after, record):
             raise self.failure(
                 "Project Serve route is missing; check certificate authorization locally."
             )
         self._preserved(before, after)
+        if not already_active:
+            self._publication = (record, after, published_etag)
         self.runtime._save(SERVE_RECORD, {**record, "phase": "active"})
         return {"status": "running", "url": origin}

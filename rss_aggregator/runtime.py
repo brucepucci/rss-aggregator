@@ -18,7 +18,12 @@ from typing import Any, Literal
 from rss_aggregator import native_service as service
 from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
-from rss_aggregator.recovery import SHUTDOWN_SUCCESS, Recovery, selected_instance
+from rss_aggregator.recovery import (
+    SHUTDOWN_SUCCESS,
+    Recovery,
+    same_data_identity,
+    selected_instance,
+)
 from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
@@ -100,6 +105,7 @@ class Runtime:
         """Execute one public operation with nonblocking serialization and durable intent."""
         from rss_aggregator.native_install import NativeInstall
 
+        install = NativeInstall(self)
         recovery = Recovery(self)
         backups = BackupSchedule(self, now)
         supervision = Supervision(self)
@@ -110,7 +116,7 @@ class Runtime:
         if operation == "select-instance" and instance is None:
             raise RuntimeFailure("Select-instance requires an explicit target.")
         handlers = {
-            "setup": NativeInstall(self).install,
+            "setup": install.install,
             "uninstall": lambda: self._runtime_change("uninstall", confirm),
             "upgrade": lambda: self._runtime_change("upgrade", confirm),
             "backup": backups.backup,
@@ -138,6 +144,8 @@ class Runtime:
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
         self._state_guard()
+        if operation == "setup":
+            install.preflight_setup()
         with service.lease(self.state_dir / "command.lock") as lock:
             if lock is None:
                 if operation == "backup-status":
@@ -149,8 +157,6 @@ class Runtime:
                 )
             self._command_lock_fd = lock
             try:
-                if operation == "stop":
-                    supervision.set_intent("stopped")
                 if backups.pending() and operation not in (
                     "status",
                     "stop",
@@ -225,8 +231,9 @@ class Runtime:
         check: bool = True,
         input: str | None = None,
         inherit_lock: bool = True,
+        timeout: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run external host tooling without echoing its potentially private output."""
+        """Run host tooling, opting read-only Tailscale helpers out of command locking."""
         try:
             result = subprocess.run(
                 args,
@@ -234,10 +241,16 @@ class Runtime:
                 capture_output=True,
                 input=input,
                 check=False,
+                timeout=timeout,
                 pass_fds=(self._command_lock_fd,)
                 if inherit_lock and self._command_lock_fd is not None
                 else (),
             )
+        except subprocess.TimeoutExpired:
+            # subprocess.run kills and reaps its direct child on timeout.
+            raise RuntimeFailure(
+                f"{Path(args[0]).name} timed out; inspect locally."
+            ) from None
         except OSError as error:
             raise RuntimeFailure(
                 f"Unable to run {Path(args[0]).name}; check the selected executable."
@@ -334,10 +347,28 @@ class Runtime:
         """Close writers even on withdrawal failure; report actual owned withdrawal."""
         if owner is None:
             owner, _ = self._ownership_receipt()
+        forwarding_error = None
         try:
-            return PrivateAccess(self).stop(owner)
+            try:
+                withdrawn = PrivateAccess(self).stop(owner)
+            except Exception as error:
+                forwarding_error = error
         finally:
-            self._stop_writers()
+            try:
+                self._stop_writers()
+            except Exception as writer_error:
+                if forwarding_error is not None:
+                    raise RuntimeFailure(
+                        f"Private forwarding shutdown is unconfirmed: {forwarding_error} "
+                        f"Writer shutdown also failed: {writer_error}"
+                    ) from None
+                raise
+        if forwarding_error is not None:
+            raise RuntimeFailure(
+                f"Private forwarding shutdown is unconfirmed: {forwarding_error} "
+                "Owned writer shutdown confirmed; inspect forwarding locally."
+            ) from None
+        return withdrawn
 
     def _service_home(self, *, create: bool = False) -> Path:
         """Locate owned private configuration without following a directory link."""
@@ -481,8 +512,10 @@ class Runtime:
                     f"Loopback port {port} is occupied; no foreign listener was stopped."
                 ) from None
 
-    def _launch(self, port: int, origin: str, private: bool) -> dict[str, Any]:
-        """Spawn a detached lease-holding worker and require generation readiness."""
+    def _launch(
+        self, port: int, origin: str, private: bool, *, check_private_backend: bool
+    ) -> dict[str, Any]:
+        """Spawn a detached lease-holding worker and record its forwarding guard."""
         self._check_port(port)
         nonce = uuid.uuid4().hex
         plan = {
@@ -492,6 +525,7 @@ class Runtime:
             "port": port,
             "url": origin,
             "private": private,
+            "check_private_backend": private or check_private_backend,
             "runtime": self._identity(),
         }
         with (
@@ -585,6 +619,54 @@ class Runtime:
         )
         return code == 200 and reply == plan["nonce"].encode()
 
+    def _generation_receipt(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Find the same live generation and its running scheduler, not a stale receipt."""
+        current, receipt = self._live() or ({}, {})
+        if (
+            current.get("nonce") == plan["nonce"]
+            and receipt.get("scheduler") == "running"
+        ):
+            return receipt
+        return None
+
+    def _acknowledged(self, plan: dict[str, Any]) -> bool:
+        """Check the controller's generation-specific ordinary HTTP gate marker."""
+        nonce = plan["nonce"]
+        return service.read(
+            service.acknowledgement_path(self.state_dir / "service", nonce)
+        ) == {"nonce": nonce}
+
+    def _ordinary_ready(self, plan: dict[str, Any]) -> bool:
+        """Check ordinary HTTP and bind the observation to the expected listener."""
+        return (
+            self._ready(plan)
+            and service.web_check(plan["port"], "/i/")[0] in (200, 302, 303)
+            and self._ready(plan)
+        )
+
+    def _approve(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """Require controller acknowledgement and ordinary HTTP from this generation."""
+        nonce = plan["nonce"]
+        request = service.approval_path(self.state_dir / "service", nonce)
+        if self._generation_receipt(plan) is not None:
+            try:
+                service.save(request, {"nonce": nonce})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if self._generation_receipt(plan) is None:
+                        break
+                    if self._acknowledged(plan) and self._ordinary_ready(plan):
+                        receipt = self._generation_receipt(plan)
+                        if receipt is not None and self._acknowledged(plan):
+                            return receipt
+                        break
+                    time.sleep(0.1)
+            finally:
+                request.unlink(missing_ok=True)
+        raise RuntimeFailure(
+            "The native generation did not confirm startup approval and ordinary loopback HTTP readiness."
+        )
+
     def _retained_security(self, plan: dict[str, Any]) -> dict[str, Any] | None:
         """Attest fresh settings for retention or request a guarded restart instead."""
         try:
@@ -618,6 +700,13 @@ class Runtime:
         access = PrivateAccess(self)
         private = access.enabled() if private_https is None else private_https
         live = self._live()
+        # A live plan's obligation belongs to its backend, not to Serve authority.
+        if live and live[0].get("port") == port:
+            check_private_backend = (
+                check_private_backend
+                or live[0].get("private") is True
+                or live[0].get("check_private_backend") is True
+            )
         try:
             if private:
                 origin = access.prepare(owner, port)
@@ -649,6 +738,10 @@ class Runtime:
                 and plan["port"] == port
                 and plan["url"] == origin
                 and plan["private"] == private
+                and (
+                    not check_private_backend
+                    or plan.get("check_private_backend") is True
+                )
                 and plan["instance"] == self.instance
                 and plan.get("startup_gate") is True
                 and receipt.get("scheduler") == "running"
@@ -659,9 +752,15 @@ class Runtime:
                 )
             ):
                 security = self._retained_security(plan)
-                if security is not None:
+                if (
+                    security is not None
+                    and self._acknowledged(plan)
+                    and self._ordinary_ready(plan)
+                    and (receipt := self._generation_receipt(plan)) is not None
+                ):
                     return {
                         **status,
+                        "scheduler": self._scheduler(receipt),
                         "security": security,
                         "fetch": {"status": "already_running"},
                     }
@@ -688,30 +787,34 @@ class Runtime:
                     )
             elif check_private_backend:
                 access.check_backend(port)
-            plan = self._launch(port, origin, private)
+            plan = self._launch(
+                port, origin, private, check_private_backend=check_private_backend
+            )
             security = self._check_web(plan, installed, starting=True)
-            current, receipt = self._live() or ({}, {})
-            if (
-                current.get("nonce") != plan["nonce"]
-                or receipt.get("scheduler") != "running"
-            ):
+            if self._generation_receipt(plan) is None:
                 raise RuntimeFailure(
                     "Native feed scheduling did not pass the startup gate."
                 )
             self._save("security.json", {"nonce": plan["nonce"], "effective": security})
             forwarding = access.start(owner, port, origin) if private else None
             if private or check_private_backend:
-                access.check_backend(port)
-            service.save(
-                service.approval_path(self.state_dir / "service", plan["nonce"]),
-                {"nonce": plan["nonce"]},
-            )
-        except Exception:
+                access.check_backend(port, owner=owner if private else None)
+            receipt = self._approve(plan)
+        except Exception as error:
+            problems = []
             try:
                 self._stop_writers()
             except Exception:
+                problems.append("stopping native writers could not be confirmed")
+            try:
+                access.rollback_start()
+            except Exception:
+                problems.append(
+                    "withdrawal of startup forwarding could not be confirmed"
+                )
+            if problems:
                 raise RuntimeFailure(
-                    "Startup failed and stopping native writers could not be confirmed; inspect potential remaining access. No foreign routes were changed."
+                    f"{error} Startup cleanup: {'; '.join(problems)}. Inspect potential remaining access locally."
                 ) from None
             raise
         return {
@@ -751,8 +854,8 @@ class Runtime:
             and isinstance(security, dict)
             and security.get("nonce") == plan["nonce"]
             and plan.get("runtime") == self._identity()
-            and self._ready(plan)
-            and service.web_check(plan["port"], "/i/")[0] in (200, 302, 303)
+            and (plan.get("startup_gate") is not True or self._acknowledged(plan))
+            and self._ordinary_ready(plan)
         )
         return {
             "runtime": "installed",
@@ -792,6 +895,7 @@ class Runtime:
                 private_https=live[0]["private"],
                 port_override=live[0]["port"],
                 recheck=True,
+                check_private_backend=live[0].get("check_private_backend", False),
             ),
             "verified": True,
         }
@@ -877,10 +981,7 @@ class Runtime:
         from rss_aggregator.archives import validate_archive
 
         current = self._identity()
-        if any(
-            installed[key] != current[key]
-            for key in ("freshrss_version", "freshrss_sha256", "platform")
-        ):
+        if not same_data_identity(installed, current):
             raise RuntimeFailure(
                 "Only PHP/web runtime upgrades of the same FreshRSS release are supported. Preserve data and plan FreshRSS upgrades separately."
             )

@@ -1,5 +1,6 @@
 """Exercise native installation through the public CLI with isolated downloads."""
 
+import fcntl
 import hashlib
 import io
 import json
@@ -10,7 +11,9 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -45,6 +48,7 @@ def test_setup_rejects_wrong_download_before_publishing_runtime(tmp_path, monkey
 ROOT = Path(__file__).resolve().parents[1]
 CLI_IN_CHECKOUT = """
 import json
+import os
 import platform
 import sys
 import urllib.request
@@ -59,6 +63,9 @@ def download(url, **kwargs):
     manifest = json.loads(Path('config/native.json').read_text())
     for key in ('freshrss', 'runtime'):
         if url == manifest[key]['url']:
+            late_entry = os.environ.get('SYNTHETIC_LATE_SETUP_ENTRY')
+            if key == 'freshrss' and late_entry:
+                (Path(os.environ['RSS_STATE_DIR']) / late_entry).mkdir(mode=0o700)
             return Path(key + '.download').open('rb')
     raise AssertionError('unexpected download URL')
 
@@ -93,6 +100,7 @@ class Checkout:
             "RSS_TAILSCALE": "0",
         }
         self.environment.pop("PYTHONPATH", None)
+        self.environment.pop("SYNTHETIC_LATE_SETUP_ENTRY", None)
         # Use an unmodified CLI in a disposable checkout with its own reviewed pins.
         shutil.copytree(
             ROOT / "rss_aggregator",
@@ -213,6 +221,79 @@ def test_setup_publishes_private_pinned_runtime_idempotently(checkout):
     assert json.loads(again.stdout)["token"] == owner["token"]
 
 
+def test_parent_setup_refusal_preserves_child_shutdown(checkout):
+    parent = checkout.state
+    parent.mkdir(mode=0o700)
+    checkout.state = parent / "production"
+    checkout.environment["RSS_STATE_DIR"] = str(checkout.state)
+    installed = checkout.run("setup")
+    assert installed.returncode == 0, installed.stderr
+
+    # Control only the writer process: the CLI must observe its real filesystem
+    # leases and request its shutdown for this generation.
+    for name, record in {
+        "service.json": {
+            "nonce": "synthetic",
+            "port": 18080,
+            "url": "http://127.0.0.1:18080",
+        },
+        "service-status.json": {"nonce": "synthetic", "web": "started"},
+    }.items():
+        path = checkout.state / name
+        path.write_text(json.dumps(record))
+        path.chmod(0o600)
+    with (
+        ThreadPoolExecutor() as executor,
+        (checkout.state / "writers.lock").open("a") as writer,
+        (checkout.state / "controller.lock").open("a") as controller,
+    ):
+        os.fchmod(writer.fileno(), 0o600)
+        os.fchmod(controller.fileno(), 0o600)
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(controller, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status = checkout.run("status")
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["application"] == "running"
+
+        checkout.environment["RSS_STATE_DIR"] = str(parent)
+        rejected = checkout.run("setup")
+        assert rejected.returncode == 1, (rejected.stdout, rejected.stderr)
+        assert "Unowned RSS_STATE_DIR is not empty" in rejected.stderr
+        assert rejected.stdout == ""
+        assert set(parent.iterdir()) == {checkout.state}
+
+        checkout.environment["RSS_STATE_DIR"] = str(checkout.state)
+        shutdown = executor.submit(checkout.run, "stop")
+        request = checkout.state / "stop-service.json"
+        deadline = time.monotonic() + 10
+        while (
+            not request.exists() and not shutdown.done() and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert request.exists(), "Stop must request shutdown of the active writer."
+        assert json.loads(request.read_text()) == {"nonce": "synthetic"}
+    stopped = shutdown.result()
+    assert stopped.returncode == 0, stopped.stderr
+    result = json.loads(stopped.stdout)
+    assert result["application"] == "stopped"
+    assert result["already_stopped"] is False
+
+
+def test_setup_refuses_new_state_entries_before_claiming_the_root(checkout):
+    entry = checkout.state / ".native-install-unrecognized"
+    checkout.environment["SYNTHETIC_LATE_SETUP_ENTRY"] = entry.name
+
+    result = checkout.run("setup")
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "Unowned RSS_STATE_DIR is not empty" in result.stderr
+    assert result.stdout == ""
+    assert entry.is_dir()
+    assert not (checkout.state / "native-owner.json").exists()
+    assert not (checkout.state / "runtime").exists()
+    assert list(checkout.state.glob(".native-install-*")) == [entry]
+
+
 @pytest.mark.parametrize(
     "entry",
     [
@@ -250,6 +331,11 @@ def test_setup_refuses_pinned_bytes_reporting_another_version(checkout, wrong_as
     assert result.stdout == ""
     assert not checkout.source.exists()
     assert not checkout.binary.exists()
+
+    checkout.prepare_source()
+    checkout.prepare_runtime()
+    retried = checkout.run("setup")
+    assert retried.returncode == 0, retried.stderr
 
 
 @pytest.mark.parametrize("drift", ["source", "executable", "symlink", "extra-file"])

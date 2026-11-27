@@ -82,22 +82,30 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   running backend after a snapshot, including a failed snapshot when safe. It
   only republishes forwarding that it confirmed withdrawing; if the route already
   disappeared, it can resume on loopback only after rechecking that no Funnel
-  reaches the port of the previously private service. If safety cannot be
-  confirmed, writers stay stopped and the foreign route is preserved. It never
-  resumes intentional stop.
-  A preflight refusal can leave existing serving state untouched. A resumption
+  reaches the port of the previously private service. Subsequent automatic
+  backup resumptions retain this read-only check, not authority to publish.
+  If safety cannot be confirmed, writers stay stopped and the foreign route is
+  preserved. Backup never resumes intentional stop. A preflight refusal can
+  leave existing serving state untouched. A resumption
   failure can leave a verified archive with the app stopped; check both results
   before retrying.
 - Normal `stop` sets stopped intent and tries to persist shutdown evidence before
   quiescence, but attempts to close owned resources even if the write or route
-  withdrawal fails. It reads selection and capture records only after quiescing
-  and verifies a complete archive when selected data exist. An archive failure
-  **after** quiescing leaves writers stopped; a failed or interrupted quiescence
-  is not proof that writers or forwarding stopped. Inspect `unresolved_shutdown`
-  and `evidence_problems` in `backup-status`, correct the cause, and retry `stop`
-  for a verified archive. A daily or manual archive and hold release do not clear
-  an unresolved shutdown. For selection loss see [operations](operations.md#common-troubleshooting).
-  Preserve unreadable records and prior archives for local inspection.
+  withdrawal fails. Forwarding discovery is bounded; discovery failure leaves
+  forwarding unconfirmed, not permission to alter foreign rules. If stopped
+  intent could not be saved, running intent may still be in force. Fix the write
+  failure and retry `stop` before reconciling.
+  Selection does not gate quiescence; capture runs afterward and verifies a
+  complete archive when selected data exist. An archive failure **after**
+  quiescing leaves writers stopped; a failed or interrupted quiescence is not
+  proof that writers or forwarding stopped. Inspect `unresolved_shutdowns` and
+  `evidence_problems` in `backup-status`, correct the cause, and retry `stop` for
+  a verified archive of the affected instance. A shutdown backup of another
+  instance, a daily or manual archive, or hold release does not clear it. If the
+  affected instance is unidentified, preserve the evidence for local inspection;
+  an unrelated capture cannot automatically resolve it. For selection loss see
+  [operations](operations.md#common-troubleshooting). Preserve unreadable records
+  and prior archives.
 - After failure inspect `status`, `backup-status`, stderr and private records.
   Never discard a good archive, promote `.rss-export-*`/`.rss-backup-*` remnants,
   or remove locks or maintenance records to force a retry. Hidden remnants may
@@ -179,7 +187,9 @@ or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
 and protection is false. Evidence records are read independently: for example, an
 unreadable attempt appears as `latest_attempt: null` with its record named in
 `evidence_problems`; a separately readable verified archive remains visible.
-Do not hand-edit records to restore a green check. Daily protection needs successful eligible daily work for
+If the archive destination becomes inaccessible, status still reports the
+readable evidence and an `archive_problems` diagnostic; an uninspectable archive
+cannot count as available. Do not hand-edit records to restore a green check. Daily protection needs successful eligible daily work for
 the current registration and selected instance, availability of **that scheduled
 archive**, and no unresolved failure, shutdown, or hold. `archive_available` and `latest_success`
 can instead describe a newer manual or shutdown archive; neither can mask a

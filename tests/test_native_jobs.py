@@ -144,13 +144,21 @@ def _ledger(checkout, name, value):
 
 
 @contextmanager
-def _owned_writer(checkout):
+def _owned_writer(checkout, *, instance=None):
     nonce = "synthetic-writer"
+    selection = checkout.state / "selected-instance.json"
+    if instance is None:
+        instance = (
+            json.loads(selection.read_text())["instance"]
+            if selection.exists()
+            else "default"
+        )
     _ledger(
         checkout,
         "service.json",
         {
             "nonce": nonce,
+            "instance": instance,
             "url": "http://127.0.0.1:8080",
             "port": 8080,
             "private": False,
@@ -469,6 +477,148 @@ def test_failed_shutdown_stays_unprotected_until_verified_retry(jobs, fault):
     assert report["protected"] is True
 
 
+@pytest.mark.parametrize("advance_first_generation", [False, True])
+def test_only_the_affected_instance_shutdown_resolves_failed_capture(
+    jobs, advance_first_generation
+):
+    _restore_fixture(jobs, "first", "second")
+    _success(jobs, "select-instance", "first")
+    _refused(jobs, "start")  # The disposable PHP stub refuses application work.
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    initial = _success(jobs, "backup-status", "--check")
+    generation = initial["latest_success"]["writer_generation"]
+    assert generation is not None
+
+    destination = jobs.environment.pop("RSS_BACKUP_DIR")
+    _refused(jobs, "stop")
+    _success(jobs, "select-instance", "second")
+    _refused(jobs, "stop")
+    both = _success(jobs, "backup-status")
+    jobs.environment["RSS_BACKUP_DIR"] = destination
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    _success(jobs, "select-instance", "first")
+    if advance_first_generation:
+        _refused(jobs, "start")
+    manual = _success(jobs, "backup")
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["latest_success"]["archive"] == manual["archive"]
+    captured_generation = report["latest_success"]["writer_generation"]
+    assert captured_generation is not None
+    assert (captured_generation != generation) is advance_first_generation
+    assert report["unresolved_shutdown"]["instance"] == "first"
+    assert report["unresolved_shutdown"]["writer_generation"] == generation
+    assert [r["instance"] for r in report["unresolved_shutdowns"]] == ["first"]
+    assert {r["instance"] for r in both["unresolved_shutdowns"]} == {"first", "second"}
+
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    healthy = _success(jobs, "backup-status", "--check")
+    assert healthy["unresolved_shutdown"] is None
+    assert healthy["unresolved_shutdowns"] == []
+
+
+def test_reconcile_retains_other_shutdowns_when_stop_ledger_write_fails(jobs):
+    _restore_fixture(jobs, "first", "second")
+    _success(jobs, "select-instance", "first")
+    destination = jobs.environment.pop("RSS_BACKUP_DIR")
+    _refused(jobs, "stop")
+    jobs.environment["RSS_BACKUP_DIR"] = destination
+    _success(jobs, "select-instance", "second")
+    jobs.environment["SYNTHETIC_REPLACE_FAILURE"] = "backup-shutdown.json"
+    with _owned_writer(jobs):
+        _refused(jobs, "stop")
+    del jobs.environment["SYNTHETIC_REPLACE_FAILURE"]
+
+    assert _success(jobs, "backup-reconcile")["resumed"] is False
+    report = _success(jobs, "backup-status")
+    assert [
+        (item["instance"], item["outcome"]) for item in report["unresolved_shutdowns"]
+    ] == [
+        ("second", "interrupted"),
+        ("first", "failed"),
+    ]
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    remaining = _success(jobs, "backup-status")["unresolved_shutdowns"]
+    assert [item["instance"] for item in remaining] == ["first"]
+
+
+def test_shutdown_cannot_clear_a_known_generation_if_identity_was_lost(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _refused(jobs, "start")  # The disposable PHP stub refuses application work.
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    healthy = _success(jobs, "backup-status", "--check")
+    generation = healthy["latest_success"]["writer_generation"]
+    assert generation is not None
+    destination = jobs.environment.pop("RSS_BACKUP_DIR")
+    _refused(jobs, "stop")
+    jobs.environment["RSS_BACKUP_DIR"] = destination
+    (jobs.state / "instances/reader/writer-generation.json").unlink()
+
+    assert "shutdown identity could not be confirmed" in _refused(jobs, "stop")
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["latest_success"]["via"] == "stop"
+    assert report["unresolved_shutdown"]["writer_generation"] == generation
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_unidentified_shutdown_is_not_cleared_by_a_verified_capture(jobs, historical):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    if historical:
+        owner = json.loads((jobs.state / "native-owner.json").read_text())
+        _ledger(
+            jobs,
+            "backup-shutdown.json",
+            {
+                "version": 1,
+                "owner": owner["token"],
+                "started_at": "2026-01-02T04:00:00+00:00",
+                "outcome": "failed",
+            },
+        )
+    else:
+        (jobs.state / "selected-instance.json").write_text("{")
+        with _owned_writer(jobs, instance=""):
+            _refused(jobs, "stop")
+        _success(jobs, "select-instance", "reader")
+
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["latest_success"]["via"] == "stop"
+    assert report["unresolved_shutdown"]["instance"] is None
+    assert report["unresolved_shutdown"]["outcome"] == "failed"
+    assert "inspect" in report["unresolved_shutdown"]["action"].lower()
+    assert report["evidence_problems"] == {}
+    assert report["protected"] is False
+
+
+def test_owned_writer_identifies_failed_stop_when_selection_is_unreadable(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    (jobs.state / "selected-instance.json").write_text("{")
+    with _owned_writer(jobs, instance="reader"):
+        _refused(jobs, "stop")
+    report = _success(jobs, "backup-status")
+    assert report["unresolved_shutdown"]["instance"] == "reader"
+    assert report["protected"] is False
+
+    _success(jobs, "select-instance", "reader")
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    assert _success(jobs, "backup-status", "--check")["unresolved_shutdown"] is None
+
+
 def test_interrupted_shutdown_reports_archive_published_before_finalization(jobs):
     _restore_fixture(jobs, "reader")
     _success(jobs, "select-instance", "reader")
@@ -489,6 +639,45 @@ def test_interrupted_shutdown_reports_archive_published_before_finalization(jobs
     assert after["latest_success"] == before["latest_success"]
     assert after["unresolved_shutdown"] == before["unresolved_shutdown"]
     assert after["protected"] is False
+
+
+def test_failed_stop_intent_write_quiesces_and_blocks_supervision(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "supervision-install")
+    _success(jobs, "backup-enable", "--hour", "4")
+    before = _success(jobs, "backup-due")["backup"]
+    _success(jobs, "backup-status", "--check")
+    _ledger(jobs, "operator-intent.json", {"version": 1, "intent": "running"})
+    with (jobs.state / "command.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert "Another project command" in _refused(jobs, "stop")
+    assert _success(jobs, "supervision-status")["intent"] == "running"
+    _success(jobs, "backup-status", "--check")
+
+    jobs.environment["SYNTHETIC_REPLACE_FAILURE"] = "operator-intent.json"
+    with _owned_writer(jobs):
+        diagnostic = _refused(jobs, "stop")
+    del jobs.environment["SYNTHETIC_REPLACE_FAILURE"]
+    assert "running intent may still be in force" in diagnostic
+    assert _success(jobs, "status")["application"] == "stopped"
+    supervision = _success(jobs, "supervision-status")
+    assert supervision["intent"] == "running" and supervision["state"] == "maintenance"
+    assert "maintenance" in _refused(jobs, "supervision-tick")
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["latest_success"]["archive"] == before["archive"]
+    assert report["maintenance_required"] is True
+    assert report["unresolved_shutdown"]["outcome"] == "failed"
+    assert report["protected"] is False
+
+    assert "backup-reconcile" in _refused(jobs, "stop")
+    assert _success(jobs, "supervision-status")["intent"] == "stopped"
+    assert _success(jobs, "backup-reconcile")["resumed"] is False
+    assert _success(jobs, "supervision-tick")["state"] == "intentionally_stopped"
+    assert _success(jobs, "stop")["backup"]["verified"] is True
+    _success(jobs, "backup-status", "--check")
 
 
 @pytest.mark.parametrize("ledger", ["backup-shutdown.json", "maintenance.json"])
@@ -877,6 +1066,53 @@ def test_manual_archive_cannot_replace_missing_daily_archive_in_protection(jobs)
     assert report["daily_archive_available"] is False
     assert report["daily_attempt"]["archive"] == daily["archive"]
     assert report["daily_attempt"]["sha256"] == daily["sha256"]
+    assert report["protected"] is False
+
+
+@pytest.mark.parametrize("inaccessible", ["latest", "daily", "both"])
+def test_inaccessible_archives_leave_independent_evidence_and_fail_check(
+    jobs, inaccessible
+):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    scheduled = jobs.environment["RSS_BACKUP_DIR"]
+    manual_destination = Path(jobs.environment["HOME"]) / "manual-backups"
+    manual_destination.mkdir(mode=0o700)
+    jobs.environment["RSS_BACKUP_DIR"] = str(manual_destination)
+    _success(jobs, "backup")
+    jobs.environment["RSS_BACKUP_DIR"] = scheduled
+    healthy = _success(jobs, "backup-status", "--check")
+
+    daily_blocked = inaccessible in ("daily", "both")
+    latest_blocked = inaccessible in ("latest", "both")
+    directories = {
+        "daily_attempt": (Path(scheduled), daily_blocked),
+        "latest_success": (manual_destination, latest_blocked),
+    }
+    try:
+        for path, blocked in directories.values():
+            if blocked:
+                path.chmod(0o600)  # Cannot traverse this disposable archive directory.
+        report = _success(jobs, "backup-status")
+        check = jobs.run("backup-status", "--check")
+    finally:
+        for path, _ in directories.values():
+            path.chmod(0o700)
+
+    assert check.returncode == 1, check.stdout
+    assert json.loads(check.stdout) == report
+    assert report["latest_success"] == healthy["latest_success"]
+    assert report["daily_attempt"] == healthy["daily_attempt"]
+    assert report["latest_attempt"] == healthy["latest_attempt"]
+    assert report["archive_available"] is not latest_blocked
+    assert report["daily_archive_available"] is not daily_blocked
+    assert set(report["archive_problems"]) == {
+        key for key, (_, blocked) in directories.items() if blocked
+    }
+    assert all(report["archive_problems"].values())
+    assert report["evidence_problems"] == {}
     assert report["protected"] is False
 
 

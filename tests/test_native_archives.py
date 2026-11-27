@@ -277,6 +277,41 @@ def test_restore_refuses_damaged_native_archive_without_publishing(installed, da
     assert hashlib.sha256(native.read_bytes()).hexdigest() == saved["sha256"]
 
 
+@pytest.mark.parametrize("invalid", ["symlink", "hardlink", "file-parent"])
+def test_restore_refuses_invalid_tar_members_with_matching_digest(installed, invalid):
+    cli, state, backups = installed
+    source = legacy_archive(backups.parent / "legacy.zip")
+    run(cli, "import-legacy", str(source), "--instance", "source")
+    run(cli, "select-instance", "source")
+    good = Path(run(cli, "backup")["archive"])
+    bad = backups.parent / "invalid-members.zip"
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as tar:
+        member = tarfile.TarInfo("entry")
+        if invalid != "file-parent":
+            member.type = tarfile.SYMTYPE if invalid == "symlink" else tarfile.LNKTYPE
+            member.linkname = "target"
+            tar.addfile(tarfile.TarInfo("target"))
+        tar.addfile(member)
+        if invalid == "file-parent":
+            tar.addfile(tarfile.TarInfo("entry/child"))
+    data = payload.getvalue()
+    with zipfile.ZipFile(good) as native, zipfile.ZipFile(bad, "w") as modified:
+        manifest = json.loads(native.read("manifest.json"))
+        manifest["payload"] = {
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        modified.writestr("manifest.json", json.dumps(manifest))
+        modified.writestr("data.tar", data)
+
+    refused = cli.invoke(main, ["restore", str(bad), "--instance", "invalid"])
+    assert refused.exit_code == 1, refused.output
+    assert "Invalid backup archive" in refused.stderr
+    assert not (state / "instances/invalid").exists()
+    assert run(cli, "status")["instance"] == "source"
+
+
 @pytest.mark.parametrize(
     "destination",
     [
@@ -706,6 +741,33 @@ def test_backup_does_not_reopen_a_previously_private_backend_on_public_exposure(
     report = run(cli, "backup-status")
     assert report["latest_success"]["verified"] is True
     assert report["resumption"] == "failed"
+
+
+def test_backup_quiesces_running_writers_without_resuming_stopped_intent(
+    installed, monkeypatch
+):
+    cli, state, backups = installed
+    archive = legacy_archive(backups.parent / "legacy.zip")
+    run(cli, "import-legacy", str(archive), "--instance", "source")
+    run(cli, "select-instance", "source")
+    run(cli, "stop")
+
+    real_popen = subprocess.Popen
+
+    def refuse_controller(argv, *args, **kwargs):
+        assert "rss_aggregator.native_service" not in argv, argv
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", refuse_controller)
+    with controlled_writers(state) as observed_stop:
+        assert run(cli, "status")["application"] == "running"
+        result = run(cli, "backup")
+        assert observed_stop.is_set()
+
+    assert result["verified"] is True
+    assert Path(result["archive"]).is_file()
+    assert run(cli, "status")["application"] == "stopped"
+    assert run(cli, "supervision-status")["intent"] == "stopped"
 
 
 def test_backup_remains_verified_when_startup_after_capture_fails(

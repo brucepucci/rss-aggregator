@@ -68,6 +68,34 @@ class BackupSchedule:
             and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None
         )
 
+    @staticmethod
+    def _valid_generation(value: Any) -> bool:
+        """Accept a recorded writer generation or a known absence of writers."""
+        return value is None or (
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}", value)
+            is not None
+        )
+
+    def _valid_shutdown(self, record: dict[str, Any]) -> bool:
+        """Validate one unresolved shutdown, without inventing a missing identity."""
+        from rss_aggregator.recovery import instance_name
+
+        instance = record["instance"]
+        if instance is not None:
+            instance_name(instance)
+        return (
+            record.get("outcome") in ("running", "failed", "interrupted")
+            and self._dated(record, "started_at")
+            and (
+                "writer_generation" not in record
+                or (
+                    instance is not None
+                    and self._valid_generation(record["writer_generation"])
+                )
+            )
+        )
+
     def _valid_evidence(self, name: str, record: dict[str, Any]) -> bool:
         """Validate fields used in each evidence view before using them."""
         outcome = record.get("outcome")
@@ -89,12 +117,26 @@ class BackupSchedule:
                 and self._dated(record, "completed_at")
             )
         if name == SHUTDOWN:
+            if not isinstance(record.get("owner"), str) or not record["owner"]:
+                return False
+            if record.get("version") == 1:
+                return self._valid_shutdown(
+                    {
+                        "instance": None,
+                        "outcome": outcome,
+                        "started_at": record["started_at"],
+                    }
+                )
+            pending = record.get("pending")
             return (
-                record.get("version") == 1
-                and isinstance(record.get("owner"), str)
-                and bool(record["owner"])
-                and outcome in ("running", "failed", "interrupted")
-                and self._dated(record, "started_at")
+                record.get("version") == 2
+                and isinstance(pending, list)
+                and bool(pending)
+                and all(
+                    isinstance(item, dict) and self._valid_shutdown(item)
+                    for item in pending
+                )
+                and len({item["instance"] for item in pending}) == len(pending)
             )
         if name == DAILY:
             return (
@@ -131,16 +173,103 @@ class BackupSchedule:
             problems[name] = str(error)
             return None
 
-    def _new_shutdown_record(
-        self, owner: dict[str, Any], outcome: str
-    ) -> dict[str, Any]:
-        """Describe an outstanding stop without depending on archive or selection state."""
-        return {
-            "version": 1,
-            "owner": owner["token"],
+    @staticmethod
+    def _shutdown_records(ledger: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Read a legacy unresolved stop as unidentified, never as the current selection."""
+        if ledger is None:
+            return []
+        if ledger["version"] == 1:
+            return [
+                {
+                    "instance": None,
+                    "started_at": ledger["started_at"],
+                    "outcome": ledger["outcome"],
+                }
+            ]
+        return ledger["pending"]
+
+    def _save_shutdowns(
+        self, owner: dict[str, Any], pending: list[dict[str, Any]]
+    ) -> None:
+        """Persist every affected instance together, without changing unrelated entries."""
+        if pending:
+            self.runtime._save(
+                SHUTDOWN, {"version": 2, "owner": owner["token"], "pending": pending}
+            )
+        else:
+            self._unlink_durable(self.runtime.state_dir / SHUTDOWN)
+
+    def _identify_shutdown(self) -> tuple[dict[str, Any], bool]:
+        """Prefer the live writer identity, falling back to selection only when idle."""
+        from rss_aggregator.recovery import Recovery, instance_name
+        from rss_aggregator.runtime import RuntimeFailure
+
+        record = {
+            "instance": None,
             "started_at": self.now.isoformat(),
-            "outcome": outcome,
+            "outcome": "running",
         }
+        already_stopped = False
+        try:
+            already_stopped = self.runtime._idle()
+            if already_stopped:
+                record["instance"] = self.runtime.instance
+            elif live := self.runtime._live():
+                record["instance"] = instance_name(live[0]["instance"])
+            elif self.runtime._idle():
+                # The controller may exit between the lease and identity probes.
+                record["instance"] = self.runtime.instance
+            if (
+                record["instance"] is not None
+                and record["instance"] == self.runtime.instance
+            ):
+                record["writer_generation"] = Recovery(self.runtime).writer_generation()
+        except (
+            RuntimeFailure,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+        ):
+            # Identification is evidence only; it must never gate quiescence.
+            pass
+        return record, already_stopped
+
+    def _set_stopped_intent(self) -> None:
+        """Attempt intent even when an earlier bookkeeping stage failed."""
+        try:
+            Supervision(self.runtime).set_intent("stopped")
+        except OSError:
+            self.runtime._diagnostic(
+                "Could not persist stopped intent; running intent may still be in force. "
+                "Fix the write failure and retry rss stop before reconciling maintenance."
+            )
+            raise
+
+    def _covered_shutdown(
+        self, shutdown: dict[str, Any], running: dict[str, Any], archive: dict[str, Any]
+    ) -> bool:
+        """Match this capture to the same instance and its trusted current generation."""
+        from rss_aggregator.recovery import SHUTDOWN_SUCCESS
+
+        if shutdown["instance"] is None or "writer_generation" not in shutdown:
+            return False
+        evidence = self._read(SHUTDOWN_SUCCESS)
+        generation = shutdown["writer_generation"]
+        # Native starts advance in place; a verified capture of the current known
+        # generation covers earlier writes. A missing generation cannot do so.
+        return (
+            isinstance(evidence, dict)
+            and evidence.get("via") == "stop"
+            and evidence.get("verified") is True
+            and evidence.get("archive") == archive["archive"]
+            and evidence.get("sha256") == archive["sha256"]
+            and evidence.get("instance") == shutdown["instance"]
+            and "writer_generation" in evidence
+            and evidence["writer_generation"] == generation
+            and (generation is not None or running.get("writer_generation") is None)
+        )
 
     def shutdown(self) -> dict[str, Any]:
         """Keep unresolved stop evidence separate from archive and maintenance state."""
@@ -149,23 +278,45 @@ class BackupSchedule:
 
         runtime = self.runtime
         owner, _installed = runtime._ownership_receipt()
-        shutdown = self._new_shutdown_record(owner, "running")
         recorded = False
         settled = False
         try:
             try:
                 try:
-                    self.begin(owner, "stop")
-                finally:
-                    previous = self._evidence(SHUTDOWN)
-                    if previous and previous["owner"] != owner["token"]:
-                        raise RuntimeFailure(
-                            "Unrecognized shutdown evidence owner; inspect locally."
+                    shutdown, already_stopped = self._identify_shutdown()
+                    try:
+                        self.begin(owner, "stop", shutdown=shutdown)
+                    finally:
+                        ledger = self._evidence(SHUTDOWN)
+                        if ledger and ledger["owner"] != owner["token"]:
+                            raise RuntimeFailure(
+                                "Unrecognized shutdown evidence owner; inspect locally."
+                            )
+                        previous = self._shutdown_records(ledger)
+                        identity = shutdown["instance"]
+                        others = [
+                            entry for entry in previous if entry["instance"] != identity
+                        ]
+                        prior = next(
+                            (
+                                entry
+                                for entry in previous
+                                if entry["instance"] == identity
+                            ),
+                            None,
                         )
-                    runtime._save(SHUTDOWN, shutdown)
-                    recorded = True
+                        running = shutdown.copy()
+                        if (
+                            prior
+                            and prior.get("writer_generation")
+                            and not running.get("writer_generation")
+                        ):
+                            running["writer_generation"] = prior["writer_generation"]
+                        self._save_shutdowns(owner, [*others, running])
+                        recorded = True
+                finally:
+                    self._set_stopped_intent()
                 self.phase("quiescing")
-                already_stopped = runtime._idle()
             finally:
                 # A bookkeeping failure must not prevent closing owned resources.
                 runtime._quiesce(owner)
@@ -177,6 +328,14 @@ class BackupSchedule:
                     ),
                     "stop",
                 )
+                archive = result["backup"]
+                if archive.get("verified") and not self._covered_shutdown(
+                    shutdown, running, archive
+                ):
+                    raise RuntimeFailure(
+                        "Verified archive published, but its shutdown identity could not be confirmed. "
+                        "Inspect the unresolved record locally."
+                    )
                 settled = True
             except (RuntimeFailure, OSError, ValueError, KeyError, TypeError) as error:
                 if not runtime._idle():
@@ -189,7 +348,9 @@ class BackupSchedule:
         except Exception:
             if recorded:
                 try:
-                    runtime._save(SHUTDOWN, {**shutdown, "outcome": "failed"})
+                    self._save_shutdowns(
+                        owner, [*others, {**running, "outcome": "failed"}]
+                    )
                 except OSError:
                     # The earlier durable record still blocks protection.
                     runtime._diagnostic(
@@ -209,10 +370,7 @@ class BackupSchedule:
                     self.notice()
         # Release the hold before clearing evidence: interruption at any prior
         # stage stays unprotected, even if archive publication already succeeded.
-        if result["backup"].get("verified") or previous is None:
-            self._unlink_durable(runtime.state_dir / SHUTDOWN)
-        else:
-            runtime._save(SHUTDOWN, previous)
+        self._save_shutdowns(owner, others if archive.get("verified") else previous)
         return result
 
     def _attempt(
@@ -643,8 +801,14 @@ class BackupSchedule:
         """Treat any durable maintenance presence, including malformed data, as a hold."""
         return os.path.lexists(self.runtime.state_dir / MAINTENANCE)
 
-    def begin(self, owner: dict[str, Any], operation: str) -> None:
-        """Persist maintenance before any forwarding, data or writer mutation."""
+    def begin(
+        self,
+        owner: dict[str, Any],
+        operation: str,
+        *,
+        shutdown: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist maintenance before mutation, including independent stop identity."""
         from rss_aggregator.runtime import RuntimeFailure
 
         if self.pending():
@@ -657,6 +821,7 @@ class BackupSchedule:
                 "operation": operation,
                 "phase": "preparing",
                 "started_at": self.now.isoformat(),
+                **({"shutdown": shutdown} if shutdown is not None else {}),
             },
         )
 
@@ -718,24 +883,38 @@ class BackupSchedule:
                 "Interrupted maintenance still has active writers or forwarding. Run rss stop to quiesce owned resources, then retry rss backup-reconcile."
             )
         problems: dict[str, str] = {}
-        shutdown = self._reported_evidence(SHUTDOWN, problems)
-        if (
-            shutdown
-            and shutdown["owner"] == owner["token"]
-            and shutdown["outcome"] == "running"
+        ledger = self._reported_evidence(SHUTDOWN, problems)
+        if SHUTDOWN not in problems and (
+            ledger is None or ledger["owner"] == owner["token"]
         ):
-            self.runtime._save(SHUTDOWN, {**shutdown, "outcome": "interrupted"})
-        elif marker["operation"] == "stop" and not os.path.lexists(
-            self.runtime.state_dir / SHUTDOWN
-        ):
-            # Older holds and a crash after begin() may have no separate evidence.
-            interrupted = self._new_shutdown_record(owner, "interrupted")
-            try:
-                if self._dated(marker, "started_at"):
-                    interrupted["started_at"] = marker["started_at"]
-            except (ValueError, KeyError, TypeError):
-                pass
-            self.runtime._save(SHUTDOWN, interrupted)
+            pending = self._shutdown_records(ledger)
+            interrupted = [
+                {**item, "outcome": "interrupted"}
+                if item["outcome"] == "running"
+                else item
+                for item in pending
+            ]
+            if marker["operation"] == "stop":
+                # A crash or failed write after begin() may leave only the hold.
+                shutdown = marker.get("shutdown")
+                try:
+                    if not isinstance(shutdown, dict) or not self._valid_shutdown(
+                        shutdown
+                    ):
+                        raise ValueError
+                except (ValueError, KeyError, TypeError, OverflowError):
+                    shutdown = {"instance": None, "started_at": self.now.isoformat()}
+                    try:
+                        if self._dated(marker, "started_at"):
+                            shutdown["started_at"] = marker["started_at"]
+                    except (ValueError, KeyError, TypeError, OverflowError):
+                        pass
+                if not any(
+                    item["instance"] == shutdown["instance"] for item in interrupted
+                ):
+                    interrupted.append({**shutdown, "outcome": "interrupted"})
+            if interrupted != pending:
+                self._save_shutdowns(owner, interrupted)
         attempt = self._reported_evidence(ATTEMPT, problems)
         if attempt and attempt["outcome"] == "running":
             self.runtime._save(
@@ -751,6 +930,27 @@ class BackupSchedule:
             "resumed": False,
             "action": "Writers and owned forwarding confirmed idle; hold released without changing intent. A separately enabled supervisor may honor existing running intent. Inspect backup-status and retry rss stop if shutdown evidence is unresolved.",
         }
+
+    @staticmethod
+    def _archive_available(
+        path: Path | None,
+        evidence: str,
+        problems: dict[str, str],
+        *,
+        follow_symlinks: bool,
+    ) -> bool:
+        """Probe a recorded archive without confusing filesystem errors with record damage."""
+        if path is None:
+            return False
+        try:
+            return stat.S_ISREG(path.stat(follow_symlinks=follow_symlinks).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            problems[evidence] = (
+                "Cannot inspect the recorded archive; check the destination and its access locally."
+            )
+            return False
 
     def status(self, *, busy: bool = False) -> dict[str, Any]:
         """Report evidence and freshness; configuration alone never proves protection."""
@@ -784,18 +984,33 @@ class BackupSchedule:
             else None
         )
         overdue = age is None or age > 26 * 3600
-        archive_available = bool(success and Path(success["archive"]).is_file())
+        archive_problems: dict[str, str] = {}
+        archive_available = self._archive_available(
+            Path(success["archive"]) if success else None,
+            "latest_success",
+            archive_problems,
+            follow_symlinks=True,
+        )
         maintenance = self.pending()
-        shutdown = self._reported_evidence(SHUTDOWN, evidence_problems)
-        if shutdown:
-            outcome = shutdown["outcome"]
-            shutdown = {
-                "started_at": shutdown["started_at"],
+        ledger = self._reported_evidence(SHUTDOWN, evidence_problems)
+        shutdowns = [
+            {
+                "instance": record["instance"],
+                "started_at": record["started_at"],
                 "outcome": "interrupted"
-                if outcome == "running" and not busy
-                else outcome,
-                "action": "Inspect shutdown state and reconcile any hold, then retry rss stop to capture a verified archive.",
+                if record["outcome"] == "running" and not busy
+                else record["outcome"],
+                **(
+                    {"writer_generation": record["writer_generation"]}
+                    if "writer_generation" in record
+                    else {}
+                ),
+                "action": "Inspect unidentified shutdown evidence locally; unrelated captures cannot resolve it."
+                if record["instance"] is None
+                else "Inspect shutdown state and reconcile any hold, then select this instance and retry rss stop to capture a verified archive.",
             }
+            for record in reversed(self._shutdown_records(ledger))
+        ]
         if attempt and attempt["outcome"] == "running" and not busy:
             attempt = {
                 **attempt,
@@ -827,8 +1042,8 @@ class BackupSchedule:
             and daily.get("sha256")
             else None
         )
-        daily_archive_available = bool(
-            daily_archive and not daily_archive.is_symlink() and daily_archive.is_file()
+        daily_archive_available = self._archive_available(
+            daily_archive, "daily_attempt", archive_problems, follow_symlinks=False
         )
         daily_fresh = bool(
             daily_archive_available
@@ -867,8 +1082,10 @@ class BackupSchedule:
             "latest_defer": defer,
             "latest_attempt": attempt,
             "latest_success": success,
-            "unresolved_shutdown": shutdown,
+            "unresolved_shutdown": shutdowns[0] if shutdowns else None,
+            "unresolved_shutdowns": shutdowns,
             "evidence_problems": evidence_problems,
+            "archive_problems": archive_problems,
             "resumption": attempt.get(
                 "resumption", "unresolved" if maintenance else "not_attempted"
             )
@@ -884,7 +1101,8 @@ class BackupSchedule:
                 and registered
                 and not problem
                 and not evidence_problems
-                and not shutdown
+                and not archive_problems
+                and not shutdowns
                 and not busy
                 and daily_fresh
                 and not daily_due

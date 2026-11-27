@@ -20,7 +20,10 @@ work around a refused install.
 Default state is `<checkout>/.local/native`. Keep that directory private (`0700`),
 owned by the controlling user, and on local, non-synced macOS storage for SQLite.
 It holds the managed runtime, `instances/NAME/data`, service settings, locks and
-ownership/recovery records. The parent legacy `.local` still belongs to the old
+ownership/recovery records. For first-time setup, choose a fresh path or an
+empty private directory, never an ancestor of another installation. `setup`
+refuses unrelated contents in an unowned state root; leave them intact and
+choose a separate path. The parent legacy `.local` still belongs to the old
 deployment; do not repurpose it or remove it recursively. A private directory is
 not a sandbox. Keep one stable controlling checkout. If you must use another
 checkout to operate the **same** instance, use the exact matching reviewed pin and
@@ -41,8 +44,10 @@ an equivalent launcher.
   ownership and exact installed pin, prepares the selected data, checks effective
   **web** PHP (not only PHP CLI), readiness and scheduling, and verifies rejection
   of anonymous API access on an initialized instance. Private startup refreshes
-  the forwarding check after preparation; ordinary HTTP requests receive 503 until
-  that generation is approved. It removes the temporary PHP probe after each check.
+  the forwarding check after preparation. Ordinary HTTP receives 503 until the
+  controller acknowledges approval. Before reporting success, startup checks the
+  same live generation, scheduler and ordinary HTTP. It removes the temporary
+  PHP probe after each check.
   A known occupied replacement port is refused before interrupting the old
   generation; a later bind race can still leave it stopped. Repeated `start`
   rechecks effective settings and anonymous API refusal before retaining
@@ -86,11 +91,14 @@ check the user/category/feed settings before changing them.
 
 Export an explicit private `RSS_BACKUP_DIR` outside Git and every native state directory. `stop` records stopped
 intent, removes only owned forwarding, and proves web and fetch writers idle
-before reading the selected instance, backup attempt or runtime layout for an
-archive. Missing previously provisioned data or a lost explicit selection is a
+before capture. It records the affected instance and writer generation when
+known; unavailable selection or capture records do not prevent quiescence. Missing previously provisioned data or a lost explicit selection is a
 failure, not an empty install. The command preserves the runtime, data and
 archives. A failed shutdown export after quiescing leaves writers stopped;
-correct the cause and retry `stop`. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
+correct the cause and retry `stop` for that instance. If `stop` could not persist
+stopped intent, it still attempts to quiesce, but a previously recorded running
+intent may remain. Fix the intent-write failure and retry `stop` before releasing
+any hold. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
 for resumption, daily checks and interrupted maintenance; a failed explicit
 `backup` has different resumption behavior. A local archive alone does not prove
 host-loss recovery.
@@ -207,9 +215,12 @@ instance's verified shutdown archive covering its last writer generation and
 revalidates it against the installed pin. An older archive does not cover writes
 from a later session. If shutdown capture failed, correct the cause and retry
 `stop` before applying. It does not rewrite old archives: each
-ZIP still needs its exact recorded pin for restore. Start with `RSS_TAILSCALE=0`,
-verify application state under the reviewed runtime and take a new native backup;
-only then restore [intended private access](tailscale-readkit.md#connect-and-verify-the-server)
+ZIP still needs its exact recorded pin for restore. **Before the local restart**, confirm
+writers remain stopped and no Serve, Funnel or other proxy targets the intended
+loopback port. Use the [local-only forwarding checks](tailscale-readkit.md#stop-resume-and-return-to-local-only-use);
+stop on uncertainty and preserve foreign rules. Then start with `RSS_TAILSCALE=0`,
+verify application state under the reviewed runtime and take a new native backup.
+Only then restore [intended private access](tailscale-readkit.md#connect-and-verify-the-server)
 and explicitly recapture wanted jobs.
 
 Changing FreshRSS itself is not supported by this command. Never hand-edit

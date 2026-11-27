@@ -36,7 +36,14 @@ INSTANCE_RECORD = "instance.json"
 _INITIAL_PROVISIONED = "default-provisioned.json"
 _SELECTION_REQUIRED = "selection-required.json"
 _WRITER_GENERATION = "writer-generation.json"
-_DATA_IDENTITY = ("freshrss_version", "freshrss_sha256", "platform")
+
+
+def same_data_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Match activation compatibility without requiring the same PHP/web pin."""
+    return all(
+        key in left and key in right and left[key] == right[key]
+        for key in ("freshrss_version", "freshrss_sha256", "platform")
+    )
 
 
 def instance_name(value: str) -> str:
@@ -220,7 +227,7 @@ class Recovery:
         if (
             not isinstance(stored, dict)
             or stored.keys() != identity.keys()
-            or any(stored[key] != identity[key] for key in _DATA_IDENTITY)
+            or not same_data_identity(stored, identity)
         ):
             raise self.failure(
                 "Instance requires its recorded FreshRSS release, source SHA-256 and platform before activation."
@@ -428,7 +435,7 @@ class Recovery:
             )
         was_running = status["application"] == "running"
         port = status.get("port") if was_running else None
-        was_private = False
+        was_private = check_private_backend = False
         if was_running:
             live = runtime._live()
             if (
@@ -437,11 +444,15 @@ class Recovery:
                 or not 1024 <= port <= 65535
                 or live[0].get("port") != port
                 or type(live[0].get("private")) is not bool
+                or type(live[0].get("check_private_backend", False)) is not bool
             ):
                 raise self.failure(
                     "Cannot confirm the active FreshRSS backend or its access mode; backup refused."
                 )
             was_private = live[0]["private"]
+            check_private_backend = was_private or live[0].get(
+                "check_private_backend", False
+            )
         maintenance = BackupSchedule(runtime)
         maintenance.begin(owner, "backup")
         settled = False
@@ -468,9 +479,9 @@ class Recovery:
                     if was_running and maintenance.may_resume():
                         maintenance.phase("resuming")
                         runtime._start(
-                            private_https=withdrawn,
+                            private_https=was_private and withdrawn,
                             port_override=port,
-                            check_private_backend=was_private and not withdrawn,
+                            check_private_backend=check_private_backend,
                         )
                     maintenance.finish()
             finally:

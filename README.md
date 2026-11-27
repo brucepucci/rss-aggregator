@@ -58,9 +58,9 @@ fetch requests. When the instance is stopped, clients cannot synchronize.
 
 Use a normal user on an Apple Silicon Mac (macOS 12+), with Git, native
 [uv](https://docs.astral.sh/uv/getting-started/installation/), internet access
-and an unused loopback port. **Before the first `start`, verify the port is not
-already a target of Serve, Funnel, or any other proxy or forwarding rule.** A
-free port and `RSS_TAILSCALE=0` do not prove isolation. See the
+and an unused loopback port. **Before the first `start`, verify that port `8080`
+(or the port you set below) is not already a target of Serve, Funnel, or any
+other proxy or forwarding rule.** A free port and `RSS_TAILSCALE=0` do not prove isolation. See the
 [private-access safeguards](docs/tailscale-readkit.md#prerequisites-and-ownership).
 This path is for a **new local instance** without jobs or forwarding. For existing
 data, use [native recovery](docs/backup-restore.md#recovery-on-this-or-a-clean-host)
@@ -70,11 +70,18 @@ before an empty start.
 ```sh
 git clone https://github.com/brucepucci/rss-aggregator.git
 cd rss-aggregator
-uv sync --locked
-uv run --locked rss setup
+# Override inherited settings. Use the port you checked above.
+export RSS_STATE_DIR="$PWD/.local/native" RSS_PORT=8080 RSS_TAILSCALE=0
 # Explicit private destination outside every Git checkout; choose your own.
 export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
-export RSS_TAILSCALE=0
+```
+
+Confirm that the chosen state path is unused. If it already exists or is a
+symlink, stop here and choose a fresh path; don't delete or reuse existing state.
+
+```sh
+uv sync --locked
+uv run --locked rss setup
 uv run --locked rss start
 ```
 

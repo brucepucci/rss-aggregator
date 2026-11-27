@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 from rss_aggregator.runtime import RuntimeFailure, ServeConfigRejected
-from rss_aggregator.serve_config import ServeConfigClient
+from rss_aggregator.serve_config import TAILSCALE_CLI_TIMEOUT, ServeConfigClient
 
 TCP_CREDS = "curl -u:fixture-token http://localhost:41112/localapi/v0/status\n"
 UNIX_PATH = "/private/fixture-tailscaled.sock"
@@ -148,7 +148,12 @@ def test_tcp_exact_wire_requests_share_discovery_and_upstream_tag(runtime, trans
     assert etag == TAG
     client.write({"TCP": {"443": {"HTTPS": True}}}, etag)
     runtime._run.assert_called_once_with(
-        "tailscale", "debug", "local-creds", check=False
+        "tailscale",
+        "debug",
+        "local-creds",
+        check=False,
+        inherit_lock=False,
+        timeout=TAILSCALE_CLI_TIMEOUT,
     )
     assert transport.calls == [(("127.0.0.1", 41112), 10, None)] * 2
     assert first.request() == (
@@ -502,7 +507,12 @@ def test_connect_failure_sends_no_bytes_and_closes_without_retry(
     assert sock.stream is None
     assert sock.closed
     runtime._run.assert_called_once_with(
-        "tailscale", "debug", "local-creds", check=False
+        "tailscale",
+        "debug",
+        "local-creds",
+        check=False,
+        inherit_lock=False,
+        timeout=TAILSCALE_CLI_TIMEOUT,
     )
     assert capsys.readouterr() == ("", "")
     assert not caplog.records
@@ -567,7 +577,12 @@ def test_unix_transport_uses_socket_path_canonical_host_and_no_auth(
     assert sockets[1].request()[2] == b"{}"
     transport.factory.assert_not_called()
     runtime._run.assert_called_once_with(
-        "tailscale", "debug", "local-creds", check=False
+        "tailscale",
+        "debug",
+        "local-creds",
+        check=False,
+        inherit_lock=False,
+        timeout=TAILSCALE_CLI_TIMEOUT,
     )
 
 

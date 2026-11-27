@@ -120,6 +120,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             cwd=state / "runtime/FreshRSS",
             capture_output=True,
             timeout=30,
+            umask=0o077,
             check=False,
             env={
                 **base,
@@ -186,14 +187,18 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert start["security"]["verified"] is True
         assert start["scheduler"]["cron"] == "*/20 * * * *"
         assert invoke(first, "stop")["backup"]["verified"] is True
-        opml = first / "instances/default/data/opml.xml"
+        data = first / "instances/default/data"
+        opml = data / "opml.xml"
+        config = data / "config.custom.php"
+        # Unlike the seeded OPML, this file is created by the fixture.
+        config.touch(mode=0o600, exist_ok=False)
         opml.write_text(
             f"<opml version='1.0'><head><title>Fixture</title></head><body>"
             f"<outline title='Synthetic publisher' type='rss' xmlUrl='{feed_url}'/>"
             "</body></opml>"
         )
         address = feed_url.split("/", 3)[2]
-        (opml.parent / "config.custom.php").write_text(
+        config.write_text(
             f"<?php return ['internal_host_allowlist' => ['{address}'], "
             f"'limits' => ['cache_duration' => {FEED_TTL}, "
             f"'cache_duration_min' => {FEED_TTL}]];\n"
@@ -282,15 +287,13 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert invoke(first, "status")["http_ready"] is True
         assert invoke(first, "verify")["verified"] is True
         invoke(first, "stop")
-        (opml.parent / "config.custom.php").write_text(
+        config.write_text(
             "<?php return ['auth_type' => 'none', 'allow_anonymous' => true];\n"
         )
         repaired = invoke(first, "start")
         assert repaired["security"]["authenticated_settings"] is True
         invoke(first, "stop")
-        (opml.parent / "applied_migrations.txt").rename(
-            opml.parent / "missing-marker.fixture"
-        )
+        (data / "applied_migrations.txt").rename(data / "missing-marker.fixture")
         refused = invoke(first, "start", success=False)
         assert (
             refused.returncode != 0 and "configuration is incomplete" in refused.stderr

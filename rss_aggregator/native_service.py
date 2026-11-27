@@ -150,14 +150,19 @@ def initialized(data: Path) -> bool:
 
 
 def approval_path(home: Path, nonce: str) -> Path:
-    """Locate the generation's ordinary HTTP approval marker, outside its web root."""
+    """Locate the parent's request to approve this generation, outside its web root."""
     return home / f"approved-{nonce}.json"
+
+
+def acknowledgement_path(home: Path, nonce: str) -> Path:
+    """Locate the controller's approval acknowledgement that opens ordinary HTTP."""
+    return home / f"acknowledged-{nonce}.json"
 
 
 def _caddyfile(plan: dict[str, Any]) -> str:
     """Gate ordinary traffic until verified, allowing generation-bound diagnostics."""
     port, nonce = plan["port"], plan["nonce"]
-    approval = approval_path(Path("../../service"), nonce)
+    approval = acknowledgement_path(Path("../../service"), nonce)
     return f"""\
 {{
     admin off
@@ -303,6 +308,7 @@ def serve(state: Path, writer_fd: int) -> None:
     fetch_deadline = 0.0
     stopping = False
     approved = False
+    acknowledgement = acknowledgement_path(home, nonce)
     approval_deadline = time.monotonic() + 30
     try:
         with config.open("x") as stream:
@@ -337,9 +343,11 @@ def serve(state: Path, writer_fd: int) -> None:
                     save(receipt, {**status, "web": "started", "scheduler": "running"})
                     fetch = None
             if not approved:
-                approved = approval_path(home, nonce).is_file()
-                if not approved and time.monotonic() >= approval_deadline:
+                if time.monotonic() >= approval_deadline:
                     break
+                if approval_path(home, nonce).is_file():
+                    save(acknowledgement, {"nonce": nonce})
+                    approved = True
             due = _scheduled(time.time(), slot)
             if due is not None:
                 slot = due
@@ -350,9 +358,12 @@ def serve(state: Path, writer_fd: int) -> None:
                             fetch = _fetch(binary, source, env, writer_fd, fetch_fd)
             time.sleep(0.25)
     finally:
-        # Stop accepting requests immediately; let active requests and fetching drain.
-        if (outcome := _drain(web, fetch, fetch_deadline)) is not None:
-            status["last_fetch"] = outcome
+        # Close the ordinary HTTP gate before draining existing writers.
+        try:
+            acknowledgement.unlink(missing_ok=True)
+        finally:
+            if (outcome := _drain(web, fetch, fetch_deadline)) is not None:
+                status["last_fetch"] = outcome
         config.unlink(missing_ok=True)
         approval_path(home, nonce).unlink(missing_ok=True)
         save(

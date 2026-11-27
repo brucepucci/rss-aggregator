@@ -115,14 +115,23 @@ do not infer stopped service from failure. See [backup failure behavior](backup-
 
 For a deliberate transition to loopback, coordinate with the owner and take a
 verified backup using the current settings. Successfully remove supervision and
-disable daily backup before changing **either** captured mode. Keep the same state,
-port and backup destination; set `RSS_TAILSCALE=0`, then `start`, `verify` and
-`status`. Require the intended HTTP loopback URL, readiness and owned forwarding
-stopped (or unconfigured if never managed). Check the actual Serve state locally;
-verify local sign-in and loopback links. Retained API passwords/ownership receipts
-are not erased. Retain Tailscale availability when checking existing forwarding
-records; never delete receipts to avoid those checks. Only recapture wanted jobs
-with the new settings after verification.
+disable daily backup before changing **either** captured mode. Keep the same
+state, port and backup destination. Run `uv run --locked rss stop` from the
+owning checkout, with the current settings, to stop writers, withdraw the owned
+route and verify a shutdown archive. Do not continue on a failed shutdown.
+
+**Before reopening**, inspect `tailscale serve status`, `tailscale funnel status`
+and any other proxy or forwarding configuration locally. Confirm that none
+targets the intended loopback port. Stop if a route is present or the check is
+uncertain; do not change someone else's rule. Explicit `RSS_TAILSCALE=0` does not
+check or disable external forwarding.
+
+Set `RSS_TAILSCALE=0`, then run `start`, `verify` and `status`. Require the intended
+HTTP loopback URL, readiness and owned forwarding stopped (or unconfigured if never
+managed). Verify local sign-in and loopback links. Retained API passwords/ownership
+receipts are not erased. Retain Tailscale availability when checking existing
+forwarding records; never delete receipts to avoid those checks. Only recapture
+wanted jobs with the new settings after verification.
 
 ## Troubleshooting
 

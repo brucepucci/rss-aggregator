@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
 
+TAILSCALE_CLI_TIMEOUT = 5
 _PATH = "/localapi/v0/serve-config"
 _HOST = "local-tailscaled.sock"
 _TIMEOUT = 10
@@ -87,7 +88,14 @@ class ServeConfigClient:
         self._socket_path: str | None = None
         self._headers = {"Host": _HOST}
         try:
-            result = runtime._run("tailscale", "debug", "local-creds", check=False)
+            result = runtime._run(
+                "tailscale",
+                "debug",
+                "local-creds",
+                check=False,
+                inherit_lock=False,
+                timeout=TAILSCALE_CLI_TIMEOUT,
+            )
             if result.returncode != 0 or not isinstance(result.stdout, str):
                 raise ValueError("Discovery failed")
             tcp = _TCP_CREDS.fullmatch(result.stdout)

@@ -38,7 +38,7 @@ def sync_plist(fd):
             ProgramArguments=['/not-the-captured-launcher'],
             EnvironmentVariables=dict(),
         ))
-        launch_agents.mkdir(parents=True, exist_ok=True)
+        launch_agents.mkdir(mode=0o700, parents=True, exist_ok=True)
         with final.open('xb') as writer:
             writer.write(definition)
         return
@@ -150,6 +150,11 @@ def test_enable_does_not_bootstrap_a_plist_that_appears_as_the_ledger_is_saved(
     loaded = Path(jobs.environment["HOME"]) / "fake-launchd" / path.stem
     assert not loaded.exists()
     assert result.returncode == 1 and not result.stdout, (result.stdout, result.stderr)
-    assert plistlib.loads(path.read_bytes())["ProgramArguments"] == [
-        "/not-the-captured-launcher"
-    ]
+    assert "conflicting native LaunchAgent definition" in result.stderr
+    assert path.read_bytes() == plistlib.dumps(
+        {
+            "Label": path.stem,
+            "ProgramArguments": ["/not-the-captured-launcher"],
+            "EnvironmentVariables": {},
+        }
+    )

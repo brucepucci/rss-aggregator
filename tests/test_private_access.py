@@ -7,9 +7,11 @@ import json
 import os
 import platform
 import shutil
+import signal
 import socket
 import stat
 import subprocess
+import sys
 from functools import partial
 from http.client import BadStatusLine, RemoteDisconnected
 from pathlib import Path
@@ -24,6 +26,8 @@ from click.testing import CliRunner
 from test_native_install import Checkout
 from test_serve_config import ControlledSocket, reply
 
+from rss_aggregator import native_service
+from rss_aggregator import runtime as native_runtime
 from rss_aggregator.cli import main
 from rss_aggregator.native_install import manifest_identity
 from rss_aggregator.private_access import PrivateAccess
@@ -33,6 +37,12 @@ from rss_aggregator.runtime import (
     RuntimeFailure,
     ServeConfigRejected,
 )
+from tests.test_native_process_lifetime import _exited, _wait_for
+from tests.test_native_process_lifetime import (
+    process_checkout as shared_process_checkout,
+)
+
+process_checkout = shared_process_checkout
 
 HOST = "reader.example.ts.net"
 ORIGIN = f"https://{HOST}"
@@ -773,17 +783,27 @@ def controlled_web(native, monkeypatch):
     """Substitute only the listener, controller process and external PHP/HTTP."""
     handles = []
     elapsed = 0.0
+    origin = None
+
+    def lose_generation():
+        while handles:
+            os.close(handles.pop())
+
+    native.lose_generation = lose_generation
     native.data = native.state / "instances/default/data"
     native.web_auth = True
+    native.acknowledge = True
     native.launches = 0
 
     def run(args, **kwargs):
+        nonlocal origin
         if args[0] != str(native.state / "runtime/frankenphp"):
             return native.api.run_cli(args, **kwargs)
         if args[2] == "-r":
-            origin = ORIGIN if os.environ["RSS_TAILSCALE"] == "1" else BACKEND
             output = json.dumps(["form", False, False, True, origin, True, "sqlite"])
         else:
+            if args[2] == "cli/reconfigure.php":
+                origin = args[args.index("--base-url") + 1]
             assert args[2] in (
                 "cli/prepare.php",
                 "cli/reconfigure.php",
@@ -809,10 +829,17 @@ def controlled_web(native, monkeypatch):
         nonlocal elapsed
         elapsed += seconds
         plan = json.loads((native.state / "service.json").read_text())
+        nonce = plan["nonce"]
+        service = native.state / "service"
+        request = service / f"approved-{nonce}.json"
+        acknowledgement = service / f"acknowledged-{nonce}.json"
         stop = native.state / "stop-service.json"
-        if stop.is_file() and json.loads(stop.read_text())["nonce"] == plan["nonce"]:
-            while handles:
-                os.close(handles.pop())
+        if stop.is_file() and json.loads(stop.read_text())["nonce"] == nonce:
+            acknowledgement.unlink(missing_ok=True)
+            request.unlink(missing_ok=True)
+            lose_generation()
+        elif handles and native.acknowledge and request.is_file():
+            acknowledgement.write_text(json.dumps({"nonce": nonce}))
 
     def web(_handler, request):
         path = request.selector
@@ -973,6 +1000,248 @@ def test_occupied_replacement_port_leaves_existing_service_ready(
     assert len(native.api.posts) == changes
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "generation-lost",
+        "no-acknowledgement",
+        "ordinary-http-unavailable",
+        "stale-receipt",
+    ],
+)
+def test_private_start_fails_closed_if_published_generation_is_not_ready(
+    controlled_web, monkeypatch, failure
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    result_json(native.run(["stop"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    original = copy.deepcopy(native.api.config)
+    ordinary = HTTPHandler.http_open
+    native.acknowledge = failure != "no-acknowledgement"
+
+    def while_publishing():
+        if ADDRESS not in native.api.posts[-1][1]["Web"]:
+            return
+        nonce = json.loads((native.state / "service.json").read_text())["nonce"]
+        assert not (native.state / "service" / f"approved-{nonce}.json").exists()
+        if failure == "generation-lost":
+            native.lose_generation()
+
+    def web(handler, request):
+        if request.selector == "/i/" and request.get_header("Host") == request.host:
+            if failure == "ordinary-http-unavailable":
+                return http_response(request, b"", 503)
+            if failure == "stale-receipt":
+                (native.state / "service-status.json").write_text(
+                    json.dumps(
+                        {"nonce": "b" * 32, "web": "started", "scheduler": "running"}
+                    )
+                )
+        return ordinary(handler, request)
+
+    native.api.before_post = while_publishing
+    monkeypatch.setattr(HTTPHandler, "http_open", web)
+    refused(native.run(["start"]), "startup approval")
+    status = result_json(native.run(["status"]))
+    assert (status["application"], status["http_ready"]) == ("stopped", False)
+    assert native.api.config == original
+    assert ADDRESS in native.api.posts[0][1]["Web"]
+    assert native.api.posts[1] == ('"snapshot-B"', original)
+
+
+@pytest.mark.parametrize("failure", ["unknown-write", "competing-route"])
+def test_failed_private_start_preserves_uncertain_or_replaced_route(
+    controlled_web, monkeypatch, failure
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    result_json(native.run(["stop"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    if failure == "unknown-write":
+        native.api.post_status = 500
+
+        def lose_confirmation():
+            native.api.config = copy.deepcopy(native.api.posts[0][1])
+
+        native.api.before_post = lose_confirmation
+        refused(native.run(["start"]), "outcome may be unknown")
+        assert len(native.api.posts) == 1
+        assert native.api.config == native.api.posts[0][1]
+        assert result_json(native.run(["status"]))["application"] == "stopped"
+    else:
+        reads_after_publication = 0
+
+        def replace_after_readback():
+            nonlocal reads_after_publication
+            if len(native.api.posts) == 1:
+                reads_after_publication += 1
+                if reads_after_publication == 2:
+                    native.api.config["Web"][ADDRESS]["Handlers"]["/"] = {
+                        "Text": REMOTE_SECRET
+                    }
+                    native.api.etag = '"competitor"'
+
+        native.api.before_get = replace_after_readback
+        refused(
+            native.run(["start"]),
+            "withdrawal of startup forwarding could not be confirmed",
+        )
+        assert native.api.posts[1][0] == '"snapshot-B"'
+        assert native.api.etag == '"competitor"'
+        assert native.api.config["Web"][ADDRESS]["Handlers"]["/"] == {
+            "Text": REMOTE_SECRET
+        }
+        # Removing the simulated competing route from inspection doesn't affect
+        # the already-confirmed writer shutdown.
+        native.api.config = route(target="http://127.0.0.1:8001")
+        assert result_json(native.run(["status"]))["application"] == "stopped"
+
+
+@pytest.mark.parametrize("exit_while_publishing", [False, True])
+def test_private_start_observes_ordinary_gate_from_real_controller(
+    process_checkout, monkeypatch, exit_while_publishing
+):
+    checkout = process_checkout
+    state, home = checkout.state, checkout.control
+    monkeypatch.chdir(checkout.root)
+    for key in ("HOME", "PATH", "RSS_PORT", "RSS_BACKUP_DIR"):
+        monkeypatch.setenv(key, checkout.environment[key])
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    monkeypatch.setattr(
+        native_runtime,
+        "sys",
+        SimpleNamespace(
+            executable=str(checkout.launcher), platform=sys.platform, stderr=sys.stderr
+        ),
+    )
+    api = LocalAPI()
+    external = subprocess.run
+
+    def run(args, **kwargs):
+        return (
+            api.run_cli(args, **kwargs)
+            if args[0] == "tailscale"
+            else external(args, **kwargs)
+        )
+
+    class PortCheck:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", PORT)
+
+    def generation():
+        return json.loads((state / "service.json").read_text())["nonce"]
+
+    ordinary = []
+
+    def probe(port, path, *, host=None):
+        assert port == PORT
+        nonce = generation()
+        try:
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.settimeout(1)
+                sock.connect(".ready-" + nonce)
+                with sock.makefile("rb") as response:
+                    assert response.read() == nonce.encode()
+        except (FileNotFoundError, ConnectionError, TimeoutError):
+            return 0, b""
+        if path == "/__rss_ready":
+            assert host == f"rss-{nonce}.invalid"
+            return 200, nonce.encode()
+        if path == "/__rss_probe.php":
+            return 200, json.dumps(
+                {
+                    "sapi": "frankenphp",
+                    "php": checkout.manifest["runtime"]["php"],
+                    "upload_progress": "0",
+                    "expose_php": "0",
+                    "display_errors": "0",
+                    "sqlite": True,
+                    "loaded_ini": str(home / "php.ini"),
+                    "initialized": True,
+                    "authenticated_settings": True,
+                }
+            ).encode()
+        if path == "/i/":
+            if host is not None:
+                return 200, b""
+            caddy = (home / ("Caddyfile-" + nonce)).read_text()
+            # Model just the generated Caddy file matcher; the actual native
+            # controller, leases and the worker's Unix readiness are not mocked.
+            gate = next(
+                line.split()[-1] for line in caddy.splitlines() if "try_files" in line
+            )
+            code = 200 if (home / gate.lstrip("/")).is_file() else 503
+            ordinary.append(code)
+            return code, b""
+        assert path == "/api/greader.php/reader/api/0/subscription/list"
+        return 403, b""
+
+    def while_publishing():
+        if ADDRESS not in api.posts[-1][1]["Web"]:
+            return
+        probe(PORT, "/i/")
+        if exit_while_publishing:
+            (home / ("web-release-" + generation())).touch()
+            receipt = state / "service-status.json"
+            _wait_for(
+                lambda: json.loads(receipt.read_text())["web"] == "failed",
+                "native controller did not observe its web writer exiting",
+            )
+
+    api.before_post = while_publishing
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(socket, "create_connection", api.connect)
+    monkeypatch.setattr(native_service, "web_check", probe)
+    monkeypatch.setattr(
+        native_runtime,
+        "socket",
+        SimpleNamespace(
+            socket=PortCheck,
+            SOL_SOCKET=socket.SOL_SOCKET,
+            SO_REUSEADDR=socket.SO_REUSEADDR,
+        ),
+    )
+    runtime = Runtime(root=checkout.root, state_dir=state)
+    original = copy.deepcopy(api.config)
+    try:
+        if exit_while_publishing:
+            with pytest.raises(RuntimeFailure, match="startup approval"):
+                runtime.run("start")
+            status = runtime.run("status")
+            assert (status["application"], status["http_ready"]) == ("stopped", False)
+            assert api.config == original
+            assert ordinary == [503]
+            assert len(api.posts) == 2
+        else:
+            assert runtime.run("start")["application"] == "running"
+            assert ordinary == [503, 200]
+            assert runtime.run("status")["http_ready"] is True
+            assert len(api.posts) == 1
+        assert not list(home.glob("approved-*.json"))
+    finally:
+        if (state / "service.json").exists():
+            (home / ("web-release-" + generation())).touch()
+            receipt = state / "service-status.json"
+            _wait_for(
+                lambda: json.loads(receipt.read_text())["web"] != "started",
+                "disposable controller did not shut down",
+            )
+
+
 def test_private_start_rechecks_forwarding_after_preparation(
     controlled_web, monkeypatch
 ):
@@ -1018,6 +1287,136 @@ def test_private_start_rechecks_forwarding_after_preparation(
     refused(native.run(["start"]), "Synthetic forwarding inspection failed")
     assert result_json(native.run(["status"]))["application"] == "stopped"
     assert not native.api.posts
+
+
+@pytest.mark.parametrize("intervening", [None, "start", "verify"])
+def test_successive_backup_resumptions_keep_forwarding_check_without_republishing(
+    controlled_web, monkeypatch, intervening
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    result_json(native.run(["stop"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    original = copy.deepcopy(native.api.config)
+    assert result_json(native.run(["start"]))["url"] == ORIGIN
+
+    # The original owned route disappears independently. Resumption is local,
+    # despite the original opt-in, and must not forget to inspect this backend.
+    native.api.config = original
+    result_json(native.run(["backup"]))
+    status = result_json(native.run(["status"]))
+    assert (status["url"], status["http_ready"]) == (BACKEND, True)
+    if intervening == "start":
+        monkeypatch.setenv("RSS_TAILSCALE", "0")
+        assert (
+            result_json(native.run(["start"]))["fetch"]["status"] == "already_running"
+        )
+    elif intervening == "verify":
+        assert result_json(native.run(["verify"]))["url"] == BACKEND
+    assert len(native.api.posts) == 1
+    launches = native.launches
+
+    def publish(source, destination, **kwargs):
+        result = link(source, destination, **kwargs)
+        if Path(destination).parent == Path(os.environ["RSS_BACKUP_DIR"]):
+            native.api.config = route(funnel=True)
+            native.api.etag = '"foreign-funnel"'
+        return result
+
+    link = os.link
+    monkeypatch.setattr(os, "link", publish)
+    refused(native.run(["backup"]), "Existing Funnel reaches this FreshRSS backend")
+    status = result_json(native.run(["status"]))
+    assert (status["application"], status["http_ready"]) == ("stopped", False)
+    backup = result_json(native.run(["backup-status"]))
+    assert backup["latest_success"]["verified"] is True
+    assert backup["resumption"] == "failed"
+    assert native.launches == launches
+    assert len(native.api.posts) == 1
+    assert native.api.config == route(funnel=True)
+
+
+def test_stalled_discovery_is_reaped_without_holding_command_lock(process_checkout):
+    checkout = process_checkout
+    result = checkout.run("start")
+    assert result.returncode == 0, result.stderr
+    nonce = json.loads((checkout.state / "service.json").read_text())["nonce"]
+    owner = json.loads((checkout.state / "native-owner.json").read_text())
+    (checkout.state / "serve.json").write_text(
+        json.dumps(
+            {
+                "owner": owner["token"],
+                "host": HOST,
+                "target": BACKEND,
+                "phase": "active",
+            }
+        )
+    )
+    executable = Path(checkout.environment["PATH"]) / "tailscale"
+    child_state = checkout.state / "discovery-child"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, signal, sys, time\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:] == ['serve', 'status', '--json']:\n"
+        "    print('{}')\n"
+        "    raise SystemExit(0)\n"
+        "assert sys.argv[1:] == ['debug', 'local-creds']\n"
+        "signal.alarm(45)\n"
+        "state = Path(os.environ['RSS_STATE_DIR'])\n"
+        "lock = (state / 'command.lock').stat()\n"
+        "inherited = False\n"
+        "for fd in range(3, 256):\n"
+        "    try:\n"
+        "        info = os.fstat(fd)\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    inherited |= (info.st_dev, info.st_ino) == (lock.st_dev, lock.st_ino)\n"
+        "progress = state / 'child.tmp'\n"
+        "progress.write_text(json.dumps([os.getpid(), inherited]))\n"
+        "progress.replace(state / 'discovery-child')\n"
+        "time.sleep(45)\n"
+    )
+    executable.chmod(0o700)
+    with subprocess.Popen(
+        (checkout.launcher, "-I", "-B", "-m", "rss_aggregator", "stop"),
+        cwd=checkout.root,
+        env=checkout.environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as command:
+        pid = None
+        try:
+            _wait_for(child_state.exists, "Tailscale discovery did not start")
+            pid, inherited = json.loads(child_state.read_text())
+            try:
+                output, error = command.communicate(timeout=9)
+            except subprocess.TimeoutExpired:
+                pytest.fail("stop stalled in the read-only Tailscale process")
+            assert command.returncode == 1 and not output
+            assert "Private forwarding shutdown is unconfirmed" in error
+            assert "Tailscale LocalAPI" in error
+            assert _exited(pid), "stop returned before reaping discovery"
+            assert not inherited, "Tailscale discovery inherited the command lock"
+            result = checkout.run("status")
+            assert result.returncode == 0, result.stderr
+            status = json.loads(result.stdout)
+            assert (status["application"], status["http_ready"]) == ("stopped", False)
+            assert not list(checkout.backups.glob("*.zip"))
+        finally:
+            if pid is not None and not _exited(pid):
+                os.kill(pid, signal.SIGKILL)
+            if command.poll() is None:
+                command.kill()
+            (checkout.control / ("web-release-" + nonce)).touch()
+            _wait_for(
+                lambda: checkout.run("status").returncode == 0,
+                "stop retry was blocked by the discovery command lock",
+            )
 
 
 def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_recorded(

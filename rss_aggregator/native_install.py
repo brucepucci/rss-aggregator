@@ -408,6 +408,32 @@ class NativeInstall:
         )
         return metadata.st_dev
 
+    def _require_initial_state(
+        self, device: int, *, staging: Path | None = None
+    ) -> None:
+        """Allow only the command lease and this attempt's staging in an unowned root."""
+        for entry in self.state.iterdir():
+            if entry == staging:
+                continue
+            if entry.name == "command.lock":
+                metadata = entry.lstat()
+                _private(entry, metadata, mode=0o600, device=device)
+                if metadata.st_size == 0:
+                    continue
+            if entry == self.root:
+                raise NativeInstallError(
+                    "Refusing to adopt a pre-existing unowned native runtime path."
+                )
+            raise NativeInstallError(
+                "Unowned RSS_STATE_DIR is not empty; use a separate private directory."
+            )
+
+    def preflight_setup(self) -> None:
+        """Check a first-time root before the command lease can change it."""
+        device = self._state_device()
+        if _optional_stat(self.owner_path) is None:
+            self._require_initial_state(device)
+
     def _read_owner(self, device: int) -> dict[str, Any] | None:
         """Validate a persistent receipt without adopting foreign files."""
         if _optional_stat(self.owner_path) is None:
@@ -534,11 +560,9 @@ class NativeInstall:
             raise NativeInstallError(
                 "Native pin changed; setup will not upgrade it implicitly."
             )
-        if _optional_stat(self.root) is not None:
-            if owner is None:
-                raise NativeInstallError(
-                    "Refusing to adopt a pre-existing unowned native runtime path."
-                )
+        if owner is None:
+            self._require_initial_state(device)
+        elif _optional_stat(self.root) is not None:
             self._verify_release(self.root, owner, device)
             return owner
 
@@ -562,6 +586,7 @@ class NativeInstall:
                     raise NativeInstallError(
                         "A native ownership receipt appeared during setup; refusing replacement."
                     )
+                self._require_initial_state(device, staging=staging)
                 (staging / self.owner_path.name).rename(self.owner_path)
             (staging / "runtime").rename(self.root)
         return new_owner
