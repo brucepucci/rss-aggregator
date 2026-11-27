@@ -140,7 +140,12 @@ def _owned_writer(checkout):
     _ledger(
         checkout,
         "service.json",
-        {"nonce": nonce, "url": "http://127.0.0.1:8080", "port": 8080},
+        {
+            "nonce": nonce,
+            "url": "http://127.0.0.1:8080",
+            "port": 8080,
+            "private": False,
+        },
     )
     _ledger(checkout, "service-status.json", {"nonce": nonce, "web": "started"})
     stop = checkout.state / "stop-service.json"
@@ -193,7 +198,12 @@ def jobs(tmp_path):
     checkout = JobCheckout(tmp_path)
     checkout.prepare_source()
     checkout.prepare_runtime()
-    checkout.environment.update(RSS_PORT="8080", SYNTHETIC_SECRET="do-not-capture")
+    for name in tuple(checkout.environment):
+        if name.startswith("SYNTHETIC_"):
+            del checkout.environment[name]
+    checkout.environment.update(
+        RSS_PORT="8080", SYNTHETIC_SECONDS="0", SYNTHETIC_SECRET="do-not-capture"
+    )
     _tool(tmp_path / "launchctl", LAUNCHCTL)
     launcher = checkout.root / ".venv/bin/python"
     launcher.parent.mkdir(parents=True)
@@ -368,6 +378,30 @@ def test_native_jobs_refuse_pin_drift_but_owned_removal_remains_possible(jobs, d
     _success(jobs, "backup-disable")
     _success(jobs, "supervision-remove")
     assert not supervisor.exists() and not daily.exists()
+
+
+def test_backup_status_keeps_evidence_when_the_runtime_layout_drifts(jobs):
+    _restore_fixture(jobs, "source")
+    _success(jobs, "select-instance", "source")
+    _success(jobs, "backup-enable", "--hour", "4")
+    archive = _success(jobs, "backup-due")["backup"]
+    assert _success(jobs, "backup-status")["protected"] is True
+    (jobs.state / "runtime/unexpected").write_text("preserve layout drift")
+    damaged = _success(jobs, "backup-status")
+    assert damaged["latest_attempt"]["outcome"] == "success"
+    assert damaged["protected"] is False and damaged["scheduler_problem"]
+    _refused(jobs, "stop")
+
+    evidence = _success(jobs, "backup-status")
+    assert evidence["enabled"] is True
+    assert evidence["latest_attempt"]["outcome"] == "failed"
+    assert evidence["latest_success"]["sha256"] == archive["sha256"]
+    assert evidence["archive_available"] is True
+    assert evidence["protected"] is False
+    assert evidence["scheduler_problem"]
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stderr
+    assert json.loads(check.stdout) == evidence
 
 
 def test_supervision_reserves_bounded_retries_and_explicit_start_resets_budget(jobs):

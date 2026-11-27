@@ -8,6 +8,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -17,13 +18,7 @@ from typing import Any, Literal
 from rss_aggregator import native_service as service
 from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
-from rss_aggregator.recovery import (
-    INITIAL_INSTANCE,
-    SELECTION,
-    SHUTDOWN_SUCCESS,
-    Recovery,
-    instance_name,
-)
+from rss_aggregator.recovery import SHUTDOWN_SUCCESS, Recovery, selected_instance
 from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
@@ -81,15 +76,7 @@ class Runtime:
     @property
     def instance(self) -> str:
         """Read the explicit data selection or the initial default name."""
-        try:
-            selection = service.read(self.state_dir / SELECTION)
-            return instance_name(
-                selection["instance"] if selection is not None else INITIAL_INSTANCE
-            )
-        except (ValueError, KeyError, TypeError):
-            raise RuntimeFailure(
-                "Invalid native instance selection; inspect local ownership."
-            ) from None
+        return selected_instance(self.state_dir)
 
     @property
     def data_dir(self) -> Path:
@@ -188,6 +175,13 @@ class Runtime:
         """Refuse legacy, public, foreign, synced-default or network state."""
         if os.getuid() == 0:
             raise RuntimeFailure("Use a normal non-root user account for FreshRSS.")
+        if any(
+            os.path.lexists(parent / "native-owner.json")
+            for parent in self.state_dir.parents
+        ):
+            raise RuntimeFailure(
+                "RSS_STATE_DIR must not be inside an existing native state directory; select the state root or a separate directory."
+            )
         home = Path.home().resolve()
         synced = (home / "Library/CloudStorage", home / "Library/Mobile Documents")
         if any(self.state_dir.is_relative_to(directory) for directory in synced):
@@ -381,12 +375,35 @@ class Runtime:
                 ("config-user.custom.php", "config-user.custom.php"),
                 ("opml.xml", "public-feed.opml"),
             ):
-                path = self.data_dir / filename
-                if not os.path.lexists(path):
-                    with path.open("xb") as target:
-                        target.write((self.root / "config" / template).read_bytes())
+                self._seed(self.data_dir / filename, self.root / "config" / template)
 
-    def _php(self, *args: str) -> bytes:
+    @staticmethod
+    def _seed(path: Path, template: Path) -> None:
+        """Publish a complete private template without replacing any existing data."""
+        from rss_aggregator.archives import sync_directory
+        from rss_aggregator.recovery import _rename_exclusive
+
+        if os.path.lexists(path):
+            return
+        payload = template.read_bytes()
+        # Stage beside the data directory, so even an interrupted staging write
+        # cannot leave a partial file in the archive payload.
+        with tempfile.TemporaryDirectory(
+            dir=path.parent.parent, prefix=".seed-"
+        ) as staging:
+            source = Path(staging) / path.name
+            fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                _rename_exclusive(source, path)
+            except FileExistsError:
+                return
+            sync_directory(path.parent)
+
+    def _php(self, *args: str, timeout_seconds: int = 120) -> bytes:
         """Run bounded native PHP with a lease and never surface upstream output in errors."""
         binary = self.state_dir / "runtime/frankenphp"
         with service.lease(self.state_dir / "fetch.lock") as operation_lock:
@@ -394,21 +411,27 @@ class Runtime:
                 raise RuntimeFailure(
                     "A feed fetch is already in progress; retry after it completes."
                 )
-            result = subprocess.run(
-                [str(binary), "php-cli", *args],
-                cwd=self.state_dir / "runtime/FreshRSS",
-                env=service.environment(self.state_dir, self.data_dir),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-                check=False,
-                pass_fds=tuple(
-                    fd
-                    for fd in (self._command_lock_fd, operation_lock)
-                    if fd is not None
-                ),
-            )
+            try:
+                result = subprocess.run(
+                    [str(binary), "php-cli", *args],
+                    cwd=self.state_dir / "runtime/FreshRSS",
+                    env=service.environment(self.state_dir, self.data_dir),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_seconds,
+                    umask=0o077,
+                    check=False,
+                    pass_fds=tuple(
+                        fd
+                        for fd in (self._command_lock_fd, operation_lock)
+                        if fd is not None
+                    ),
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeFailure(
+                    f"FreshRSS PHP operation timed out after {timeout_seconds} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
+                ) from None
         if result.returncode:
             raise RuntimeFailure(
                 "FreshRSS PHP operation failed; inspect the instance locally (logs may contain secrets)."
@@ -493,20 +516,16 @@ class Runtime:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             if self._idle():
-                break
+                raise RuntimeFailure(
+                    "Native web service exited before loopback readiness; inspect the port and runtime pin."
+                )
             live = self._live()
-            if live and self._ready(plan):
-                break
+            if live and self._ready(plan) and not self._idle():
+                return plan
             time.sleep(0.2)
-        else:
-            raise RuntimeFailure(
-                "Owned PHP web service or scheduler did not become ready on loopback."
-            )
-        if self._idle() or not self._ready(plan):
-            raise RuntimeFailure(
-                "Native web service exited before loopback readiness; inspect the port and runtime pin."
-            )
-        return plan
+        raise RuntimeFailure(
+            "Owned PHP web service or scheduler did not become ready on loopback."
+        )
 
     def _check_web(self, plan: dict[str, Any], initialized: bool) -> dict[str, Any]:
         """Check fresh effective web settings, readiness and anonymous API refusal."""
@@ -581,6 +600,7 @@ class Runtime:
         private_https: bool | None = None,
         port_override: int | None = None,
         recheck: bool = False,
+        check_private_backend: bool = False,
     ) -> dict[str, Any]:
         """Start or recheck owned serving, failing closed before enabling private forwarding."""
         owner, _ = self._owned()
@@ -589,9 +609,12 @@ class Runtime:
         private = access.enabled() if private_https is None else private_https
         live = self._live()
         try:
-            origin = (
-                access.prepare(owner, port) if private else f"http://127.0.0.1:{port}"
-            )
+            if private:
+                origin = access.prepare(owner, port)
+            else:
+                if check_private_backend:
+                    access.check_backend(port)
+                origin = f"http://127.0.0.1:{port}"
         except PublicBackendExposed as error:
             if live is None or live[0].get("port") != port:
                 raise
@@ -642,6 +665,10 @@ class Runtime:
             if installed:
                 self._configure(origin)
                 fetch = self._actualize()
+            if check_private_backend and not private:
+                # Pre-start preparation/fetch may have taken a while. Recheck
+                # before opening the listener when there is no publication gate.
+                access.check_backend(port)
             plan = self._launch(port, origin, private)
             security = self._check_web(plan, installed)
             current, receipt = self._live() or ({}, {})
@@ -718,7 +745,7 @@ class Runtime:
 
     def _actualize(self) -> dict[str, Any]:
         """Run the upstream fetcher without bypassing TTL, backoff or cache."""
-        self._php("app/actualize_script.php")
+        self._php("app/actualize_script.php", timeout_seconds=600)
         return {"status": "completed"}
 
     def _fetch(self) -> dict[str, Any]:

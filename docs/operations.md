@@ -66,6 +66,11 @@ Once configured, FreshRSS performs an initial fetch on startup and requests feed
 fetching at UTC minutes **00, 20 and 40** while running. Sleep and missed slots are
 not a queued backlog. `fetch` requests immediate upstream fetching; TTL, publisher
 backoff and caches still apply. A completed run does not guarantee new articles.
+Startup (including a restart via `verify` or backup resumption) and manual
+`fetch` allow up to **10 minutes** for the complete foreground fetch. A timeout
+fails the operation without emitting upstream output; inspect logs and slow feeds
+locally. On a restart timeout, serving may remain stopped; check `status` and, if
+resuming a backup, `backup-status` before retrying.
 The scheduler and manual fetch serialize to avoid overlapping fetches. When the
 instance is stopped, neither the service nor its feed scheduler runs. Reader
 synchronization does not fetch feeds. Archiving policies can remove older articles;
@@ -75,10 +80,11 @@ check the user/category/feed settings before changing them.
 
 Export an explicit private `RSS_BACKUP_DIR` outside Git. `stop` records stopped
 intent, removes only owned forwarding, and proves web and fetch writers idle
-before checking the runtime layout and installed bytes for an archive. Missing
-previously provisioned data is a failure, not an empty install. The command
-preserves the runtime, data and archives. A failed shutdown export after quiescing leaves writers
-stopped; correct the cause and retry `stop`. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
+before reading the selected instance, backup attempt or runtime layout for an
+archive. Missing previously provisioned data or a lost explicit selection is a
+failure, not an empty install. The command preserves the runtime, data and
+archives. A failed shutdown export after quiescing leaves writers stopped;
+correct the cause and retry `stop`. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
 for resumption, daily checks and interrupted maintenance; a failed explicit
 `backup` has different resumption behavior. A local archive alone does not prove
 host-loss recovery.
@@ -316,6 +322,12 @@ Never share raw logs, URLs, tokens, database files or copied journals.
 - **Port/forwarding ownership:** inspect the port and route locally, including
   known proxy targets. Preserve unrelated software. Follow the reviewed port
   change and job recapture procedures rather than forcing a bind.
+- **Lost or unreadable selection:** `stop` still attempts to quiesce owned
+  resources but refuses a backup until the intended instance is known. Preserve
+  data and records, confirm which complete instance is intended, and run
+  `rss select-instance NAME` while idle with no maintenance hold. Retry `stop`
+  for a verified archive before restarting. Do not remove the selection guard
+  or use `default` as a substitute for a missing reader.
 - **Writer or backup hold:** confirm idle state via the supported
   [reconciliation](backup-restore.md#interrupted-maintenance-and-reconciliation).
   Do not unlink lock files, clear holds or kill unidentified processes.

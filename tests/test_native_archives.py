@@ -431,13 +431,14 @@ def test_shutdown_backups_use_installed_pin_even_after_checkout_pin_change(insta
 
 
 @contextmanager
-def controlled_writers(state, port=8080):
+def controlled_writers(state, port=8080, *, private=False):
     # Hold the real filesystem leases until stop is requested; never run web/PHP.
     for filename, value in {
         "service.json": {
             "nonce": "synthetic",
             "url": f"http://127.0.0.1:{port}",
             "port": port,
+            "private": private,
         },
         "service-status.json": {"nonce": "synthetic", "web": "started"},
     }.items():
@@ -509,6 +510,67 @@ def test_shutdown_quiesces_writers_and_forwarding_before_attesting_runtime_layou
     assert drift.read_text() == "preserve layout drift"
 
 
+@pytest.mark.parametrize("damage", ["bad-attempt", "bad-selection", "lost-selection"])
+@pytest.mark.parametrize("older_default", [False, True])
+def test_stop_closes_owned_service_before_checking_backup_bookkeeping(
+    installed, monkeypatch, damage, older_default
+):
+    cli, state, backups = installed
+    # When there is older default data, it must not become a substitute source.
+    if older_default:
+        backups.mkdir(mode=0o700)
+        (state / "service").symlink_to(backups, target_is_directory=True)
+        failure = cli.invoke(main, ["start"])
+        assert "Native service configuration is not private and owned" in failure.stderr
+        (state / "service").unlink()
+    archive = legacy_archive(backups.parent / "legacy.zip")
+    run(cli, "import-legacy", str(archive), "--instance", "source")
+    run(cli, "select-instance", "source")
+    baseline = run(cli, "backup")
+    api = owned_forwarding(state, monkeypatch)
+    path = state / (
+        "backup-attempt.json" if damage == "bad-attempt" else "selected-instance.json"
+    )
+    if damage == "lost-selection":
+        path.unlink()
+    else:
+        path.write_text("{")
+
+    with controlled_writers(state, PORT, private=True) as observed_stop:
+        stopped = cli.invoke(main, ["stop"])
+        assert observed_stop.is_set(), stopped.output
+    assert stopped.exit_code == 1, stopped.output
+    assert "writers remain stopped" in stopped.stderr
+    assert api.config == route(target="http://127.0.0.1:8001")
+    assert list(backups.glob("*.zip")) == [Path(baseline["archive"])]
+    if damage == "lost-selection":
+        retry = cli.invoke(main, ["start"])
+        assert retry.exit_code == 1, retry.output
+        assert "Instance selection is missing" in retry.stderr
+        assert (state / "instances/default").exists() is older_default
+        assert run(cli, "select-instance", "source")["selected"] is True
+        assert run(cli, "stop")["backup"]["verified"] is True
+    elif damage == "bad-attempt":
+        assert path.read_text() == "{"
+    else:
+        assert run(cli, "backup-status")["latest_attempt"]["outcome"] == "failed"
+
+
+def test_state_selector_cannot_write_inside_an_installed_release(
+    installed, monkeypatch
+):
+    cli, state, _backups = installed
+    for redirected in (state / "runtime", state / "runtime/FreshRSS/typo"):
+        with monkeypatch.context() as env:
+            env.setenv("RSS_STATE_DIR", str(redirected))
+            failure = cli.invoke(main, ["status"])
+        assert failure.exit_code == 1, failure.output
+        assert "inside an existing native state directory" in failure.stderr
+        assert not (redirected / "command.lock").exists()
+    assert not (state / "runtime/FreshRSS/typo").exists()
+    assert run(cli, "status")["runtime"] == "installed"
+
+
 @pytest.mark.parametrize(
     ("withdrawn", "diagnostic"),
     [
@@ -539,7 +601,7 @@ def test_backup_only_attempts_private_restart_if_it_withdrew_forwarding(
     unrelated.mkdir()
     (state / "service").symlink_to(unrelated, target_is_directory=True)
 
-    with controlled_writers(state, PORT) as observed_stop:
+    with controlled_writers(state, PORT, private=True) as observed_stop:
         result = cli.invoke(main, ["backup"])
         assert observed_stop.is_set(), result.output
 
@@ -547,6 +609,32 @@ def test_backup_only_attempts_private_restart_if_it_withdrew_forwarding(
     assert diagnostic in result.stderr
     assert api.config == unrelated_forwarding
     assert run(cli, "backup-status")["latest_success"]["verified"] is True
+
+
+def test_backup_does_not_reopen_a_previously_private_backend_on_public_exposure(
+    installed, monkeypatch
+):
+    cli, state, backups = installed
+    archive = legacy_archive(backups.parent / "legacy.zip")
+    run(cli, "import-legacy", str(archive), "--instance", "source")
+    run(cli, "select-instance", "source")
+    api = owned_forwarding(state, monkeypatch)
+    # The fake LocalAPI snapshot loses our route but reports public forwarding
+    # to the backend on another port. No real forwarding configuration is used.
+    foreign_route = route(funnel=True)
+    api.before_get = lambda: setattr(api, "config", foreign_route)
+    with controlled_writers(state, PORT, private=True) as observed_stop:
+        failure = cli.invoke(main, ["backup"])
+        assert observed_stop.is_set()
+    assert failure.exit_code == 1, failure.output
+    assert "Existing Funnel reaches this FreshRSS backend" in failure.stderr
+    assert not (state / "service").exists()
+    assert api.config == foreign_route
+    assert not api.posts
+    assert run(cli, "status")["application"] == "stopped"
+    report = run(cli, "backup-status")
+    assert report["latest_success"]["verified"] is True
+    assert report["resumption"] == "failed"
 
 
 def test_backup_remains_verified_when_startup_after_capture_fails(

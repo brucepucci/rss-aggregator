@@ -140,7 +140,7 @@ class NativeJob:
                 "Native job ledger must be a private user-owned regular file."
             )
         record = json.loads(path.read_text())
-        owner, _installed = self.runtime._owned(require_current=False, verify=False)
+        owner, _installed = self.runtime._ownership_receipt()
         if (
             not isinstance(record, dict)
             or record.get("version") != JOB_VERSION
@@ -374,6 +374,7 @@ class Supervision:
         try:
             self._check_job(record)
             self.job.check(record)
+            self.runtime._owned(require_current=False, verify=False)
             session = self.job.launch(record, "print", self.job.domain)
             if session.returncode:
                 return {

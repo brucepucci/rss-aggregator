@@ -10,6 +10,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -41,18 +42,22 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def web_check(port: int, path: str, *, host: str | None = None) -> tuple[int, bytes]:
-    """Read a bounded loopback response without ambient proxy settings."""
+    """Read a bounded loopback response without ambient proxy settings.
+
+    Report transport loss as an unsuccessful probe so startup can retry it.
+    """
     opener = build_opener(ProxyHandler({}), _NoRedirect())
     request = Request(
         f"http://127.0.0.1:{port}{path}", headers={"Host": host} if host else {}
     )
     try:
-        with opener.open(request, timeout=2) as response:
+        try:
+            response = opener.open(request, timeout=2)
+        except HTTPError as error:
+            response = error
+        with response:
             return response.status, response.read(128 * 1024)
-    except HTTPError as error:
-        with error:
-            return error.code, error.read(128 * 1024)
-    except (URLError, TimeoutError):
+    except (URLError, TimeoutError, RemoteDisconnected, ConnectionResetError):
         return 0, b""
 
 

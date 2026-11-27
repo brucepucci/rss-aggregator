@@ -127,6 +127,11 @@ class PrivateAccess:
             )
         return "https://" + host
 
+    def check_backend(self, port: int) -> None:
+        """Refuse known public forwarding without requiring or modifying Serve ownership."""
+        config, _etag = self._config_client().read()
+        self._check_public_backend(config, port)
+
     def _check_public_backend(self, config: dict[str, Any], port: int) -> None:
         """Refuse any enabled Funnel reaching this backend, regardless of port.
 
@@ -198,7 +203,7 @@ class PrivateAccess:
                     raise PublicBackendExposed(
                         "Existing Funnel reaches this FreshRSS backend; preserve the "
                         "foreign route and resolve public exposure locally before "
-                        "private start. No forwarding was changed."
+                        "starting it. No forwarding was changed."
                     )
 
     def _scope(self, config: dict[str, Any]) -> dict[str, Any]:

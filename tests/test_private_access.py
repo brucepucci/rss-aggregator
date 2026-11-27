@@ -5,11 +5,13 @@ import fcntl
 import io
 import json
 import os
+import platform
 import shutil
 import socket
+import stat
 import subprocess
 from functools import partial
-from http.client import BadStatusLine
+from http.client import BadStatusLine, RemoteDisconnected
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import URLError
@@ -422,6 +424,9 @@ def test_stop_refuses_changed_ownership_without_touching_foreign_route(
         else "not exclusively project-owned"
     )
     refused(native.run(["stop"]), diagnostic, PRIVATE_FEED)
+    evidence = result_json(native.run(["backup-status"]))
+    assert evidence["maintenance_required"] is True
+    assert evidence["protected"] is False
     assert native.api.config == before
     assert not native.api.posts
     assert json.loads(native.record.read_text()) == record
@@ -767,6 +772,7 @@ def test_private_preflight_conflict_does_not_stop_existing_backend(
 def controlled_web(native, monkeypatch):
     """Substitute only the listener, controller process and external PHP/HTTP."""
     handles = []
+    elapsed = 0.0
     native.data = native.state / "instances/default/data"
     native.web_auth = True
     native.launches = 0
@@ -799,23 +805,26 @@ def controlled_web(native, monkeypatch):
         native.launches += 1
         return object()
 
-    def settle(_seconds):
+    def settle(seconds):
+        nonlocal elapsed
+        elapsed += seconds
         plan = json.loads((native.state / "service.json").read_text())
-        stop = json.loads((native.state / "stop-service.json").read_text())
-        assert stop["nonce"] == plan["nonce"]
-        while handles:
-            os.close(handles.pop())
+        stop = native.state / "stop-service.json"
+        if stop.is_file() and json.loads(stop.read_text())["nonce"] == plan["nonce"]:
+            while handles:
+                os.close(handles.pop())
 
-    def web(port, path, *, host=None):
-        assert port == PORT and handles
+    def web(_handler, request):
+        path = request.selector
+        assert request.full_url == BACKEND + path and handles
         plan = json.loads((native.state / "service.json").read_text())
         if path in ("/__rss_ready", "/__rss_probe.php"):
-            assert host == "rss-" + plan["nonce"] + ".invalid"
+            assert request.get_header("Host") == "rss-" + plan["nonce"] + ".invalid"
         if path == "/__rss_ready":
-            return 200, plan["nonce"].encode()
+            return http_response(request, plan["nonce"].encode())
         if path == "/__rss_probe.php":
             assert (native.state / "service/__rss_probe.php").is_file()
-            return 200, json.dumps(
+            body = json.dumps(
                 {
                     "sapi": "frankenphp",
                     "php": native.manifest["runtime"]["php"],
@@ -828,10 +837,11 @@ def controlled_web(native, monkeypatch):
                     "authenticated_settings": native.web_auth,
                 }
             ).encode()
+            return http_response(request, body)
         if path == "/i/":
-            return 200, b""
+            return http_response(request, b"")
         assert path == "/api/greader.php/reader/api/0/subscription/list"
-        return 403, b""
+        return http_response(request, b"", 403)
 
     class Listener:
         def __enter__(self):
@@ -849,8 +859,11 @@ def controlled_web(native, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setattr(socket, "socket", Listener)
-    monkeypatch.setattr("rss_aggregator.runtime.time.sleep", settle)
-    monkeypatch.setattr("rss_aggregator.native_service.web_check", web)
+    monkeypatch.setattr(
+        "rss_aggregator.runtime.time",
+        SimpleNamespace(monotonic=lambda: elapsed, sleep=settle),
+    )
+    monkeypatch.setattr(HTTPHandler, "http_open", web)
     yield native
     while handles:
         os.close(handles.pop())
@@ -864,6 +877,113 @@ def initialized_web(native):
 def result_json(result):
     assert result.exit_code == 0, result.output
     return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("disconnect", [RemoteDisconnected, ConnectionResetError])
+@pytest.mark.parametrize("persistent", [False, True], ids=["recovers", "persistent"])
+def test_start_retries_loopback_readiness_disconnect(
+    controlled_web, monkeypatch, disconnect, persistent
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    ready = HTTPHandler.http_open
+    probes = 0
+
+    def web(handler, request):
+        nonlocal probes
+        if request.selector == "/__rss_ready":
+            probes += 1
+            if persistent or probes == 1:
+                raise disconnect("synthetic readiness disconnect")
+        return ready(handler, request)
+
+    monkeypatch.setattr(HTTPHandler, "http_open", web)
+    result = native.run(["start"])
+    if persistent:
+        refused(result, "did not become ready on loopback")
+        assert result_json(native.run(["status"]))["application"] == "stopped"
+        assert not (native.state / "security.json").exists()
+    else:
+        assert result_json(result)["application"] == "running"
+        assert result_json(native.run(["status"]))["http_ready"] is True
+    assert probes > 1
+    assert native.launches == 1
+    assert not native.api.posts
+
+
+def test_start_seeds_complete_private_templates_and_retries_failed_seed(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    config = native.access.runtime.root / "config"
+    original_read = Path.read_bytes
+
+    def missing_source(path):
+        if path == config / "public-feed.opml":
+            raise FileNotFoundError("Synthetic inaccessible source template")
+        return original_read(path)
+
+    previous = os.umask(0o002)
+    try:
+        with monkeypatch.context() as io:
+            io.setattr(Path, "read_bytes", missing_source)
+            failure = native.run(["start"])
+        assert failure.exit_code == 1, failure.output
+        assert "Synthetic inaccessible source template" in failure.stderr
+        assert not (native.data / "opml.xml").exists()
+        result_json(native.run(["start"]))
+        for name, template in (
+            ("config-user.custom.php", "config-user.custom.php"),
+            ("opml.xml", "public-feed.opml"),
+        ):
+            data = native.data / name
+            assert data.read_bytes() == (config / template).read_bytes()
+            assert stat.S_IMODE(data.stat().st_mode) == 0o600
+        assert result_json(native.run(["stop"]))["backup"]["verified"] is True
+    finally:
+        os.umask(previous)
+
+
+def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_recorded(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    initialized_web(native)
+    for path in (native.data / "config.php", native.data / "applied_migrations.txt"):
+        path.chmod(0o600)
+    result_json(native.run(["start"]))
+    run = subprocess.run
+
+    def timed_run(args, **kwargs):
+        if args[:1] == [str(native.state / "runtime/frankenphp")]:
+            assert kwargs["umask"] == 0o077
+            if args[2] == "app/actualize_script.php":
+                assert kwargs["timeout"] == 600
+                raise subprocess.TimeoutExpired(
+                    ["synthetic-secret-arg"],
+                    kwargs["timeout"],
+                    b"synthetic-secret-output",
+                )
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", timed_run)
+    refused(native.run(["fetch"]), "timed out", "synthetic-secret")
+    assert result_json(native.run(["status"]))["http_ready"] is True
+    refused(native.run(["verify"]), "timed out", "synthetic-secret")
+    assert result_json(native.run(["status"]))["application"] == "stopped"
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result_json(native.run(["start"]))
+    monkeypatch.setattr(subprocess, "run", timed_run)
+    refused(native.run(["backup"]), "timed out", "synthetic-secret")
+    status = result_json(native.run(["backup-status"]))
+    assert status["latest_attempt"]["outcome"] == "failed"
+    assert status["resumption"] == "failed"
+    assert status["latest_success"]["verified"] is True
+    assert result_json(native.run(["status"]))["application"] == "stopped"
 
 
 def test_repeat_start_observes_installer_completion(controlled_web, monkeypatch):
@@ -930,6 +1050,10 @@ def test_upgrade_rejects_archive_from_before_last_running_session(
     native = controlled_web
     destination = Path(os.environ["RSS_BACKUP_DIR"])
     monkeypatch.setenv("RSS_TAILSCALE", "0")
+    # The disposable setup child already uses this platform; upgrade runs here.
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(platform, "mac_ver", lambda: ("14.0.0", ("", "", ""), "arm64"))
     result_json(native.run(["start"]))
     initialized_web(native)
     old_archive = Path(result_json(native.run(["stop"]))["backup"]["archive"])

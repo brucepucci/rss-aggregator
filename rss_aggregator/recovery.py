@@ -35,6 +35,7 @@ SELECTION = "selected-instance.json"
 INITIAL_INSTANCE = "default"
 INSTANCE_RECORD = "instance.json"
 _INITIAL_PROVISIONED = "default-provisioned.json"
+_SELECTION_REQUIRED = "selection-required.json"
 _WRITER_GENERATION = "writer-generation.json"
 _DATA_IDENTITY = ("freshrss_version", "freshrss_sha256", "platform")
 
@@ -48,6 +49,26 @@ def instance_name(value: str) -> str:
             "Instance must be 1–48 lowercase letters, digits or hyphens, starting with a letter or digit."
         )
     return value
+
+
+def selected_instance(state: Path) -> str:
+    """Read explicit selection, failing closed once a selection was attempted."""
+    from rss_aggregator.runtime import RuntimeFailure
+
+    path = state / SELECTION
+    try:
+        selection = native_service.read(path)
+        if selection is not None or os.path.lexists(path):
+            return instance_name(selection["instance"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise RuntimeFailure(
+            "Invalid native instance selection; inspect locally and explicitly select the intended instance."
+        ) from None
+    if os.path.lexists(state / _SELECTION_REQUIRED):
+        raise RuntimeFailure(
+            "Instance selection is missing; inspect locally and explicitly select the intended instance."
+        )
+    return INITIAL_INSTANCE
 
 
 def _contains(directory: Path, location: Path) -> bool:
@@ -395,12 +416,6 @@ class Recovery:
             runtime._save(SHUTDOWN_SUCCESS, evidence)
         return result
 
-    def _maintenance_notice(self) -> None:
-        """Tell operators when a durable hold still needs reconciliation."""
-        self.runtime._diagnostic(
-            "Backup maintenance remains unresolved; run rss backup-status and rss backup-reconcile. Archive success and resumption are separate."
-        )
-
     def backup(self) -> dict[str, Any]:
         """Back up complete data and resume only previously running, allowed web."""
         self._require_lock()
@@ -419,10 +434,20 @@ class Recovery:
             )
         was_running = status["application"] == "running"
         port = status.get("port") if was_running else None
-        if was_running and (type(port) is not int or not 1024 <= port <= 65535):
-            raise self.failure(
-                "Cannot confirm the active FreshRSS port; backup refused."
-            )
+        was_private = False
+        if was_running:
+            live = runtime._live()
+            if (
+                live is None
+                or type(port) is not int
+                or not 1024 <= port <= 65535
+                or live[0].get("port") != port
+                or type(live[0].get("private")) is not bool
+            ):
+                raise self.failure(
+                    "Cannot confirm the active FreshRSS backend or its access mode; backup refused."
+                )
+            was_private = live[0]["private"]
         maintenance = BackupSchedule(runtime)
         maintenance.begin(owner, "backup")
         settled = False
@@ -448,62 +473,47 @@ class Recovery:
                         )
                     if was_running and maintenance.may_resume():
                         maintenance.phase("resuming")
-                        runtime._start(private_https=withdrawn, port_override=port)
+                        runtime._start(
+                            private_https=withdrawn,
+                            port_override=port,
+                            check_private_backend=was_private and not withdrawn,
+                        )
                     maintenance.finish()
             finally:
                 if maintenance.pending():
-                    self._maintenance_notice()
+                    maintenance.notice()
 
-    def shutdown(self) -> dict[str, Any]:
-        """Stop owned writers and archive data without ever reopening the service."""
+    def capture_shutdown(self, *, already_stopped: bool) -> dict[str, Any]:
+        """Capture the shutdown archive after explicit stop proved writers idle."""
         self._require_lock()
         runtime = self.runtime
-        # Closing writers depends on the ownership receipt, not on an intact
-        # runtime layout or a matching checkout. Attest installed bytes only after stop.
+        if not runtime._idle():
+            raise self.failure("FreshRSS writers are still running; snapshot refused.")
         owner, installed = runtime._ownership_receipt()
-        maintenance = BackupSchedule(runtime)
-        already_stopped = runtime._idle()
-        maintenance.begin(owner, "stop")
-        try:
-            maintenance.phase("quiescing")
-            self._quiesce(owner)
-            maintenance.phase("snapshot")
-            try:
-                instance = runtime.instance
-                data = self._data(instance, owner, installed)
-                if data is None:
-                    if not self._initial_absent(instance):
-                        raise self.failure("Selected instance data are absent.")
-                    backup = {"status": "no_data"}
-                else:
-                    self._remember_default(instance)
-                    if runtime._owned(require_current=False) != (owner, installed):
-                        raise self.failure(
-                            "Installed runtime identity changed during shutdown."
-                        )
-                    backup = self._snapshot(
-                        data, self._directory(), instance, installed, via="stop"
-                    )
-            except (self.failure, OSError, ValueError, KeyError, TypeError) as error:
-                if runtime._idle():
-                    maintenance.finish()
+        instance = runtime.instance
+        data = self._data(instance, owner, installed)
+        if data is None:
+            if not self._initial_absent(instance):
+                raise self.failure("Selected instance data are absent.")
+            backup = {"status": "no_data"}
+        else:
+            self._remember_default(instance)
+            if runtime._owned(require_current=False) != (owner, installed):
                 raise self.failure(
-                    "Shutdown backup failed; application writers remain stopped. "
-                    "Fix the backup configuration and retry rss stop. " + str(error)
-                ) from error
-            if not runtime._idle():
-                raise self.failure(
-                    "Cannot confirm writers are stopped; reconcile maintenance."
+                    "Installed runtime identity changed during shutdown."
                 )
-            maintenance.finish()
-            return {
-                "application": "stopped",
-                "already_stopped": already_stopped,
-                "backup": backup,
-            }
-        finally:
-            if maintenance.pending():
-                self._maintenance_notice()
+            backup = self._snapshot(
+                data, self._directory(), instance, installed, via="stop"
+            )
+        if not runtime._idle():
+            raise self.failure(
+                "Cannot confirm writers are stopped; reconcile maintenance."
+            )
+        return {
+            "application": "stopped",
+            "already_stopped": already_stopped,
+            "backup": backup,
+        }
 
     def _restore(self, archive: Path, instance: str, *, legacy: bool) -> dict[str, Any]:
         """Validate one format and publish a fresh owned instance without selection."""
@@ -574,6 +584,11 @@ class Recovery:
         if self._data(instance, owner, runtime._identity()) is None:
             raise self.failure("Instance is absent; select a complete owned instance.")
         self._remember_default(instance)
+        # Write the independent guard first: an interrupted first selection
+        # requires explicit repair, never implicit activation of the default.
+        marker = runtime.state_dir / _SELECTION_REQUIRED
+        if not os.path.lexists(marker):
+            runtime._save(_SELECTION_REQUIRED, {"version": 1})
         runtime._save(SELECTION, {"instance": instance})
         return {
             "instance": instance,

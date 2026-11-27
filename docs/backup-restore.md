@@ -80,14 +80,19 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
 - Explicit `backup` preserves persisted intent and attempts to resume a previously
   running backend after a snapshot, including a failed snapshot when safe. It
   only republishes forwarding that it confirmed withdrawing; if the route already
-  disappeared, it resumes on loopback only. It never resumes intentional stop.
+  disappeared, it can resume on loopback only after rechecking that no Funnel
+  reaches the port of the previously private service. If safety cannot be
+  confirmed, writers stay stopped and the foreign route is preserved. It never
+  resumes intentional stop.
   A preflight refusal can leave existing serving state untouched. A resumption
   failure can leave a verified archive with the app stopped; check both results
   before retrying.
-- Normal `stop` sets stopped intent, quiesces and verifies a complete archive when
-  data exist. Snapshot failure **after** quiescing leaves writers stopped. Fix the
-  backup destination, permissions or space and retry `stop`; a preflight or
-  uncertain shutdown is not proof that writers or forwarding are stopped.
+- Normal `stop` sets stopped intent and quiesces before reading selection or
+  backup bookkeeping. It verifies a complete archive when selected data exist.
+  An archive failure **after** quiescing leaves writers stopped. Fix the reported
+  cause and retry `stop`; for selection loss see [operations](operations.md#common-troubleshooting).
+  Preserve an unreadable backup record and prior archives for local inspection.
+  A preflight or uncertain shutdown is not proof that writers or forwarding are stopped.
 - After failure inspect `status`, `backup-status`, stderr and private records.
   Never discard a good archive, promote `.rss-export-*`/`.rss-backup-*` remnants,
   or remove locks or maintenance records to force a retry. Hidden remnants may
@@ -159,7 +164,9 @@ retained but does not count.
 true. Ordinary `backup-status` is inspection, not an assurance of protection.
 Check registration, `scheduler_problem`, due/missed/deferred work, latest attempt
 and verified publication, archive availability, age/overdue, `resumption` and
-`maintenance_required`. Daily protection needs successful eligible daily work for
+`maintenance_required`. A damaged runtime layout does not erase readable archive
+or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
+and protection is false. Daily protection needs successful eligible daily work for
 the current registration and selected instance, availability of **that scheduled
 archive**, and no unresolved failure/hold. `archive_available` and `latest_success`
 can instead describe a newer manual or shutdown archive; neither can mask a

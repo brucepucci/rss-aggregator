@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from rss_aggregator import native_service
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.supervision import MAINTENANCE, NativeJob, Supervision
 
@@ -41,10 +42,7 @@ class BackupSchedule:
 
     def _read(self, name: str) -> Any:
         """Read private managed state without treating malformed state as absence."""
-        path = self.runtime.state_dir / name
-        if path.is_symlink():
-            raise ValueError("Refusing symlinked backup or maintenance state.")
-        return json.loads(path.read_text()) if path.exists() else None
+        return native_service.read(self.runtime.state_dir / name)
 
     def backup(self) -> dict[str, Any]:
         """Record an explicit backup's outcome separately from verified publication."""
@@ -53,28 +51,73 @@ class BackupSchedule:
         return self._attempt(Recovery(self.runtime).backup, "backup")
 
     def shutdown(self) -> dict[str, Any]:
-        """Record normal-stop backup outcomes without changing its failure semantics."""
+        """Quiesce from ownership evidence before reading any archive bookkeeping."""
         from rss_aggregator.recovery import Recovery
+        from rss_aggregator.runtime import RuntimeFailure
 
-        return self._attempt(Recovery(self.runtime).shutdown, "stop")
+        runtime = self.runtime
+        recovery = Recovery(runtime)
+        owner, _installed = runtime._ownership_receipt()
+        already_stopped = runtime._idle()
+        settled = False
+        try:
+            try:
+                self.begin(owner, "stop")
+                self.phase("quiescing")
+            finally:
+                # Stopped intent is already durable. A bookkeeping write
+                # failure must not prevent closing the owned service.
+                runtime._quiesce()
+            try:
+                self.phase("snapshot")
+                # Preserve unreadable evidence rather than overwriting it.
+                previous = self._read(ATTEMPT)
+                if not isinstance(previous, dict) and (
+                    previous is not None or os.path.lexists(runtime.state_dir / ATTEMPT)
+                ):
+                    raise ValueError(
+                        "Invalid backup attempt record; preserve it and inspect locally."
+                    )
+                result = self._attempt(
+                    lambda: recovery.capture_shutdown(already_stopped=already_stopped),
+                    "stop",
+                )
+                settled = True
+                return result
+            except (RuntimeFailure, OSError, ValueError, KeyError, TypeError) as error:
+                if not runtime._idle():
+                    raise
+                settled = True
+                raise RuntimeFailure(
+                    "Shutdown backup failed; application writers remain stopped. "
+                    "Fix the backup problem and retry rss stop. " + str(error)
+                ) from error
+        finally:
+            try:
+                if settled and runtime._idle():
+                    self.finish()
+            finally:
+                if self.pending():
+                    self.notice()
 
     def _attempt(
         self, operation: Callable[[], dict[str, Any]], kind: str
     ) -> dict[str, Any]:
-        """Keep effective capture evidence; an idempotent stop is not a new capture."""
-        previous = self._read(ATTEMPT) if kind == "stop" else None
+        """Keep capture and resumption evidence even if selection is unreadable."""
         attempt = {
             "started_at": self.now.isoformat(),
             "outcome": "running",
             "kind": kind,
-            "instance": self.runtime.instance,
+            "instance": None,
         }
-        self.runtime._save(ATTEMPT, attempt)
         try:
+            attempt["instance"] = self.runtime.instance
+            self.runtime._save(ATTEMPT, attempt)
             result = operation()
         except Exception:
-            resumption = "unresolved" if self.pending() else "preserved"
-            if self.pending():
+            resumption = "preserved"
+            if kind == "backup" and self.pending():
+                resumption = "unresolved"
                 try:
                     marker = self._read(MAINTENANCE)
                     if isinstance(marker, dict) and marker.get("phase") == "resuming":
@@ -93,14 +136,6 @@ class BackupSchedule:
             )
             raise
         archive = result if kind == "backup" else result["backup"]
-        if (
-            kind == "stop"
-            and archive.get("status") == "already_stopped"
-            and previous is not None
-        ):
-            # Retain failures too: a no-op cannot repair a failed capture/resumption.
-            self.runtime._save(ATTEMPT, previous)
-            return result
         if self.controlled_clock and archive.get("verified"):
             # Recovery owns publication evidence. Only align the clock for this
             # exact success under an explicitly injected Runtime clock.
@@ -184,6 +219,7 @@ class BackupSchedule:
             raise ValueError("Daily UTC hour/minute must be 0–23 and 0–59.")
         directory = Recovery(self.runtime)._directory()
         owner, _installed = self.runtime._owned()
+        selected = self.runtime.instance
         info = self.runtime.state_dir.stat()
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise RuntimeFailure(
@@ -258,7 +294,9 @@ class BackupSchedule:
             "enabled": True,
             "job": str(self.job),
             "daily_utc": f"{hour:02}:{minute:02}",
-            "next_expected_attempt": self._next(config, self._read(DAILY)).isoformat(),
+            "next_expected_attempt": self._next(
+                config, self._read(DAILY), selected
+            ).isoformat(),
         }
 
     def disable(self) -> dict[str, Any]:
@@ -323,35 +361,42 @@ class BackupSchedule:
         )
 
     def _same_registration(
-        self, daily: dict[str, Any] | None, config: dict[str, Any]
+        self, daily: dict[str, Any] | None, config: dict[str, Any], selected: str | None
     ) -> bool:
         """Bind daily evidence to one successful registration and selected instance."""
         return bool(
             daily
+            and selected is not None
             and config["active"]
             and config.get("registration_id")
             and daily.get("registration_id") == config["registration_id"]
             and daily.get("policy_id") == config["policy_id"]
-            and daily.get("instance") == self.runtime.instance
+            and daily.get("instance") == selected
         )
 
     def _same_target(
-        self, daily: dict[str, Any] | None, config: dict[str, Any], slot: datetime
+        self,
+        daily: dict[str, Any] | None,
+        config: dict[str, Any],
+        slot: datetime,
+        selected: str | None,
     ) -> bool:
         """Apply the current attempt budget only to this registration's elapsed slot."""
         return bool(
             daily
             and daily.get("slot") == slot.isoformat()
-            and self._same_registration(daily, config)
+            and self._same_registration(daily, config, selected)
         )
 
-    def _next(self, config: dict[str, Any], daily: dict[str, Any] | None) -> datetime:
+    def _next(
+        self, config: dict[str, Any], daily: dict[str, Any] | None, selected: str
+    ) -> datetime:
         """Describe the earliest daily/retry target (wakeup may lag 15 minutes)."""
         slot = self._slot(config)
         following = slot + timedelta(days=1)
         if not self._eligible(config, slot):
             return following
-        if self._same_target(daily, config, slot):
+        if self._same_target(daily, config, slot, selected):
             if daily.get("outcome") == "success" or daily["count"] >= MAX_ATTEMPTS:
                 return following
             return min(
@@ -416,6 +461,8 @@ class BackupSchedule:
                     "Backup runtime settings differ from captured configuration."
                 )
             self._job.check(config)
+            self.runtime._owned(require_current=False, verify=False)
+            selected = self.runtime.instance
         except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
             self.runtime._save(
                 ATTEMPT,
@@ -432,8 +479,8 @@ class BackupSchedule:
             ) from None
         slot = self._slot(config)
         daily = self._read(DAILY)
-        same_target = self._same_target(daily, config, slot)
-        next_attempt = self._next(config, daily)
+        same_target = self._same_target(daily, config, slot, selected)
+        next_attempt = self._next(config, daily, selected)
         if self.now < next_attempt:
             return {
                 "outcome": "not_due",
@@ -444,7 +491,7 @@ class BackupSchedule:
             "count": daily["count"] + 1 if same_target else 1,
             "attempted_at": self.now.isoformat(),
             "outcome": "running",
-            "instance": self.runtime.instance,
+            "instance": selected,
             "policy_id": config["policy_id"],
             "registration_id": config["registration_id"],
         }
@@ -501,6 +548,12 @@ class BackupSchedule:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    def notice(self) -> None:
+        """Point operators to the supported inspection and reconciliation path."""
+        self.runtime._diagnostic(
+            "Backup maintenance remains unresolved; run rss backup-status and rss backup-reconcile. Archive success and resumption are separate."
+        )
 
     def may_resume(self) -> bool:
         """Honor stopped intent; absence preserves observed state without enabling intent."""
@@ -560,7 +613,20 @@ class BackupSchedule:
         """Report evidence and freshness; configuration alone never proves protection."""
         from rss_aggregator.runtime import RuntimeFailure
 
-        schedule = self._config()
+        problem = None
+        try:
+            schedule = self._config()
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            schedule = None
+            problem = (
+                "Backup schedule ledger is unavailable or invalid; inspect locally."
+            )
+        selected = None
+        if schedule:
+            try:
+                selected = self.runtime.instance
+            except RuntimeFailure:
+                problem = "Selected instance is unavailable; inspect and explicitly reselect it."
         attempt = self._read(ATTEMPT)
         success = self._read(SUCCESS)
         age = (
@@ -585,7 +651,7 @@ class BackupSchedule:
         daily = self._read(DAILY)
         slot = self._slot(schedule) if schedule else None
         same_target = bool(
-            schedule and slot and self._same_target(daily, schedule, slot)
+            schedule and slot and self._same_target(daily, schedule, slot, selected)
         )
         daily_due = bool(
             slot
@@ -600,7 +666,7 @@ class BackupSchedule:
         daily_archive = (
             Path(daily["archive"])
             if schedule
-            and self._same_registration(daily, schedule)
+            and self._same_registration(daily, schedule, selected)
             and daily.get("outcome") == "success"
             and daily.get("archive")
             and daily.get("sha256")
@@ -618,7 +684,6 @@ class BackupSchedule:
             <= 26 * 3600
         )
         registered = False
-        problem = None
         if schedule:
             try:
                 registered = self._job_matches(schedule) and self._job.loaded(schedule)
@@ -627,8 +692,9 @@ class BackupSchedule:
                     problem = "Backup job missing, changed or not registered; inspect/re-enable the owned schedule explicitly."
                 elif not schedule.get("registration_id"):
                     problem = "Backup registration lacks activation evidence; run rss backup-enable with the captured settings."
+                self.runtime._owned(require_current=False, verify=False)
             except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
-                problem = "Backup scheduler unavailable/conflicting; inspect job, launcher, native manifest and captured dependencies locally."
+                problem = "Backup scheduler unavailable/conflicting; inspect runtime, job, launcher, native manifest and captured dependencies locally."
         return {
             "enabled": bool(schedule and schedule["active"]),
             "registered": registered,
@@ -636,8 +702,8 @@ class BackupSchedule:
             "registration_id": schedule.get("registration_id") if schedule else None,
             "busy": busy,
             "scheduler_problem": problem,
-            "next_expected_attempt": self._next(schedule, daily).isoformat()
-            if schedule and schedule.get("registration_id")
+            "next_expected_attempt": self._next(schedule, daily, selected).isoformat()
+            if schedule and selected is not None and schedule.get("registration_id")
             else None,
             "daily_attempt": daily,
             "daily_archive_available": daily_archive_available,
@@ -665,6 +731,6 @@ class BackupSchedule:
                 and not maintenance
                 and attempt
                 and attempt["outcome"] == "success"
-                and attempt.get("instance") == self.runtime.instance
+                and attempt.get("instance") == selected
             ),
         }

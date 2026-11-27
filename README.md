@@ -120,7 +120,7 @@ Export settings in the shell that runs the CLI; `.env` is not automatically read
 | --- | --- |
 | `RSS_STATE_DIR` | `<checkout>/.local/native`. Private owned directory for native runtime, instance data and records. Legacy `.local` remains separate; do not point native commands at it. Use a fresh private path for each rehearsal. |
 | `RSS_BACKUP_DIR` | **No default.** Explicit absolute private directory outside Git, required for backups and shutdown with data. Rehearsal uses a separate destination. |
-| `RSS_PORT` | `8080`; unused IPv4 loopback port in `1024–65535`. Follow the [port-change procedure](docs/configuration.md#changing-the-loopback-port) for an existing deployment. |
+| `RSS_PORT` | `8080`; unused and unforwarded IPv4 loopback port in `1024–65535`. Follow the [port-change procedure](docs/configuration.md#changing-the-loopback-port) for an existing deployment. |
 | `RSS_TAILSCALE` | `0`. Follow the [private-HTTPS procedure](docs/tailscale-readkit.md#connect-and-verify-the-server) before setting `1`. `0` does not turn off unrelated forwarding to the same port. |
 
 Keep passwords, private URLs, logs and archives out of Git and shared messages.
@@ -133,6 +133,9 @@ See the [full configuration reference](docs/configuration.md).
 - **Backup/shutdown failure:** inspect destination, free space and status. A failed
   explicit `backup` can have resumed service; shutdown export failure after
   quiescing leaves writers stopped. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
+- **Lost instance selection:** do not start or back up a substitute instance.
+  Use [operator troubleshooting](docs/operations.md#common-troubleshooting) to
+  confirm and reselect the intended data while stopped.
 - **Stale daily backups or interrupted maintenance:** use `backup-status --check`
   and the [reconciliation procedure](docs/backup-restore.md#interrupted-maintenance-and-reconciliation).
   Do not remove locks or holds to force startup.

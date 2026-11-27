@@ -6,9 +6,10 @@ import platform
 import socket
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -16,24 +17,33 @@ import pytest
 
 pytestmark = pytest.mark.live
 ROOT = Path(__file__).resolve().parents[2]
+FEED_TTL = 1  # Seconds; used by both FreshRSS and the synthetic publisher's cache.
+FETCH_PERIOD = 20 * 60  # Seconds between UTC scheduler slots.
 
 
 @pytest.fixture
 def synthetic_feed():
+    third_published = Event()
+
     class Publisher(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path != "/feed":
+                self.send_error(404)
+                return
+            origin = f"http://127.0.0.1:{self.server.server_port}"
             items = "".join(
                 f"<item><title>Fixture {n}</title><guid isPermaLink='false'>item-{n}</guid>"
-                f"<link>https://example.invalid/item-{n}</link><description>Content {n}</description></item>"
-                for n in (1, 2)
+                f"<link>{origin}/item-{n}</link><description>Content {n}</description></item>"
+                for n in ((1, 2, 3) if third_published.is_set() else (1, 2))
             )
             payload = (
                 "<rss version='2.0'><channel><title>Synthetic publisher</title>"
-                "<link>https://example.invalid</link><description>Test fixture</description>"
+                f"<link>{origin}</link><description>Test fixture</description>"
                 f"{items}</channel></rss>"
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/rss+xml")
+            self.send_header("Cache-Control", f"max-age={FEED_TTL}")
             self.end_headers()
             self.wfile.write(payload)
 
@@ -44,7 +54,7 @@ def synthetic_feed():
         worker = Thread(target=server.serve_forever)
         worker.start()
         try:
-            yield f"http://127.0.0.1:{server.server_port}/feed"
+            yield f"http://127.0.0.1:{server.server_port}/feed", third_published.set
         finally:
             server.shutdown()
             worker.join()
@@ -53,6 +63,7 @@ def synthetic_feed():
 def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed):
     if sys.platform != "darwin" or platform.machine() != "arm64" or os.getuid() == 0:
         pytest.fail("Native integration requires a normal Apple Silicon macOS account.")
+    feed_url, publish_third = synthetic_feed
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -69,7 +80,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         "RSS_TAILSCALE": "0",
     }
 
-    def invoke(state, *arguments, data=None, success=True):
+    def invoke(state, *arguments, data=None, success=True, umask=-1):
         result = subprocess.run(
             [sys.executable, "-I", "-m", "rss_aggregator", *arguments],
             text=True,
@@ -78,6 +89,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             cwd=ROOT,
             env={**base, "RSS_STATE_DIR": str(state)},
             timeout=210,
+            umask=umask,
             check=False,
         )
         if success:
@@ -137,7 +149,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         result = json.loads(
             reader("reader/api/0/subscription/list?output=json", token=auth)
         )
-        assert synthetic_feed in {sub["url"] for sub in result["subscriptions"]}
+        assert [sub["url"] for sub in result["subscriptions"]] == [feed_url]
 
     def items(auth):
         result = json.loads(
@@ -151,7 +163,9 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
     try:
         initial = invoke(first, "setup")
         assert invoke(first, "setup") == initial
-        start = invoke(first, "start")
+        # Real CLI prepare, web and startup templates must remain archivable
+        # even when the operator's shell permits group writes.
+        start = invoke(first, "start", umask=0o002)
         assert start["fetch"]["status"] == "installer_pending"
         assert start["security"]["verified"] is True
         assert start["scheduler"]["cron"] == "*/20 * * * *"
@@ -159,12 +173,14 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         opml = first / "instances/default/data/opml.xml"
         opml.write_text(
             f"<opml version='1.0'><head><title>Fixture</title></head><body>"
-            f"<outline title='Synthetic publisher' type='rss' xmlUrl='{synthetic_feed}'/>"
+            f"<outline title='Synthetic publisher' type='rss' xmlUrl='{feed_url}'/>"
             "</body></opml>"
         )
-        address = synthetic_feed.split("/", 3)[2]
+        address = feed_url.split("/", 3)[2]
         (opml.parent / "config.custom.php").write_text(
-            "<?php return ['internal_host_allowlist' => ['" + address + "']];\n"
+            f"<?php return ['internal_host_allowlist' => ['{address}'], "
+            f"'limits' => ['cache_duration' => {FEED_TTL}, "
+            f"'cache_duration_min' => {FEED_TTL}]];\n"
         )
         upstream(
             first,
@@ -188,24 +204,45 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             "fixture-web-only",
             "--api-password",
             "fixture-api-only",
+            "--feed-ttl-default",
+            str(FEED_TTL),
         )
+        # Leave a quiet window for startup and manual fetch, so the periodic
+        # fetch cannot be mistaken for the command that collected Fixture 3.
+        until_slot = FETCH_PERIOD - time.time() % FETCH_PERIOD
+        if until_slot <= 15:
+            time.sleep(until_slot + 0.25)
+        startup_slot = int(time.time()) // FETCH_PERIOD
         serving = invoke(first, "start")
+        startup_finished = time.monotonic()
         assert serving["security"]["authenticated_settings"] is True
         assert serving["fetch"]["status"] == "completed"
         assert invoke(first, "start")["fetch"]["status"] == "already_running"
-        assert invoke(first, "fetch")["status"] == "completed"
         api(first)
         auth = login()
         assert_fixture_subscription(auth)
-        before = items(auth)
-        assert {"Fixture 1", "Fixture 2"} <= before.keys()
+        assert items(auth).keys() == {"Fixture 1", "Fixture 2"}
+
+        # Let the real TTL and HTTP cache expire without modifying their state.
+        # Upstream compares integer Unix seconds with a strict expiry boundary.
+        time.sleep(max(0, startup_finished + FEED_TTL + 1 - time.monotonic()))
+        publish_third()
+        assert "Fixture 3" not in items(auth)
+        assert invoke(first, "fetch")["status"] == "completed"
+        fetched = items(auth)
+        assert fetched.keys() == {"Fixture 1", "Fixture 2", "Fixture 3"}
+        assert "Content 3" in fetched["Fixture 3"]["summary"]["content"]
+        assert int(time.time()) // FETCH_PERIOD == startup_slot, (
+            "A periodic fetch slot overlapped startup and manual fetching."
+        )
+
         write_token = reader("reader/api/0/token", token=auth).decode()
         assert (
             reader(
                 "reader/api/0/edit-tag",
                 token=auth,
                 form={
-                    "i": before["Fixture 1"]["id"],
+                    "i": fetched["Fixture 1"]["id"],
                     "T": write_token,
                     "a": "user/-/state/com.google/read",
                 },
@@ -217,7 +254,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
                 "reader/api/0/edit-tag",
                 token=auth,
                 form={
-                    "i": before["Fixture 1"]["id"],
+                    "i": fetched["Fixture 1"]["id"],
                     "T": write_token,
                     "a": "user/-/state/com.google/starred",
                 },
@@ -263,9 +300,9 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         restored_auth = login()
         assert_fixture_subscription(restored_auth)
         restored = items(restored_auth)
-        for n in (1, 2):
+        for n in (1, 2, 3):
             title = f"Fixture {n}"
-            assert restored[title]["id"] == before[title]["id"]
+            assert restored[title]["id"] == fetched[title]["id"]
             assert f"Content {n}" in restored[title]["summary"]["content"]
             categories = restored[title]["categories"]
             assert any(tag.endswith("/read") for tag in categories) is (n == 1)
