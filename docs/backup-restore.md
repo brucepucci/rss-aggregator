@@ -25,10 +25,11 @@ upload or encryption is performed.
 
 ## Create a backup
 
-Choose an absolute private destination outside **every Git checkout** and away
-from instance data. Set `RSS_BACKUP_DIR` explicitly; there is no default. Use an
-owned `0700` directory on a filesystem supporting hard links for non-overwriting
-publication (`0600` files). A new directory may be created; unsafe existing
+Choose an absolute private destination outside **every Git checkout**. It must
+neither overlap nor contain the controlling checkout or `RSS_STATE_DIR`; do not
+place it under a managed path such as `runtime/`. Set `RSS_BACKUP_DIR` explicitly; there is no default.
+Use an owned `0700` directory on a filesystem supporting hard links for
+non-overwriting publication (`0600` files). A new directory may be created; unsafe existing
 permissions are refused rather than repaired. Keep an independent durable copy.
 
 ```sh
@@ -55,6 +56,18 @@ Keep the matching reviewed [runtime manifest](../config/native.json) (including
 upstream revision) and checkout revision. The same FreshRSS version alone does
 **not** make a different native runtime compatible. ZIP structure, manifest,
 payload integrity and safe data paths are validated before publication or restore.
+Paths are limited to **4,096 UTF-8 bytes** and **64 components** each; cumulative
+path metadata is limited to **8 MiB**. A legitimate but exceptionally large or
+deep tree can be refused even with free disk. Preserve the source and prior
+archives; do not bypass validation.
+
+Allow room for several full-size copies at the backup destination: the original
+staged tar, uncompressed ZIP, and additional raw and sanitized tars during
+verification. Existing archives stay in place. Restore needs room for the raw
+and sanitized tars in the system temporary directory as well as the extracted
+data on the target filesystem. If those locations share a volume, budget their
+combined working space.
+
 The old v1 Podman image identity is not a native runtime pin; ordinary native
 `restore` rejects v1. Import through the temporary migration command only.
 
@@ -64,11 +77,13 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   forwarding and all managed writers, including active web requests and in-flight
   feed fetching, must be quiesced before copying. Do not point external writers at
   managed SQLite data: the project's leases cannot control them.
-- Explicit `backup` preserves persisted intent and attempts to restore the observed
-  prior serving mode after a snapshot, including a failed snapshot when safe. It
-  never resumes intentional stop. A preflight refusal can leave existing serving
-  state untouched. A resumption failure can leave a verified archive with the app
-  stopped; check both results before retrying.
+- Explicit `backup` preserves persisted intent and attempts to resume a previously
+  running backend after a snapshot, including a failed snapshot when safe. It
+  only republishes forwarding that it confirmed withdrawing; if the route already
+  disappeared, it resumes on loopback only. It never resumes intentional stop.
+  A preflight refusal can leave existing serving state untouched. A resumption
+  failure can leave a verified archive with the app stopped; check both results
+  before retrying.
 - Normal `stop` sets stopped intent, quiesces and verifies a complete archive when
   data exist. Snapshot failure **after** quiescing leaves writers stopped. Fix the
   backup destination, permissions or space and retry `stop`; a preflight or
@@ -124,13 +139,19 @@ Default policy is **03:00 UTC daily**, adjustable with `--hour`/`--minute`.
 Launchd requests checks at load and every 15 minutes while the session and host
 are available. Eligible failures retry after at least 15 minutes, at most three
 attempts for a UTC target; contention is a defer, not success or a spent attempt.
-Wakeup can catch up today's due target, not every missed day. No wake-from-sleep,
-pre-login or power setting is installed. A job captures absolute checkout/Python,
-private state and non-secret settings; it does not use `.env` or invoke uv. An
-unchanged owned job can be disabled without erasing archives or intent; a busy,
-changed or foreign job is not overwritten. Follow
+Wakeup considers only the most recent elapsed slot since registration, including
+one on the preceding UTC date if the wake crosses midnight. It does not replay
+older slots or work scheduled before registration. No wake-from-sleep, pre-login
+or power setting is installed. A job captures absolute checkout/Python, private
+state and non-secret settings; it does not use `.env` or invoke uv. The owned job
+can be disabled without erasing archives or intent. A missing plist is recoverable
+if the ledger is valid and any loaded job matches it; a busy, changed or foreign
+job is not overwritten. Follow
 [removal and recapture safeguards](operations.md#upgrade-installed-mac-jobs-safely)
-for changes. Recapture needs new daily evidence, not deletion of old records.
+for changes. Recapture starts a new `registration_id`, even with identical
+settings. Wait for a successful `daily_attempt` with that ID after `registered_at`
+and verify `daily_archive_available`; an earlier registration's evidence is
+retained but does not count.
 
 ### Daily check and failure response
 
@@ -139,10 +160,12 @@ true. Ordinary `backup-status` is inspection, not an assurance of protection.
 Check registration, `scheduler_problem`, due/missed/deferred work, latest attempt
 and verified publication, archive availability, age/overdue, `resumption` and
 `maintenance_required`. Daily protection needs successful eligible daily work for
-the current instance and policy, an available verified archive and no unresolved
-failure/hold. A recent manual archive alone is not daily proof. A recovery point
-more than **26 hours** old is overdue; the daily goal is about a day of loss under
-healthy operation, not a guarantee during outages. Status is not a fresh archive
+the current registration and selected instance, availability of **that scheduled
+archive**, and no unresolved failure/hold. `archive_available` and `latest_success`
+can instead describe a newer manual or shutdown archive; neither can mask a
+missing scheduled copy. A recovery point more than **26 hours** old is overdue;
+the daily goal is about a day of loss under healthy operation, not a guarantee
+during outages. Status is not a fresh archive
 rehash or proof of independent copies. Manually invoking `backup-due` does not
 establish that launchd ran unattended.
 

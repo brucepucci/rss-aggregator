@@ -58,8 +58,12 @@ fetch requests. When the instance is stopped, clients cannot synchronize.
 
 Use a normal user on an Apple Silicon Mac (macOS 12+), with Git, native
 [uv](https://docs.astral.sh/uv/getting-started/installation/), internet access
-and an unused loopback port. This path is for a **new local instance** without
-jobs or forwarding. For existing data, use [native recovery](docs/backup-restore.md#recovery-on-this-or-a-clean-host)
+and an unused loopback port. **Before the first `start`, verify the port is not
+already a target of Serve, Funnel, or any other proxy or forwarding rule.** A
+free port and `RSS_TAILSCALE=0` do not prove isolation. See the
+[private-access safeguards](docs/tailscale-readkit.md#prerequisites-and-ownership).
+This path is for a **new local instance** without jobs or forwarding. For existing
+data, use [native recovery](docs/backup-restore.md#recovery-on-this-or-a-clean-host)
 or the [one-time legacy procedure](docs/operations.md#one-time-migration-from-podman)
 before an empty start.
 
@@ -77,8 +81,11 @@ uv run --locked rss start
 Open the returned loopback URL (normally **http://127.0.0.1:8080**). After startup
 passes its PHP checks, complete the installer with **SQLite**, **Web form
 authentication** and one FreshRSS user. Enter a strong password only in the local
-browser. Sign in, check the initial public FreshRSS releases subscription and run
-`uv run --locked rss fetch`. In **Configuration → Archiving**, check the age and
+browser. This interactive browser step is separate from the [native integration
+check](docs/development.md#explicit-liveplatform-checks), which initializes a
+synthetic user via the upstream CLI. Sign in, check the initial public FreshRSS
+releases subscription, and run `uv run --locked rss fetch`. In
+**Configuration → Archiving**, check the age and
 maximum-article limits before you rely on keeping history. To finish, run
 `uv run --locked rss stop` and confirm the returned backup was verified. Keep the
 backup directory configured for subsequent shutdowns. A local backup is not an

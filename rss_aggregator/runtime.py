@@ -17,6 +17,13 @@ from typing import Any, Literal
 from rss_aggregator import native_service as service
 from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
+from rss_aggregator.recovery import (
+    INITIAL_INSTANCE,
+    SELECTION,
+    SHUTDOWN_SUCCESS,
+    Recovery,
+    instance_name,
+)
 from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
@@ -43,11 +50,14 @@ Operation = Literal[
     "uninstall",
     "upgrade",
 ]
-SELECTION = "selected-instance.json"
 
 
 class RuntimeFailure(Exception):
     """Report a lifecycle guard or external command failure without CLI coupling."""
+
+
+class PublicBackendExposed(RuntimeFailure):
+    """Report confirmed public forwarding to the specific requested backend."""
 
 
 class ServeConfigRejected(RuntimeFailure):
@@ -71,15 +81,15 @@ class Runtime:
     @property
     def instance(self) -> str:
         """Read the explicit data selection or the initial default name."""
-        selection = service.read(self.state_dir / SELECTION)
-        name = selection["instance"] if selection is not None else "default"
-        if not isinstance(name, str) or not re.fullmatch(
-            r"[a-z0-9][a-z0-9-]{0,47}", name
-        ):
+        try:
+            selection = service.read(self.state_dir / SELECTION)
+            return instance_name(
+                selection["instance"] if selection is not None else INITIAL_INSTANCE
+            )
+        except (ValueError, KeyError, TypeError):
             raise RuntimeFailure(
                 "Invalid native instance selection; inspect local ownership."
-            )
-        return name
+            ) from None
 
     @property
     def data_dir(self) -> Path:
@@ -102,7 +112,6 @@ class Runtime:
     ) -> dict[str, Any]:
         """Execute one public operation with nonblocking serialization and durable intent."""
         from rss_aggregator.native_install import NativeInstall
-        from rss_aggregator.recovery import Recovery
 
         recovery = Recovery(self)
         backups = BackupSchedule(self, now)
@@ -270,6 +279,12 @@ class Runtime:
 
         return NativeInstall(self).owned(require_current=require_current, verify=verify)
 
+    def _ownership_receipt(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Identify the owner for shutdown independently of runtime layout drift."""
+        from rss_aggregator.native_install import NativeInstall
+
+        return NativeInstall(self).receipt()
+
     def _port(self) -> int:
         """Parse the non-privileged local listener port before starting writers."""
         try:
@@ -324,34 +339,42 @@ class Runtime:
 
     def _quiesce(self) -> None:
         """Close writers even if conditional unpublication fails; preserve foreign routes."""
-        owner, _ = self._owned(require_current=False, verify=False)
+        owner, _ = self._ownership_receipt()
         try:
             PrivateAccess(self).stop(owner)
         finally:
             self._stop_writers()
 
-    def _prepare(self) -> None:
-        """Configure explicit PHP settings and prepare only an uninitialized data target."""
+    def _service_home(self, *, create: bool = False) -> Path:
+        """Locate owned private configuration without following a directory link."""
         home = self.state_dir / "service"
-        if home.is_symlink():
-            raise RuntimeFailure("Unexpected native service directory symlink.")
-        home.mkdir(mode=0o700, exist_ok=True)
+        if create:
+            home.mkdir(mode=0o700, exist_ok=True)
         info = home.lstat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
             raise RuntimeFailure(
                 "Native service configuration is not private and owned."
             )
-        for filename, payload in (
-            ("php.ini", service.INI.encode()),
-            ("__rss_probe.php", (self.root / "config/security-probe.php").read_bytes()),
-        ):
-            path = home / filename
-            path.unlink(missing_ok=True)
-            descriptor = os.open(
-                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-            )
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(payload)
+        return home
+
+    @staticmethod
+    def _write_service_file(path: Path, payload: bytes) -> None:
+        """Replace one generated file without following links."""
+        path.unlink(missing_ok=True)
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+
+    def _prepare(self) -> None:
+        """Configure explicit PHP settings and prepare only an uninitialized data target."""
+        home = self._service_home(create=True)
+        self._write_service_file(home / "php.ini", service.INI.encode())
         if not service.initialized(self.data_dir):
             self._php("cli/prepare.php")
             for filename, template in (
@@ -424,7 +447,7 @@ class Runtime:
             )
 
     def _launch(self, port: int, origin: str, private: bool) -> dict[str, Any]:
-        """Spawn a detached lease-holding worker and require its effective HTTP gates."""
+        """Spawn a detached lease-holding worker and require generation readiness."""
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -483,29 +506,47 @@ class Runtime:
             raise RuntimeFailure(
                 "Native web service exited before loopback readiness; inspect the port and runtime pin."
             )
-        code, body = service.web_check(
-            port, "/__rss_probe.php", host="rss-" + nonce + ".invalid"
-        )
-        result = json.loads(body) if code == 200 else {}
+        return plan
+
+    def _check_web(self, plan: dict[str, Any], initialized: bool) -> dict[str, Any]:
+        """Check fresh effective web settings, readiness and anonymous API refusal."""
+        port, nonce = plan["port"], plan["nonce"]
+        probe = self._service_home() / "__rss_probe.php"
+        source = (self.root / "config/security-probe.php").read_bytes()
+        try:
+            self._write_service_file(probe, source)
+            code, body = service.web_check(
+                port, "/__rss_probe.php", host="rss-" + nonce + ".invalid"
+            )
+            result = json.loads(body) if code == 200 else None
+        finally:
+            probe.unlink(missing_ok=True)
         if (
-            result.get("sapi") != "frankenphp"
-            or result.get("php") != self._identity()["php"]
+            not isinstance(result, dict)
+            or result.get("sapi") != "frankenphp"
+            or result.get("php") != plan["runtime"]["php"]
             or result.get("upload_progress") not in ("", "0")
             or result.get("expose_php") not in ("", "0")
             or result.get("display_errors") not in ("", "0")
             or result.get("sqlite") is not True
             or result.get("loaded_ini") != str(self.state_dir / "service/php.ini")
             or result.get("scanned_ini") not in ("", False, None)
-            or result.get("initialized") is not service.initialized(self.data_dir)
-            or (
-                result.get("initialized")
-                and result.get("authenticated_settings") is not True
-            )
+            or result.get("initialized") is not initialized
+            or (initialized and result.get("authenticated_settings") is not True)
         ):
             raise RuntimeFailure(
                 "Effective web PHP settings or SQLite support failed verification."
             )
-        (self.state_dir / "service/__rss_probe.php").unlink()
+        if service.web_check(port, "/i/")[0] not in (200, 302, 303):
+            raise RuntimeFailure(
+                "The FreshRSS application did not pass loopback readiness."
+            )
+        if initialized and service.web_check(
+            port, "/api/greader.php/reader/api/0/subscription/list"
+        )[0] not in (401, 403):
+            raise RuntimeFailure(
+                "The unauthenticated Google Reader-compatible API was not refused."
+            )
         return {**result, "verified": True}
 
     def _ready(self, plan: dict[str, Any]) -> bool:
@@ -515,6 +556,25 @@ class Runtime:
         )
         return code == 200 and reply == plan["nonce"].encode()
 
+    def _retained_security(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Attest fresh settings for retention or request a guarded restart instead."""
+        try:
+            initialized = service.initialized(self.data_dir)
+            record = service.read(self.state_dir / "security.json")
+            previous = record.get("effective") if isinstance(record, dict) else None
+            if (
+                not isinstance(previous, dict)
+                or previous.get("initialized") is not initialized
+                or (plan["private"] and not initialized)
+            ):
+                return None
+            security = self._check_web(plan, initialized)
+            self._save("security.json", {"nonce": plan["nonce"], "effective": security})
+            return security
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # The guarded restart withdraws owned forwarding before opening writers.
+            return None
+
     def _start(
         self,
         *,
@@ -523,16 +583,28 @@ class Runtime:
         recheck: bool = False,
     ) -> dict[str, Any]:
         """Start or recheck owned serving, failing closed before enabling private forwarding."""
-        from rss_aggregator.recovery import Recovery
-
         owner, _ = self._owned()
         port = self._port() if port_override is None else port_override
         access = PrivateAccess(self)
         private = access.enabled() if private_https is None else private_https
-        origin = access.prepare(owner, port) if private else f"http://127.0.0.1:{port}"
+        live = self._live()
+        try:
+            origin = (
+                access.prepare(owner, port) if private else f"http://127.0.0.1:{port}"
+            )
+        except PublicBackendExposed as error:
+            if live is None or live[0].get("port") != port:
+                raise
+            # Leave the foreign route alone; close only the owned backend it reaches.
+            try:
+                self._stop_writers()
+            except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+                raise RuntimeFailure(
+                    f"{error} Shutdown of the owned backend could not be confirmed."
+                ) from None
+            raise RuntimeFailure(f"{error} Owned backend shutdown confirmed.") from None
         recovery = Recovery(self)
         recovery.check_activation()
-        live = self._live()
         if live and not recheck:
             plan, receipt = live
             status = self._status()
@@ -542,23 +614,24 @@ class Runtime:
                 and plan["url"] == origin
                 and plan["private"] == private
                 and plan["instance"] == self.instance
+                and receipt.get("scheduler") == "running"
                 and (
                     status["forwarding"]["status"] == "running"
                     if private
                     else status["forwarding"]["status"] in ("stopped", "unconfigured")
                 )
             ):
-                return {
-                    **status,
-                    "security": service.read(self.state_dir / "security.json")[
-                        "effective"
-                    ],
-                    "scheduler": self._scheduler(receipt),
-                    "fetch": {"status": "already_running"},
-                }
+                security = self._retained_security(plan)
+                if security is not None:
+                    return {
+                        **status,
+                        "security": security,
+                        "fetch": {"status": "already_running"},
+                    }
         try:
             self._quiesce()
             recovery.ensure_data()
+            recovery.mark_writer_start()
             self._prepare()
             installed = service.initialized(self.data_dir)
             if private and not installed:
@@ -569,33 +642,21 @@ class Runtime:
             if installed:
                 self._configure(origin)
                 fetch = self._actualize()
-            security = self._launch(port, origin, private)
-            status, _ = service.web_check(port, "/i/")
-            if status not in (200, 302, 303):
-                raise RuntimeFailure(
-                    "The FreshRSS application did not pass loopback readiness."
-                )
-            if installed:
-                status, _ = service.web_check(
-                    port, "/api/greader.php/reader/api/0/subscription/list"
-                )
-                if status not in (401, 403):
-                    raise RuntimeFailure(
-                        "The unauthenticated Google Reader-compatible API was not refused; no Serve route was published."
-                    )
-            plan, receipt = self._live() or ({}, {})
-            if receipt.get("scheduler") != "running":
+            plan = self._launch(port, origin, private)
+            security = self._check_web(plan, installed)
+            current, receipt = self._live() or ({}, {})
+            if (
+                current.get("nonce") != plan["nonce"]
+                or receipt.get("scheduler") != "running"
+            ):
                 raise RuntimeFailure(
                     "Native feed scheduling did not pass the startup gate."
                 )
             self._save("security.json", {"nonce": plan["nonce"], "effective": security})
             forwarding = access.start(owner, port, origin) if private else None
         except Exception:
-            home = self.state_dir / "service"
             try:
                 self._stop_writers()
-                if not home.is_symlink():
-                    (home / "__rss_probe.php").unlink(missing_ok=True)
             except Exception:
                 raise RuntimeFailure(
                     "Startup failed and stopping native writers could not be confirmed; inspect potential remaining access. No foreign routes were changed."
@@ -632,9 +693,10 @@ class Runtime:
         owner, _ = self._owned(require_current=False, verify=False)
         live = self._live()
         plan, receipt = live or ({}, {})
-        security = service.read(self.state_dir / "security.json") or {}
+        security = service.read(self.state_dir / "security.json")
         ready = bool(
             live
+            and isinstance(security, dict)
             and security.get("nonce") == plan["nonce"]
             and plan.get("runtime") == self._identity()
             and self._ready(plan)
@@ -770,13 +832,19 @@ class Runtime:
             raise RuntimeFailure(
                 "Only PHP/web runtime upgrades of the same FreshRSS release are supported. Preserve data and plan FreshRSS upgrades separately."
             )
-        target = self.state_dir / "instances"
-        if not os.path.lexists(target) or not any(target.iterdir()):
+        recovery = Recovery(self)
+        if recovery.pristine():
             return
-        success = service.read(self.state_dir / "backup-success.json")
-        if not success or success.get("instance") != self.instance:
+        generation = recovery.writer_generation()
+        success = service.read(self.state_dir / SHUTDOWN_SUCCESS)
+        if (
+            not isinstance(success, dict)
+            or success.get("instance") != self.instance
+            or "writer_generation" not in success
+            or success["writer_generation"] != generation
+        ):
             raise RuntimeFailure(
-                "A verified shutdown archive of the selected instance is required; return to the installed pin to back up first."
+                "A verified shutdown archive covering the selected instance's last writer generation is required; fix the backup and retry rss stop."
             )
         archive = Path(success["archive"])
         digest = hashlib.sha256()

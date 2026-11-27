@@ -27,7 +27,9 @@ checkout to operate the **same** instance, use the exact matching reviewed pin a
 explicitly set the original `RSS_STATE_DIR`; installed jobs still use their
 captured checkout. Never copy or fabricate receipts or adopt an unowned runtime.
 For another instance rehearsal or recovery drill, use **new** private state, an
-unused loopback port and a separate explicit backup destination.
+unused and unforwarded loopback port and a separate explicit backup destination.
+Check for existing Serve, Funnel or other forwarding to the port before starting
+an installer or rehearsal, even with `RSS_TAILSCALE=0`.
 
 ## Start and verify
 
@@ -39,15 +41,20 @@ an equivalent launcher.
   ownership and exact installed pin, prepares the selected data, checks effective
   **web** PHP (not only PHP CLI), readiness and scheduling, and verifies rejection
   of anonymous API access on an initialized instance before opening private
-  forwarding. It removes the temporary PHP probe. A matching healthy service is
-  retained; a reconfiguration or failed health check can interrupt it. Use `status`
+  forwarding. It removes the temporary PHP probe after each check. Repeated
+  `start` rechecks effective settings and anonymous API refusal before retaining
+  an initialized service. Installer completion, reconfiguration or a failed
+  health check can trigger a guarded restart. Use `status`
   for routine health checks.
 - On first start finish the installer locally with SQLite and form authentication
   before enabling forwarding. Do not enter credentials if a security check fails.
 - `status` inspects the selected instance, HTTP readiness, scheduler and forwarding
   without starting it. `verify` requires the owned service running and restarts it
   through its current serving mode to recheck the gates; it does not change intent.
-  A readiness result is not proof of authenticated browser/reader use.
+  If preflight confirms the owned backend is publicly reachable through Funnel,
+  it attempts to stop that backend and reports whether shutdown was confirmed.
+  It does not change the foreign route. A readiness result is not proof of
+  authenticated browser/reader use.
 - Watch for a port conflict, unexpected forwarding or a warning that writer shutdown
   could not be confirmed. Preserve other listeners/routes. Never infer that a failed
   command closed access; inspect service and forwarding locally before retrying.
@@ -67,9 +74,10 @@ check the user/category/feed settings before changing them.
 ## Backups and stopping
 
 Export an explicit private `RSS_BACKUP_DIR` outside Git. `stop` records stopped
-intent, removes only owned forwarding, proves web and fetch writers idle and
-verifies a complete external backup when data exist. It preserves the runtime,
-data and archives. A failed shutdown export after quiescing leaves writers
+intent, removes only owned forwarding, and proves web and fetch writers idle
+before checking the runtime layout and installed bytes for an archive. Missing
+previously provisioned data is a failure, not an empty install. The command
+preserves the runtime, data and archives. A failed shutdown export after quiescing leaves writers
 stopped; correct the cause and retry `stop`. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
 for resumption, daily checks and interrupted maintenance; a failed explicit
 `backup` has different resumption behavior. A local archive alone does not prove
@@ -182,8 +190,11 @@ active forwarding as above. Use only an explicitly reviewed target manifest;
 and platform must stay the same. From the reviewed target checkout with the same
 state, run `uv run --locked rss upgrade`. Inspect installed/target identity and
 preservation plan, then apply only the current preview with `uv run --locked rss
-upgrade --confirm TOKEN`. Apply revalidates the selected instance's backup against
-the installed pin when instance data exist. It does not rewrite old archives: each
+upgrade --confirm TOKEN`. With instance data present, apply requires the selected
+instance's verified shutdown archive covering its last writer generation and
+revalidates it against the installed pin. An older archive does not cover writes
+from a later session. If shutdown capture failed, correct the cause and retry
+`stop` before applying. It does not rewrite old archives: each
 ZIP still needs its exact recorded pin for restore. Start with `RSS_TAILSCALE=0`,
 verify application state under the reviewed runtime and take a new native backup;
 only then restore [intended private access](tailscale-readkit.md#connect-and-verify-the-server)
@@ -274,7 +285,8 @@ There is no permanent dual backend or legacy restore on the native branch.
 Do not remove the VM or retire the importer until live acceptance and
 [independent Time Machine restore](backup-restore.md#time-machine-copy-recovery-drill)
 of an unattended native archive have passed. Historical issue #24 evidence is
-for the old runtime. Record sanitized outcomes, failed and open gates in #30/PR.
+for the old runtime. Record sanitized outcomes and any outstanding gates in the
+owner's migration handoff, regardless of the implementation issue's status.
 Final removal needs **separate owner approval** using the
 [pinned guarded legacy removal runbook](https://github.com/brucepucci/rss-aggregator/blob/28664ab936f8872da6ff3ddca1c4b0a725dfb0ec/docs/operations.md#preview-and-remove-the-vm)
 and its existing ownership/inventory/fresh-archive prerequisites. The gate does

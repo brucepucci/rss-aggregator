@@ -10,6 +10,7 @@ import socket
 import subprocess
 from functools import partial
 from http.client import BadStatusLine
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.parse import parse_qs
@@ -24,7 +25,12 @@ from test_serve_config import ControlledSocket, reply
 from rss_aggregator.cli import main
 from rss_aggregator.native_install import manifest_identity
 from rss_aggregator.private_access import PrivateAccess
-from rss_aggregator.runtime import Runtime, RuntimeFailure, ServeConfigRejected
+from rss_aggregator.runtime import (
+    PublicBackendExposed,
+    Runtime,
+    RuntimeFailure,
+    ServeConfigRejected,
+)
 
 HOST = "reader.example.ts.net"
 ORIGIN = f"https://{HOST}"
@@ -159,6 +165,9 @@ def installed_checkout(tmp_path_factory):
     checkout = Checkout(tmp_path_factory.mktemp("private-install"))
     checkout.prepare_source()
     checkout.prepare_runtime()
+    config = Path(__file__).resolve().parents[1] / "config"
+    for name in ("security-probe.php", "config-user.custom.php", "public-feed.opml"):
+        shutil.copyfile(config / name, checkout.root / "config" / name)
     installed = checkout.run("setup")
     assert installed.returncode == 0, installed.stderr
     return checkout, json.loads(installed.stdout)
@@ -238,7 +247,12 @@ def test_start_refuses_unowned_443_before_touching_application(native, scope):
     native.api.config = (
         config if scope == "background" else {"Foreground": {"foreign": config}}
     )
-    preflight_refuses(native, "Serve HTTPS port 443 is not exclusively project-owned")
+    expected = (
+        "Existing Funnel reaches this FreshRSS backend"
+        if scope == "foreground-funnel"
+        else "Serve HTTPS port 443 is not exclusively project-owned"
+    )
+    preflight_refuses(native, expected)
 
 
 @pytest.mark.parametrize(
@@ -747,6 +761,203 @@ def test_private_preflight_conflict_does_not_stop_existing_backend(
     assert not native.record.exists()
     assert not native.api.posts
     assert native.api.config == route(ADDRESS)
+
+
+@pytest.fixture
+def controlled_web(native, monkeypatch):
+    """Substitute only the listener, controller process and external PHP/HTTP."""
+    handles = []
+    native.data = native.state / "instances/default/data"
+    native.web_auth = True
+    native.launches = 0
+
+    def run(args, **kwargs):
+        if args[0] != str(native.state / "runtime/frankenphp"):
+            return native.api.run_cli(args, **kwargs)
+        if args[2] == "-r":
+            origin = ORIGIN if os.environ["RSS_TAILSCALE"] == "1" else BACKEND
+            output = json.dumps(["form", False, False, True, origin, True, "sqlite"])
+        else:
+            assert args[2] in (
+                "cli/prepare.php",
+                "cli/reconfigure.php",
+                "app/actualize_script.php",
+            )
+            output = ""
+        return subprocess.CompletedProcess(args, 0, output.encode(), b"")
+
+    def spawn(args, *, pass_fds, **_kwargs):
+        assert args[2:4] == ["-m", "rss_aggregator.native_service"]
+        assert not handles
+        handles.extend(os.dup(fd) for fd in pass_fds)
+        plan = json.loads((native.state / "service.json").read_text())
+        (native.state / "service-status.json").write_text(
+            json.dumps(
+                {"nonce": plan["nonce"], "web": "started", "scheduler": "running"}
+            )
+        )
+        native.launches += 1
+        return object()
+
+    def settle(_seconds):
+        plan = json.loads((native.state / "service.json").read_text())
+        stop = json.loads((native.state / "stop-service.json").read_text())
+        assert stop["nonce"] == plan["nonce"]
+        while handles:
+            os.close(handles.pop())
+
+    def web(port, path, *, host=None):
+        assert port == PORT and handles
+        plan = json.loads((native.state / "service.json").read_text())
+        if path in ("/__rss_ready", "/__rss_probe.php"):
+            assert host == "rss-" + plan["nonce"] + ".invalid"
+        if path == "/__rss_ready":
+            return 200, plan["nonce"].encode()
+        if path == "/__rss_probe.php":
+            assert (native.state / "service/__rss_probe.php").is_file()
+            return 200, json.dumps(
+                {
+                    "sapi": "frankenphp",
+                    "php": native.manifest["runtime"]["php"],
+                    "upload_progress": "0",
+                    "expose_php": "0",
+                    "display_errors": "0",
+                    "sqlite": True,
+                    "loaded_ini": str(native.state / "service/php.ini"),
+                    "initialized": (native.data / "applied_migrations.txt").is_file(),
+                    "authenticated_settings": native.web_auth,
+                }
+            ).encode()
+        if path == "/i/":
+            return 200, b""
+        assert path == "/api/greader.php/reader/api/0/subscription/list"
+        return 403, b""
+
+    class Listener:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            pass
+
+        def setsockopt(self, *_args):
+            pass
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", PORT)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(socket, "socket", Listener)
+    monkeypatch.setattr("rss_aggregator.runtime.time.sleep", settle)
+    monkeypatch.setattr("rss_aggregator.native_service.web_check", web)
+    yield native
+    while handles:
+        os.close(handles.pop())
+
+
+def initialized_web(native):
+    (native.data / "config.php").write_text("synthetic config")
+    (native.data / "applied_migrations.txt").touch()
+
+
+def result_json(result):
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def test_repeat_start_observes_installer_completion(controlled_web, monkeypatch):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    assert not result_json(native.run(["start"]))["security"]["initialized"]
+    initialized_web(native)
+    result = result_json(native.run(["start"]))
+    assert result["security"]["initialized"]
+    assert result["security"]["authenticated_settings"]
+    assert result["fetch"]["status"] == "completed"
+    assert result_json(native.run(["start"]))["fetch"]["status"] == "already_running"
+    assert native.launches == 2
+    assert not (native.state / "service/__rss_probe.php").exists()
+    assert not native.api.posts
+
+
+@pytest.mark.parametrize("repeated", [False, True], ids=["first-start", "repeat-start"])
+def test_private_start_refuses_failed_effective_authentication(
+    controlled_web, monkeypatch, repeated
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    assert not result_json(native.run(["start"]))["security"]["initialized"]
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    if repeated:
+        assert result_json(native.run(["start"]))["security"]["initialized"]
+    native.web_auth = False
+    refused(native.run(["start"]), "Effective web PHP settings")
+    status = result_json(native.run(["status"]))
+    assert status["application"] == "stopped"
+    assert status["forwarding"]["status"] != "running"
+    assert not (native.state / "service/__rss_probe.php").exists()
+    assert len(native.api.posts) == (2 if repeated else 0)
+
+
+def test_verify_stops_owned_backend_on_confirmed_public_exposure(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    result_json(native.run(["start"]))
+    observed = copy.deepcopy(native.api.config)
+    writes = len(native.api.posts)
+
+    def confirmed(_access, _owner, port):
+        assert port == PORT
+        raise PublicBackendExposed("Synthetic confirmed public exposure")
+
+    monkeypatch.setattr(PrivateAccess, "prepare", confirmed)
+    refused(native.run(["verify"]), "Owned backend shutdown confirmed")
+    assert result_json(native.run(["status"]))["application"] == "stopped"
+    assert native.api.config == observed
+    assert len(native.api.posts) == writes
+
+
+def test_upgrade_rejects_archive_from_before_last_running_session(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    destination = Path(os.environ["RSS_BACKUP_DIR"])
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    initialized_web(native)
+    old_archive = Path(result_json(native.run(["stop"]))["backup"]["archive"])
+    result_json(native.run(["start"]))
+    (native.data / "new-state").write_text("synthetic post-backup change")
+    monkeypatch.setenv("RSS_BACKUP_DIR", str(old_archive))
+    failed = native.run(["stop"])
+    assert failed.exit_code == 1, failed.output
+    assert "Shutdown backup failed" in failed.stderr
+    assert old_archive.is_file()
+    preview = result_json(native.run(["upgrade"]))
+    refused(
+        native.run(["upgrade", "--confirm", preview["confirmation"]]),
+        "shutdown archive",
+    )
+    monkeypatch.setenv("RSS_BACKUP_DIR", str(destination))
+    result_json(native.run(["stop"]))
+    assert (
+        result_json(native.run(["upgrade", "--confirm", preview["confirmation"]]))[
+            "status"
+        ]
+        == "installed"
+    )
+    (native.state / "instances").rename(native.state / "held-instances")
+    refused(
+        native.run(["upgrade", "--confirm", preview["confirmation"]]),
+        "Selected instance data are absent",
+    )
 
 
 @pytest.mark.parametrize("flags", [[], ["--loopback"]])

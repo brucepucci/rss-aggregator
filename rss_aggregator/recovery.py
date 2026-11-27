@@ -10,10 +10,12 @@ import re
 import stat
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+from rss_aggregator import native_service
 from rss_aggregator.archives import (
     create_archive,
     sync_directory,
@@ -28,9 +30,12 @@ if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
 
 BACKUP_RECORD = "last-backup.json"
+SHUTDOWN_SUCCESS = "shutdown-backup-success.json"
 SELECTION = "selected-instance.json"
 INITIAL_INSTANCE = "default"
 INSTANCE_RECORD = "instance.json"
+_INITIAL_PROVISIONED = "default-provisioned.json"
+_WRITER_GENERATION = "writer-generation.json"
 _DATA_IDENTITY = ("freshrss_version", "freshrss_sha256", "platform")
 
 
@@ -43,6 +48,16 @@ def instance_name(value: str) -> str:
             "Instance must be 1–48 lowercase letters, digits or hyphens, starting with a letter or digit."
         )
     return value
+
+
+def _contains(directory: Path, location: Path) -> bool:
+    """Check ancestry even when the filesystem accepts case or Unicode aliases."""
+    exists = directory.exists()
+    return any(
+        candidate == directory
+        or (exists and candidate.exists() and candidate.samefile(directory))
+        for candidate in (location, *location.parents)
+    )
 
 
 def _rename_exclusive(source: Path, target: Path) -> None:
@@ -102,7 +117,7 @@ class Recovery:
             )
 
     def _directory(self) -> Path:
-        """Require an explicitly chosen private backup directory outside Git."""
+        """Require a private destination separate from checkout and native state."""
         setting = os.environ.get("RSS_BACKUP_DIR")
         if not setting or not Path(setting).expanduser().is_absolute():
             raise self.failure(
@@ -112,13 +127,21 @@ class Recovery:
         if raw.is_symlink():
             raise self.failure("RSS_BACKUP_DIR must not be a symlink.")
         path = raw.resolve()
-        if path == self.runtime.root or self.runtime.root in path.parents:
-            raise self.failure("RSS_BACKUP_DIR must be outside the checkout.")
-        if any(os.path.lexists(parent / ".git") for parent in (path, *path.parents)):
-            raise self.failure("RSS_BACKUP_DIR must be outside every Git checkout.")
-        instances = self.runtime.state_dir / "instances"
-        if path == instances or instances in path.parents:
-            raise self.failure("RSS_BACKUP_DIR must be outside managed instance data.")
+        checkout, state = self.runtime.root, self.runtime.state_dir
+        for candidate in dict.fromkeys((Path(os.path.abspath(raw)), path)):
+            if _contains(state, candidate) or _contains(candidate, state):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside and not contain RSS_STATE_DIR."
+                )
+            if _contains(checkout, candidate) or _contains(candidate, checkout):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside and not contain the checkout."
+                )
+            if any(
+                os.path.lexists(parent / ".git")
+                for parent in (candidate, *candidate.parents)
+            ):
+                raise self.failure("RSS_BACKUP_DIR must be outside every Git checkout.")
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             self._private(path, directory=True)
@@ -179,10 +202,26 @@ class Recovery:
         return base / "data"
 
     def _initial_absent(self, instance: str) -> bool:
-        """Identify the never-selected default, not a missing named recovery target."""
-        return instance == INITIAL_INSTANCE and not os.path.lexists(
-            self.runtime.state_dir / SELECTION
+        """Distinguish pristine state from a lost or interrupted instance."""
+        state = self.runtime.state_dir
+        return instance == INITIAL_INSTANCE and not any(
+            os.path.lexists(state / name) for name in (SELECTION, _INITIAL_PROVISIONED)
         )
+
+    def pristine(self) -> bool:
+        """Return whether no default was attempted and no instance state exists."""
+        self._require_lock()
+        instances = self._instances()
+        return self._initial_absent(self.runtime.instance) and (
+            not instances.exists() or not any(instances.iterdir())
+        )
+
+    def _remember_default(self, instance: str) -> None:
+        """Keep durable default provenance outside the instance tree."""
+        if instance == INITIAL_INSTANCE and not os.path.lexists(
+            self.runtime.state_dir / _INITIAL_PROVISIONED
+        ):
+            self.runtime._save(_INITIAL_PROVISIONED, {"version": 1})
 
     def check_activation(self) -> None:
         """Require selected data to be complete, private, owned and compatible."""
@@ -205,6 +244,7 @@ class Recovery:
         instance = runtime.instance
         data = self._data(instance, owner, identity)
         if data is not None:
+            self._remember_default(instance)
             return data
         if not self._initial_absent(instance):
             raise self.failure(
@@ -212,6 +252,49 @@ class Recovery:
             )
         self._publish(instance, owner, identity)
         return runtime.data_dir
+
+    def _selected_data(self) -> Path:
+        """Require an owned selected instance compatible with the installed pin."""
+        self._require_lock()
+        owner, installed = self.runtime._owned(require_current=False, verify=False)
+        data = self._data(self.runtime.instance, owner, installed)
+        if data is None:
+            raise self.failure("Selected instance data are absent.")
+        return data
+
+    def _read_generation(self, data: Path) -> str | None:
+        """Read a private generation record next to already validated instance data."""
+        path = data.parent / _WRITER_GENERATION
+        if not os.path.lexists(path):
+            return None
+        try:
+            self._private(path, directory=False)
+            record = native_service.read(path)
+            if not isinstance(record, dict) or record.keys() != {"writer_generation"}:
+                raise ValueError
+            generation = record["writer_generation"]
+            if (
+                not isinstance(generation, str)
+                or uuid.UUID(generation, version=4).hex != generation
+            ):
+                raise ValueError
+        except (OSError, ValueError):
+            raise self.failure(
+                "Invalid writer generation record; preserve it and inspect selected instance state locally."
+            ) from None
+        return generation
+
+    def mark_writer_start(self) -> None:
+        """Durably invalidate earlier captures before a new writer may touch data."""
+        data = self._selected_data()
+        self._read_generation(data)
+        native_service.save(
+            data.parent / _WRITER_GENERATION, {"writer_generation": uuid.uuid4().hex}
+        )
+
+    def writer_generation(self) -> str | None:
+        """Return the selected generation, or None for complete data with no record."""
+        return self._read_generation(self._selected_data())
 
     def _publish(
         self,
@@ -223,6 +306,9 @@ class Recovery:
         legacy_image: dict[str, Any] | None = None,
     ) -> None:
         """Durably stage private data and provenance before exclusive publication."""
+        # Record the provisioning attempt before creating data. An interruption
+        # may require recovery, but must never authorize silent reinitialization.
+        self._remember_default(instance)
         directory = self._instances(create=True)
         target = directory / instance
         record = {
@@ -263,23 +349,31 @@ class Recovery:
                 ) from None
             sync_directory(directory)
 
-    def _quiesce(self, owner: dict[str, Any]) -> None:
-        """Withdraw only owned forwarding and synchronously stop all writers."""
+    def _quiesce(self, owner: dict[str, Any]) -> bool:
+        """Stop all writers and report whether owned forwarding was withdrawn."""
         self._require_lock()
         try:
-            PrivateAccess(self.runtime).stop(owner)
+            withdrawn = PrivateAccess(self.runtime).stop(owner)
         finally:
             self.runtime._stop_writers()
         if not self.runtime._idle():
             raise self.failure("FreshRSS writers are still running; snapshot refused.")
+        return withdrawn
 
     def _snapshot(
-        self, data: Path, directory: Path, instance: str, identity: dict[str, Any]
+        self,
+        data: Path,
+        directory: Path,
+        instance: str,
+        identity: dict[str, Any],
+        *,
+        via: Literal["stop", "backup"],
     ) -> dict[str, Any]:
         """Publish verified data and record success independently of resumption."""
         runtime = self.runtime
         if not runtime._idle():
             raise self.failure("FreshRSS writers are still running; snapshot refused.")
+        generation = self._read_generation(data)
         with tempfile.TemporaryDirectory(
             prefix=".rss-export-", dir=directory
         ) as temporary:
@@ -289,14 +383,16 @@ class Recovery:
             BACKUP_RECORD,
             {"archive": result["archive"], "sha256": result["sha256"]},
         )
-        runtime._save(
-            SUCCESS,
-            {
-                **result,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "instance": instance,
-            },
-        )
+        evidence = {
+            **result,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "instance": instance,
+            "writer_generation": generation,
+            "via": via,
+        }
+        runtime._save(SUCCESS, evidence)
+        if via == "stop":
+            runtime._save(SHUTDOWN_SUCCESS, evidence)
         return result
 
     def _maintenance_notice(self) -> None:
@@ -315,6 +411,7 @@ class Recovery:
         data = self._data(instance, owner, identity)
         if data is None:
             raise self.failure("Selected instance has no data to back up.")
+        self._remember_default(instance)
         status = runtime._status()
         if status["application"] not in ("running", "stopped"):
             raise self.failure(
@@ -326,16 +423,17 @@ class Recovery:
             raise self.failure(
                 "Cannot confirm the active FreshRSS port; backup refused."
             )
-        was_private = status["forwarding"]["status"] == "running"
         maintenance = BackupSchedule(runtime)
         maintenance.begin(owner, "backup")
         settled = False
         try:
             maintenance.phase("quiescing")
-            self._quiesce(owner)
+            withdrawn = self._quiesce(owner)
             maintenance.phase("snapshot")
             try:
-                result = self._snapshot(data, directory, instance, identity)
+                result = self._snapshot(
+                    data, directory, instance, identity, via="backup"
+                )
             except Exception:
                 settled = True
                 raise
@@ -350,7 +448,7 @@ class Recovery:
                         )
                     if was_running and maintenance.may_resume():
                         maintenance.phase("resuming")
-                        runtime._start(private_https=was_private, port_override=port)
+                        runtime._start(private_https=withdrawn, port_override=port)
                     maintenance.finish()
             finally:
                 if maintenance.pending():
@@ -360,9 +458,9 @@ class Recovery:
         """Stop owned writers and archive data without ever reopening the service."""
         self._require_lock()
         runtime = self.runtime
-        # Closing writers must not depend on the checkout still matching the
-        # installed pin. Capture uses verified installed bytes, not that checkout.
-        owner, installed = runtime._owned(require_current=False, verify=False)
+        # Closing writers depends on the ownership receipt, not on an intact
+        # runtime layout or a matching checkout. Attest installed bytes only after stop.
+        owner, installed = runtime._ownership_receipt()
         maintenance = BackupSchedule(runtime)
         already_stopped = runtime._idle()
         maintenance.begin(owner, "stop")
@@ -378,12 +476,13 @@ class Recovery:
                         raise self.failure("Selected instance data are absent.")
                     backup = {"status": "no_data"}
                 else:
+                    self._remember_default(instance)
                     if runtime._owned(require_current=False) != (owner, installed):
                         raise self.failure(
                             "Installed runtime identity changed during shutdown."
                         )
                     backup = self._snapshot(
-                        data, self._directory(), instance, installed
+                        data, self._directory(), instance, installed, via="stop"
                     )
             except (self.failure, OSError, ValueError, KeyError, TypeError) as error:
                 if runtime._idle():
@@ -474,6 +573,7 @@ class Recovery:
             )
         if self._data(instance, owner, runtime._identity()) is None:
             raise self.failure("Instance is absent; select a complete owned instance.")
+        self._remember_default(instance)
         runtime._save(SELECTION, {"instance": instance})
         return {
             "instance": instance,

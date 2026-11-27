@@ -133,6 +133,12 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             if line.startswith("Auth=")
         )
 
+    def assert_fixture_subscription(auth):
+        result = json.loads(
+            reader("reader/api/0/subscription/list?output=json", token=auth)
+        )
+        assert synthetic_feed in {sub["url"] for sub in result["subscriptions"]}
+
     def items(auth):
         result = json.loads(
             reader(
@@ -190,12 +196,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert invoke(first, "fetch")["status"] == "completed"
         api(first)
         auth = login()
-        subscriptions = json.loads(
-            reader("reader/api/0/subscription/list?output=json", token=auth)
-        )
-        assert any(
-            sub["url"] == synthetic_feed for sub in subscriptions["subscriptions"]
-        )
+        assert_fixture_subscription(auth)
         before = items(auth)
         assert {"Fixture 1", "Fixture 2"} <= before.keys()
         write_token = reader("reader/api/0/token", token=auth).decode()
@@ -259,7 +260,9 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert invoke(second, "select-instance", "recovered")["instance"] == "recovered"
         assert invoke(second, "start")["instance"] == "recovered"
         api(second)
-        restored = items(login())
+        restored_auth = login()
+        assert_fixture_subscription(restored_auth)
+        restored = items(restored_auth)
         for n in (1, 2):
             title = f"Fixture {n}"
             assert restored[title]["id"] == before[title]["id"]

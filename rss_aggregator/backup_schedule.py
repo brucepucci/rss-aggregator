@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.supervision import MAINTENANCE, NativeJob, Supervision
@@ -100,18 +101,18 @@ class BackupSchedule:
             # Retain failures too: a no-op cannot repair a failed capture/resumption.
             self.runtime._save(ATTEMPT, previous)
             return result
-        if archive.get("verified"):
-            completed = (
-                self.now if self.controlled_clock else datetime.now(timezone.utc)
-            )
-            self.runtime._save(
-                SUCCESS,
-                {
-                    **archive,
-                    "completed_at": completed.isoformat(),
-                    "instance": attempt["instance"],
-                },
-            )
+        if self.controlled_clock and archive.get("verified"):
+            # Recovery owns publication evidence. Only align the clock for this
+            # exact success under an explicitly injected Runtime clock.
+            success = self._read(SUCCESS)
+            if (
+                isinstance(success, dict)
+                and success.get("archive") == archive["archive"]
+                and success.get("sha256") == archive["sha256"]
+            ):
+                self.runtime._save(
+                    SUCCESS, {**success, "completed_at": self.now.isoformat()}
+                )
         self.runtime._save(
             ATTEMPT,
             {
@@ -128,8 +129,47 @@ class BackupSchedule:
         return self._job.path
 
     def _config(self) -> dict[str, Any] | None:
-        """Require a native schedule owned by the selected checkout and state."""
-        return self._job.read(SCHEDULE)
+        """Require the owned ledger and an internally consistent captured policy."""
+        config = self._job.read(SCHEDULE)
+        if config is None:
+            return None
+        environment = config["environment"]
+        launchctl = Path(config["dependencies"]["launchctl"])
+        if (
+            type(config.get("active")) is not bool
+            or config.get("timezone") != "UTC"
+            or type(config.get("hour")) is not int
+            or not 0 <= config["hour"] <= 23
+            or type(config.get("minute")) is not int
+            or not 0 <= config["minute"] <= 59
+            or not isinstance(environment, dict)
+            or not isinstance(environment.get("PATH"), str)
+            or config.get("destination") != environment.get("RSS_BACKUP_DIR")
+            or not Path(config["destination"]).is_absolute()
+            or launchctl.name != "launchctl"
+            or not launchctl.is_absolute()
+            or str(launchctl.parent) not in environment["PATH"].split(os.pathsep)
+            or config.get("policy_id") != self._policy_id(config)
+        ):
+            raise ValueError("Invalid backup schedule ledger; inspect locally.")
+        if "registration_id" in config or "registered_at" in config:
+            if (
+                not config["active"]
+                or not isinstance(config.get("registration_id"), str)
+                or not config["registration_id"]
+                or datetime.fromisoformat(config["registered_at"]).utcoffset()
+                != timedelta(0)
+            ):
+                raise ValueError(
+                    "Invalid backup registration evidence; inspect locally."
+                )
+        return config
+
+    def _policy_id(self, config: dict[str, Any]) -> str:
+        """Identify the captured definition, UTC target and launcher/manifest pins."""
+        encoded = self._job.definition(config, RETRY_SECONDS)
+        policy = f"{config['hour']}:{config['minute']}:{config['owner']}:{config['manifest_sha256']}:{config['python_sha256']}"
+        return hashlib.sha256(encoded + policy.encode()).hexdigest()
 
     def _job_matches(self, config: dict[str, Any]) -> bool:
         """Verify the exact owned definition without adopting another job."""
@@ -153,17 +193,23 @@ class BackupSchedule:
         captured = self._job.capture(owner, directory)
         self._job.check(captured)
         encoded = self._job.definition(captured, RETRY_SECONDS)
-        policy = f"{hour}:{minute}:{captured['owner']}:{captured['manifest_sha256']}:{captured['python_sha256']}"
         config = {
             **captured,
             "hour": hour,
             "minute": minute,
             "timezone": "UTC",
             "destination": str(directory),
-            "policy_id": hashlib.sha256(encoded + policy.encode()).hexdigest(),
-            "active": False,
         }
-        if existing and {**existing, "active": False} != config:
+        config["policy_id"] = self._policy_id(config)
+        if (
+            existing
+            and {
+                k: v
+                for k, v in existing.items()
+                if k not in ("active", "registered_at", "registration_id")
+            }
+            != config
+        ):
             raise RuntimeFailure(
                 "Backup schedule settings changed; explicitly disable the owned schedule before re-enabling."
             )
@@ -184,25 +230,35 @@ class BackupSchedule:
             raise RuntimeFailure(
                 "Loaded backup job definition is missing; preserve the registration and inspect locally."
             )
-        self.runtime._save(SCHEDULE, config)
-        if not self.job.exists():
-            self._job.write(encoded)
-        if (
-            not loaded
-            and self._job.launch(
+        if not loaded:
+            self.runtime._save(SCHEDULE, {**config, "active": False})
+            if not self.job.exists():
+                self._job.write(encoded)
+            if self._job.launch(
                 config, "bootstrap", self._job.domain, str(self.job)
-            ).returncode
+            ).returncode:
+                raise RuntimeFailure(
+                    "Backup LaunchAgent activation failed; inspect the normal user's GUI session and retry enable. Configuration is not protection."
+                )
+        if (
+            loaded
+            and existing
+            and existing["active"]
+            and existing.get("registration_id")
         ):
-            raise RuntimeFailure(
-                "Backup LaunchAgent activation failed; inspect the normal user's GUI session and retry enable. Configuration is not protection."
-            )
-        config["active"] = True
-        self.runtime._save(SCHEDULE, config)
+            config = existing
+        else:
+            config["active"] = True
+            config["registration_id"] = uuid4().hex
+            config["registered_at"] = (
+                self.now if self.controlled_clock else datetime.now(timezone.utc)
+            ).isoformat()
+            self.runtime._save(SCHEDULE, config)
         return {
             "enabled": True,
             "job": str(self.job),
             "daily_utc": f"{hour:02}:{minute:02}",
-            "next_expected_attempt": self._next(config).isoformat(),
+            "next_expected_attempt": self._next(config, self._read(DAILY)).isoformat(),
         }
 
     def disable(self) -> dict[str, Any]:
@@ -214,10 +270,7 @@ class BackupSchedule:
             if os.path.lexists(self.job):
                 raise RuntimeFailure("Backup job is unowned; nothing removed.")
             return {"enabled": False}
-        if not self._job_matches(config):
-            raise RuntimeFailure(
-                "Backup job changed; nothing removed. Inspect locally."
-            )
+        self._removable_definition(config)
         if (
             self._job.loaded(config)
             and self._job.launch(
@@ -227,38 +280,84 @@ class BackupSchedule:
             raise RuntimeFailure(
                 "Backup job removal failed; configuration retained for inspection."
             )
-        self.job.unlink()
-        (self.runtime.state_dir / SCHEDULE).unlink()
+        self._unlink_durable(self._removable_definition(config))
+        self._unlink_durable(self.runtime.state_dir / SCHEDULE)
         return {"enabled": False, "archives_preserved": True}
 
+    def _removable_definition(self, config: dict[str, Any]) -> Path:
+        """Allow a missing plist, but never unlink an altered or foreign definition."""
+        from rss_aggregator.runtime import RuntimeFailure
+
+        path = self.job
+        if os.path.lexists(path) and not self._job_matches(config):
+            raise RuntimeFailure("Backup job definition changed; refusing removal.")
+        return path
+
+    @staticmethod
+    def _unlink_durable(path: Path) -> None:
+        """Persist unlink order, allowing an already completed stage on retry."""
+        path.unlink(missing_ok=True)
+        try:
+            descriptor = os.open(path.parent, os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _slot(self, config: dict[str, Any]) -> datetime:
-        """Identify today's UTC daily target; no pre-target catch-up on first enable."""
-        return self.now.replace(
+        """Identify the latest elapsed UTC slot, even on the other side of midnight."""
+        today = self.now.replace(
             hour=config["hour"], minute=config["minute"], second=0, microsecond=0
         )
+        return today if today <= self.now else today - timedelta(days=1)
 
-    def _same_target(
+    def _eligible(self, config: dict[str, Any], slot: datetime) -> bool:
+        """Exclude all targets before activation, including one earlier the same day."""
+        registered_at = config.get("registered_at")
+        return bool(
+            config["active"]
+            and registered_at
+            and datetime.fromisoformat(registered_at) <= slot
+        )
+
+    def _same_registration(
         self, daily: dict[str, Any] | None, config: dict[str, Any]
     ) -> bool:
-        """Bind daily eligibility to the exact captured policy and current instance."""
+        """Bind daily evidence to one successful registration and selected instance."""
         return bool(
             daily
-            and daily.get("slot") == self._slot(config).isoformat()
+            and config["active"]
+            and config.get("registration_id")
+            and daily.get("registration_id") == config["registration_id"]
             and daily.get("policy_id") == config["policy_id"]
             and daily.get("instance") == self.runtime.instance
         )
 
-    def _next(self, config: dict[str, Any]) -> datetime:
+    def _same_target(
+        self, daily: dict[str, Any] | None, config: dict[str, Any], slot: datetime
+    ) -> bool:
+        """Apply the current attempt budget only to this registration's elapsed slot."""
+        return bool(
+            daily
+            and daily.get("slot") == slot.isoformat()
+            and self._same_registration(daily, config)
+        )
+
+    def _next(self, config: dict[str, Any], daily: dict[str, Any] | None) -> datetime:
         """Describe the earliest daily/retry target (wakeup may lag 15 minutes)."""
         slot = self._slot(config)
-        daily = self._read(DAILY)
-        if self.now < slot:
-            return slot
-        if self._same_target(daily, config):
+        following = slot + timedelta(days=1)
+        if not self._eligible(config, slot):
+            return following
+        if self._same_target(daily, config, slot):
             if daily.get("outcome") == "success" or daily["count"] >= MAX_ATTEMPTS:
-                return slot + timedelta(days=1)
-            return datetime.fromisoformat(daily["attempted_at"]) + timedelta(
-                seconds=RETRY_SECONDS
+                return following
+            return min(
+                following,
+                datetime.fromisoformat(daily["attempted_at"])
+                + timedelta(seconds=RETRY_SECONDS),
             )
         return slot
 
@@ -307,6 +406,10 @@ class BackupSchedule:
             raise RuntimeFailure(
                 "Backup job missing, changed or not registered; inspect backup-status and the owned schedule locally."
             )
+        if not config.get("registration_id"):
+            raise RuntimeFailure(
+                "Backup registration lacks activation evidence; run rss backup-enable with the captured settings."
+            )
         try:
             if not self._selectors_match(config):
                 raise ValueError(
@@ -329,20 +432,12 @@ class BackupSchedule:
             ) from None
         slot = self._slot(config)
         daily = self._read(DAILY)
-        same_target = self._same_target(daily, config)
-        if self.now < slot or (
-            same_target
-            and (
-                daily.get("outcome") == "success"
-                or daily["count"] >= MAX_ATTEMPTS
-                or self.now
-                < datetime.fromisoformat(daily["attempted_at"])
-                + timedelta(seconds=RETRY_SECONDS)
-            )
-        ):
+        same_target = self._same_target(daily, config, slot)
+        next_attempt = self._next(config, daily)
+        if self.now < next_attempt:
             return {
                 "outcome": "not_due",
-                "next_expected_attempt": self._next(config).isoformat(),
+                "next_expected_attempt": next_attempt.isoformat(),
             }
         daily = {
             "slot": slot.isoformat(),
@@ -351,6 +446,7 @@ class BackupSchedule:
             "outcome": "running",
             "instance": self.runtime.instance,
             "policy_id": config["policy_id"],
+            "registration_id": config["registration_id"],
         }
         self.runtime._save(DAILY, daily)
         try:
@@ -361,7 +457,15 @@ class BackupSchedule:
             raise RuntimeFailure(
                 "Daily backup failed. Inspect rss backup-status, destination/dependencies and maintenance locally; no private diagnostics are emitted by this command."
             ) from None
-        self.runtime._save(DAILY, {**daily, "outcome": "success"})
+        self.runtime._save(
+            DAILY,
+            {
+                **daily,
+                "outcome": "success",
+                "archive": result["archive"],
+                "sha256": result["sha256"],
+            },
+        )
         return {"outcome": "success", "backup": result}
 
     def pending(self) -> bool:
@@ -480,10 +584,12 @@ class BackupSchedule:
             }
         daily = self._read(DAILY)
         slot = self._slot(schedule) if schedule else None
-        same_target = bool(schedule and self._same_target(daily, schedule))
+        same_target = bool(
+            schedule and slot and self._same_target(daily, schedule, slot)
+        )
         daily_due = bool(
             slot
-            and self.now >= slot
+            and self._eligible(schedule, slot)
             and not (same_target and daily.get("outcome") == "success")
         )
         missed = bool(
@@ -491,12 +597,20 @@ class BackupSchedule:
             and self.now > slot + timedelta(seconds=RETRY_SECONDS)
             and not same_target
         )
-        daily_fresh = bool(
-            daily
-            and schedule
-            and daily.get("policy_id") == schedule["policy_id"]
-            and daily.get("instance") == self.runtime.instance
+        daily_archive = (
+            Path(daily["archive"])
+            if schedule
+            and self._same_registration(daily, schedule)
             and daily.get("outcome") == "success"
+            and daily.get("archive")
+            and daily.get("sha256")
+            else None
+        )
+        daily_archive_available = bool(
+            daily_archive and not daily_archive.is_symlink() and daily_archive.is_file()
+        )
+        daily_fresh = bool(
+            daily_archive_available
             and 0
             <= (
                 self.now - datetime.fromisoformat(daily["attempted_at"])
@@ -511,17 +625,22 @@ class BackupSchedule:
                 self._job.check(schedule)
                 if not registered:
                     problem = "Backup job missing, changed or not registered; inspect/re-enable the owned schedule explicitly."
+                elif not schedule.get("registration_id"):
+                    problem = "Backup registration lacks activation evidence; run rss backup-enable with the captured settings."
             except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
                 problem = "Backup scheduler unavailable/conflicting; inspect job, launcher, native manifest and captured dependencies locally."
         return {
             "enabled": bool(schedule and schedule["active"]),
             "registered": registered,
+            "registered_at": schedule.get("registered_at") if schedule else None,
+            "registration_id": schedule.get("registration_id") if schedule else None,
             "busy": busy,
             "scheduler_problem": problem,
-            "next_expected_attempt": self._next(schedule).isoformat()
-            if schedule
+            "next_expected_attempt": self._next(schedule, daily).isoformat()
+            if schedule and schedule.get("registration_id")
             else None,
             "daily_attempt": daily,
+            "daily_archive_available": daily_archive_available,
             "daily_due": daily_due,
             "missed": missed,
             "latest_defer": self._read(DEFER),
@@ -542,11 +661,7 @@ class BackupSchedule:
                 and registered
                 and not problem
                 and daily_fresh
-                and success
-                and success.get("instance") == self.runtime.instance
-                and archive_available
                 and not daily_due
-                and not overdue
                 and not maintenance
                 and attempt
                 and attempt["outcome"] == "success"

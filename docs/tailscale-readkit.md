@@ -133,6 +133,9 @@ with the new settings after verification.
   Conditional writes may refuse a concurrent change; there is no global reset,
   automatic rollback or permission to adopt a route on uncertain ownership. Do
   not edit `serve.json`; a failed operation is not proof access is closed.
+  If private `start` or `verify` confirms Funnel reaches the current owned backend,
+  it requests backend shutdown without changing the route. Check whether shutdown
+  was confirmed and have the route owner resolve the exposure before reopening.
 - **PHP, readiness or authentication refusal:** resolve the cause locally before
   exposing access. Verify the instance, base URL, form authentication and separate
   API password. A wrong base URL can cause a redirect. Treat a failed confirmation
@@ -164,6 +167,6 @@ The [legacy device checks](https://github.com/brucepucci/rss-aggregator/blob/286
 confirmed origin-only configuration and bi-directional marking changes on a Mac
 and iPhone, with a server self-HTTPS diagnostic limitation. Those were Podman-era
 results, not current native evidence. Both native ReadKit clients, trusted remote
-HTTPS and post-cutover state are open owner-assisted checks for
-[#30](https://github.com/brucepucci/rss-aggregator/issues/30). Synthetic loopback
-or API tests do not pass them.
+HTTPS and post-cutover state require owner-assisted verification under the
+[native deployment spec](https://github.com/brucepucci/rss-aggregator/issues/30).
+Synthetic loopback or API tests do not satisfy those checks.

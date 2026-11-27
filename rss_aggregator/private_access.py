@@ -102,9 +102,9 @@ class PrivateAccess:
                 "HTTPS certificates are not enabled for this device; obtain approval before changing tailnet DNS/HTTPS settings."
             )
         config, _etag = self._config_client().read()
+        self._check_public_backend(config, port)
         record = self._record(owner)
         self._validate(config, record)
-        self._check_public_backend(config, port)
         netmap = self._query("debug", "netmap")
         rules = netmap.get("PacketFilter")
         if not isinstance(rules, list):
@@ -193,7 +193,9 @@ class PrivateAccess:
                     for handler in server.get("Handlers", {}).values()
                 )
                 if tcp_exposed or http_exposed:
-                    raise self.failure(
+                    from rss_aggregator.runtime import PublicBackendExposed
+
+                    raise PublicBackendExposed(
                         "Existing Funnel reaches this FreshRSS backend; preserve the "
                         "foreign route and resolve public exposure locally before "
                         "private start. No forwarding was changed."

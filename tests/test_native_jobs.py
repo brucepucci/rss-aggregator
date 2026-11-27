@@ -61,9 +61,10 @@ else:
 CLOCKED_CLI = f"""
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
-from rss_aggregator import backup_schedule, supervision
+from rss_aggregator import backup_schedule, recovery, supervision
 
 instant = datetime.fromisoformat('2026-01-02T04:00:00+00:00') + timedelta(
     seconds=int(os.environ.get('SYNTHETIC_SECONDS', '0'))
@@ -74,7 +75,20 @@ class Clock(datetime):
     def now(cls, tz=None):
         return instant.astimezone(tz)
 
-with patch.object(backup_schedule, 'datetime', Clock), patch.object(supervision.time, 'time', instant.timestamp):
+unlink = Path.unlink
+
+def fail_requested_unlink(path, *args, **kwargs):
+    target = os.environ.get('SYNTHETIC_UNLINK_FAILURE')
+    if target == str(path):
+        raise PermissionError('synthetic unlink failure')
+    return unlink(path, *args, **kwargs)
+
+with (
+    patch.object(backup_schedule, 'datetime', Clock),
+    patch.object(recovery, 'datetime', Clock),
+    patch.object(supervision.time, 'time', instant.timestamp),
+    patch.object(Path, 'unlink', fail_requested_unlink),
+):
     exec({CLI_IN_CHECKOUT!r})
 """
 
@@ -179,7 +193,7 @@ def jobs(tmp_path):
     checkout = JobCheckout(tmp_path)
     checkout.prepare_source()
     checkout.prepare_runtime()
-    checkout.environment["SYNTHETIC_SECRET"] = "do-not-capture"
+    checkout.environment.update(RSS_PORT="8080", SYNTHETIC_SECRET="do-not-capture")
     _tool(tmp_path / "launchctl", LAUNCHCTL)
     launcher = checkout.root / ".venv/bin/python"
     launcher.parent.mkdir(parents=True)
@@ -261,7 +275,8 @@ def test_owned_jobs_refuse_loaded_conflicts_and_keep_ledgers_on_removal_failure(
         loaded = home / "fake-launchd" / path.stem
         original = loaded.read_bytes()
         changed = json.loads(original)
-        changed["definition"]["EnvironmentVariables"]["RSS_PORT"] = "8029"
+        environment = changed["definition"]["EnvironmentVariables"]
+        environment["RSS_PORT"] = str(int(environment["RSS_PORT"]) + 1)
         loaded.write_text(json.dumps(changed))
         assert "foreign/changed loaded native job" in _refused(jobs, *options)
         assert path.is_file()
@@ -275,6 +290,64 @@ def test_owned_jobs_refuse_loaded_conflicts_and_keep_ledgers_on_removal_failure(
         (home / "bootout-refused").unlink()
         _success(jobs, *options)
         assert not path.exists() and not loaded.exists()
+
+
+def test_backup_disable_without_plist_requires_owned_ledger_and_loaded_identity(jobs):
+    plist = Path(_success(jobs, "backup-enable")["job"])
+    loaded = Path(jobs.environment["HOME"]) / "fake-launchd" / plist.stem
+    ledger = jobs.state / "backup-schedule.json"
+    plist.unlink()
+    original_ledger = ledger.read_bytes()
+    for change, diagnostic in [
+        ({"owner": "foreign"}, "ownership"),
+        ({"hour": 4}, "ledger"),
+    ]:
+        ledger.write_text(json.dumps({**json.loads(original_ledger), **change}))
+        assert diagnostic in _refused(jobs, "backup-disable")
+        assert loaded.is_file()
+    ledger.write_bytes(original_ledger)
+
+    original_loaded = loaded.read_bytes()
+    changed_loaded = json.loads(original_loaded)
+    changed_loaded["path"] = str(plist.with_name("other.plist"))
+    loaded.write_text(json.dumps(changed_loaded))
+    assert "foreign/changed loaded native job" in _refused(jobs, "backup-disable")
+    assert json.loads(loaded.read_bytes()) == changed_loaded
+    loaded.write_bytes(original_loaded)
+
+    assert _success(jobs, "backup-disable")["archives_preserved"] is True
+    assert not loaded.exists()
+    assert _success(jobs, "backup-status")["enabled"] is False
+    assert _success(jobs, "backup-disable")["enabled"] is False
+
+
+@pytest.mark.parametrize("stage", ["plist", "ledger"])
+def test_backup_disable_retries_an_unlink_failure_without_touching_foreign_file(
+    jobs, stage
+):
+    plist = Path(_success(jobs, "backup-enable")["job"])
+    loaded = Path(jobs.environment["HOME"]) / "fake-launchd" / plist.stem
+    ledger = jobs.state / "backup-schedule.json"
+    plist_contents = plist.read_bytes()
+    jobs.environment["SYNTHETIC_UNLINK_FAILURE"] = str(
+        plist if stage == "plist" else ledger
+    )
+    assert "synthetic unlink failure" in _refused(jobs, "backup-disable")
+    assert not loaded.exists()
+    assert plist.exists() is (stage == "plist")
+    assert ledger.is_file()
+    del jobs.environment["SYNTHETIC_UNLINK_FAILURE"]
+
+    plist.write_bytes(b"unrelated definition at the same path")
+    assert "changed" in _refused(jobs, "backup-disable")
+    assert plist.read_bytes() == b"unrelated definition at the same path"
+    assert ledger.is_file()
+    if stage == "plist":
+        plist.write_bytes(plist_contents)
+    else:
+        plist.unlink()
+    assert _success(jobs, "backup-disable")["archives_preserved"] is True
+    assert not plist.exists() and not ledger.exists()
 
 
 @pytest.mark.parametrize("drift", ["launcher", "manifest"])
@@ -402,10 +475,81 @@ def test_reconcile_refuses_active_owned_route_even_with_idle_writers(jobs):
     assert not (jobs.state / "operator-intent.json").exists()
 
 
+def test_end_of_day_slot_is_caught_after_midnight_and_superseded_by_next_slot(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    jobs.environment["SYNTHETIC_SECONDS"] = "71520"  # Jan 2, 23:52 UTC
+    enabled = _success(jobs, "backup-enable", "--hour", "23", "--minute", "59")
+    target = "2026-01-02T23:59:00+00:00"
+    assert enabled["next_expected_attempt"] == target
+    assert _success(jobs, "backup-due")["outcome"] == "not_due"
+    assert _success(jobs, "backup-status")["daily_attempt"] is None
+
+    jobs.environment["SYNTHETIC_SECONDS"] = "72420"  # Jan 3, 00:07 UTC
+    report = _success(jobs, "backup-status")
+    assert report["daily_due"] is True
+    assert report["next_expected_attempt"] == target
+    assert _success(jobs, "backup-due")["outcome"] == "success"
+    assert _success(jobs, "backup-status", "--check")["daily_attempt"]["slot"] == target
+    assert _success(jobs, "backup-due")["outcome"] == "not_due"
+
+    jobs.environment["SYNTHETIC_SECONDS"] = "332220"  # Jan 6, 00:17 UTC
+    report = _success(jobs, "backup-status")
+    assert report["missed"] is True
+    assert report["next_expected_attempt"] == "2026-01-05T23:59:00+00:00"
+    assert _success(jobs, "backup-due")["outcome"] == "success"
+    report = _success(jobs, "backup-status", "--check")
+    assert report["daily_attempt"]["slot"] == "2026-01-05T23:59:00+00:00"
+    assert report["daily_attempt"]["count"] == 1
+    assert report["next_expected_attempt"] == "2026-01-06T23:59:00+00:00"
+    assert _success(jobs, "backup-due")["outcome"] == "not_due"
+
+
+def test_enabling_past_target_waits_for_first_post_registration_slot(jobs):
+    enabled = _success(jobs, "backup-enable", "--hour", "3")
+    target = "2026-01-03T03:00:00+00:00"
+    assert enabled["next_expected_attempt"] == target
+    assert _success(jobs, "backup-due") == {
+        "outcome": "not_due",
+        "next_expected_attempt": target,
+    }
+    report = _success(jobs, "backup-status")
+    assert report["daily_due"] is False
+    assert report["missed"] is False
+    assert report["daily_attempt"] is None
+    assert report["latest_attempt"] is None
+
+
+def test_elapsed_slot_retries_across_midnight_but_does_not_exceed_budget(jobs):
+    _success(jobs, "backup-enable", "--hour", "23", "--minute", "59")
+    target = "2026-01-02T23:59:00+00:00"
+    for elapsed, count, following in [
+        (71940, 1, "2026-01-03T00:14:00+00:00"),
+        (72840, 2, "2026-01-03T00:29:00+00:00"),
+        (73740, 3, "2026-01-03T23:59:00+00:00"),
+    ]:
+        jobs.environment["SYNTHETIC_SECONDS"] = str(elapsed)
+        assert "Daily backup failed" in _refused(jobs, "backup-due")
+        report = _success(jobs, "backup-status")
+        assert report["daily_attempt"]["slot"] == target
+        assert report["daily_attempt"]["count"] == count
+        assert report["next_expected_attempt"] == following
+        assert _success(jobs, "backup-due") == {
+            "outcome": "not_due",
+            "next_expected_attempt": following,
+        }
+
+    jobs.environment["SYNTHETIC_SECONDS"] = "158340"  # Jan 3, 23:59 UTC
+    assert "Daily backup failed" in _refused(jobs, "backup-due")
+    daily = _success(jobs, "backup-status")["daily_attempt"]
+    assert daily["slot"] == "2026-01-03T23:59:00+00:00"
+    assert daily["count"] == 1
+
+
 def test_daily_failed_attempt_is_not_protection_and_does_not_resume_or_retry_early(
     jobs,
 ):
-    _success(jobs, "backup-enable", "--hour", "0")
+    _success(jobs, "backup-enable", "--hour", "4")
     with (jobs.state / "command.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert "Another project command" in _refused(jobs, "backup-due")
@@ -426,10 +570,74 @@ def test_daily_failed_attempt_is_not_protection_and_does_not_resume_or_retry_ear
     assert not (jobs.state / "operator-intent.json").exists()
 
 
+def test_identical_recapture_requires_its_own_daily_success(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    first = _success(jobs, "backup-due")["backup"]
+    before = _success(jobs, "backup-status", "--check")
+    _success(jobs, "backup-enable", "--hour", "4")
+    repeated = _success(jobs, "backup-status", "--check")
+    assert repeated["registration_id"] == before["registration_id"]
+
+    _success(jobs, "backup-disable")
+    _success(jobs, "backup-enable", "--hour", "4")
+    result = jobs.run("backup-status", "--check")
+    assert result.returncode == 1, result.stdout
+    report = json.loads(result.stdout)
+    assert report["registered"] is True
+    assert report["registered_at"] == before["registered_at"]
+    assert report["registration_id"] != before["registration_id"]
+    assert report["daily_attempt"]["registration_id"] == before["registration_id"]
+    assert report["daily_archive_available"] is False
+    assert report["daily_attempt"]["archive"] == first["archive"]
+    assert Path(first["archive"]).is_file()
+    second = _success(jobs, "backup-due")["backup"]
+    assert second["archive"] != first["archive"]
+    assert _success(jobs, "backup-status", "--check")["protected"] is True
+
+
+def test_manual_archive_cannot_replace_missing_daily_archive_in_protection(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    daily = _success(jobs, "backup-due")["backup"]
+    scheduled = jobs.environment["RSS_BACKUP_DIR"]
+    manual_destination = Path(jobs.environment["HOME"]) / "manual-backups"
+    manual_destination.mkdir(mode=0o700)
+    jobs.environment["RSS_BACKUP_DIR"] = str(manual_destination)
+    jobs.environment["SYNTHETIC_SECONDS"] = "60"
+    manual = _success(jobs, "backup")
+    jobs.environment["RSS_BACKUP_DIR"] = scheduled
+    assert _success(jobs, "backup-status", "--check")["protected"] is True
+
+    manual_path = Path(manual["archive"])
+    moved = manual_path.with_suffix(".retained")
+    manual_path.rename(moved)
+    report = _success(jobs, "backup-status", "--check")
+    assert report["archive_available"] is False
+    assert report["daily_archive_available"] is True
+    moved.rename(manual_path)
+
+    Path(daily["archive"]).unlink()
+    assert manual_path.is_file()
+    result = jobs.run("backup-status", "--check")
+    assert result.returncode == 1, result.stdout
+    report = json.loads(result.stdout)
+    assert report["archive_available"] is True
+    assert report["latest_success"]["archive"] == manual["archive"]
+    assert report["latest_success"]["via"] == "backup"
+    assert "writer_generation" in report["latest_success"]
+    assert report["daily_archive_available"] is False
+    assert report["daily_attempt"]["archive"] == daily["archive"]
+    assert report["daily_attempt"]["sha256"] == daily["sha256"]
+    assert report["protected"] is False
+
+
 def test_daily_archive_publication_remains_visible_when_resumption_fails(jobs):
     _restore_fixture(jobs, "first", "second")
     _success(jobs, "select-instance", "first")
-    _success(jobs, "backup-enable", "--hour", "0")
+    _success(jobs, "backup-enable", "--hour", "4")
     first = _success(jobs, "backup-due")["backup"]
     assert first["verified"] is True
     assert _success(jobs, "backup-status")["protected"] is True

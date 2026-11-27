@@ -460,21 +460,30 @@ class NativeInstall:
                 "Installed FreshRSS source tree changed; refusing to operate on it."
             )
 
+    def _require_owner(self, device: int) -> dict[str, Any]:
+        """Require a validated private receipt without inspecting the release tree."""
+        owner = self._read_owner(device)
+        if owner is None:
+            raise NativeInstallError(
+                "Native runtime has no ownership receipt; run rss setup only if the runtime path is absent."
+            )
+        return owner
+
+    def receipt(self) -> tuple[dict[str, Any], dict[str, str]]:
+        """Read ownership for shutdown even when the released files have drifted."""
+        owner = self._require_owner(self._state_device())
+        return owner, manifest_identity(owner["manifest"])
+
     def owned(
         self, *, require_current: bool = True, verify: bool = True
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Return the owner and installed identity, verifying the runtime by default.
 
         ``require_current=False`` checks against the installed receipt instead of
-        the checkout pin. ``verify=False`` is suitable only for read-only metadata
-        inspection; it does not attest that the installed bytes are unchanged.
+        the checkout pin. ``verify=False`` checks the layout, not the installed bytes.
         """
         device = self._state_device()
-        owner = self._read_owner(device)
-        if owner is None:
-            raise NativeInstallError(
-                "Native runtime has no ownership receipt; run rss setup only if the runtime path is absent."
-            )
+        owner = self._require_owner(device)
         if require_current and self.runtime._manifest() != owner["manifest"]:
             raise NativeInstallError(
                 "Native pin changed; setup and normal operation will not upgrade it implicitly."
