@@ -1,41 +1,24 @@
 # Personal RSS aggregator
 
-Collect feeds in one place and keep reading state shared across your devices,
-without giving up control of your subscriptions and collected articles.
-[FreshRSS](https://freshrss.org/) provides the reading service: subscriptions,
-feed fetching, articles, a browser interface and reader APIs. **This repository
-manages FreshRSS; it does not implement or fork it.** It adds a pinned container,
-guarded start/stop commands, complete instance backups, opt-in daily Mac backups
-and optional private HTTPS.
+Collect feeds in one place and keep reading state shared across your devices.
+[FreshRSS](https://freshrss.org/) supplies the browser interface, subscriptions,
+articles and APIs. **This repository manages FreshRSS; it does not fork it.** It
+runs FreshRSS natively on Apple Silicon macOS, with guarded lifecycle commands,
+complete instance backups and optional private HTTPS for ReadKit.
 
-The deployment is an **Apple Silicon Mac instance**, with manual operation by
-default and optional [normal-user-session startup/recovery](docs/operations.md#opt-in-mac-startup-and-recovery)
-and [daily backups](docs/backup-restore.md#opt-in-daily-mac-backups). Neither job is
-installed by default; backup scheduling does not enable application supervision.
-Already installed jobs require [safe removal/update/recapture](docs/operations.md#upgrade-installed-mac-jobs-safely)
-to apply the native process-lifetime repair; checkout alone does not update them.
-ReadKit on macOS and iOS has been verified with shared read/unread and starred state.
-[An owner-coordinated reboot/login check](https://github.com/brucepucci/rss-aggregator/issues/26#issuecomment-6937647568)
-verified automatic recovery, availability after the job exited and later healthy
-checks without container restart; the owner then confirmed
-[ReadKit availability](https://github.com/brucepucci/rss-aggregator/issues/26#issuecomment-6937683728).
-Intentional-stop across reboot, detailed client-state checks, natural daily backup
-timing, power/outage behavior and overall production acceptance remain outstanding;
-no pre-unlock availability is promised. Preview-first [safe cleanup and recreation](docs/operations.md#safe-cleanup)
-is available with a separately selected disposable-VM recovery drill. Native host
-uninstall and broader unrelated-resource preservation remain unverified. Always-on
-Linux deployment and paid-feed authorization remain future/unverified work.
-Readers cannot synchronize while the instance is stopped; explicit stop persists
-until explicit start.
+Manual operation is the default. Normal-user-session recovery and daily backups
+are independent opt-ins. The native deployment does not require Podman or a VM.
+Moving an existing Podman instance is a separate [owner-assisted migration](docs/operations.md#one-time-migration-from-podman),
+not part of ordinary setup or an in-place update. Real archive rehearsal,
+launchd/login, cutover, both ReadKit clients and independently retrieved Time
+Machine recovery are open native acceptance gates; historical VM checks do not
+certify the native service.
 
 ## Contents
 
 - [Architecture](#architecture)
 - [Getting started](#getting-started)
 - [Routine CLI commands](#routine-cli-commands)
-- [Daily backup setup and checks](docs/backup-restore.md#opt-in-daily-mac-backups)
-- [Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill)
-- [Safe upgrades for installed Mac jobs](docs/operations.md#upgrade-installed-mac-jobs-safely)
 - [Essential configuration](#essential-configuration)
 - [Common troubleshooting](#common-troubleshooting)
 - [FAQ](#faq)
@@ -55,313 +38,195 @@ until explicit start.
 ## Architecture
 
 ```text
-Publisher feeds ──feed fetching──> FreshRSS container (official image)
-                                  inside a dedicated rootless Podman VM
-                                    │
-                                    └── SQLite + complete data in named volume
-                                          └── verified backup ZIP outside VM/Git
-
-Local browser ──http://127.0.0.1:8080──> FreshRSS
-Other devices / ReadKit ──private HTTPS──> Tailscale Serve ──> same loopback listener
-                         client synchronization (articles + reading state)
+Publisher feeds ──feed fetching──> FreshRSS on native FrankenPHP/Caddy
+                                     └── SQLite and complete local instance data
+                                           └── verified backup ZIP outside Git
+Local browser ──HTTP 127.0.0.1:8080──> same instance
+Browser / ReadKit ──private HTTPS──> Tailscale Serve ──> same loopback listener
 ```
 
-FreshRSS fetches feeds at startup and at UTC minutes **00, 20 and 40** while
-running, subject to publisher caching/backoff. Synchronizing a reading app exchanges
-articles and reading state with FreshRSS; it is not a request to fetch publishers.
-The VM's named volume survives container replacement but **not VM deletion**.
-External backups are essential. Optional user-session launchd supervision observes
-health before bounded guarded recovery; it respects persistent operator stop and
-serialized backup maintenance. A separate opt-in LaunchAgent can make verified
-daily copies outside the VM/Git. Sleep/logout and failures limit both jobs; neither
-changes login, FileVault or power policy. Local publication alone does not prove
-Time Machine or host-loss protection.
-
-Only loopback HTTP is published on the Mac; optional Tailscale Serve adds
-trusted, tailnet-only HTTPS, not public access. There is no host PHP/database
-installation. See the [official FreshRSS manual](https://freshrss.github.io/FreshRSS/en/),
-[architecture details](docs/architecture.md) and
-[architecture decisions](docs/architecture.md#decisions) for rationale and limits.
+The [reviewed pin](config/native.json) is FreshRSS **1.30.4** at upstream revision
+[`08f97bd497ace733c151ea1c709d85cd5b65cc53`](https://github.com/FreshRSS/FreshRSS/commit/08f97bd497ace733c151ea1c709d85cd5b65cc53),
+FrankenPHP **1.14.0** with PHP **8.6.0** and Caddy **2.11.9**. They run as a normal
+Mac user from project-managed files, without global PHP or a separate database
+server. A private directory is not a sandbox. SQLite stays on local, non-synced
+storage. FreshRSS fetches on startup and at UTC minutes **00, 20 and 40** while
+running; reader synchronization exchanges articles and markings, not publisher
+fetch requests. When the instance is stopped, clients cannot synchronize.
 
 ## Getting started
 
-You need an Apple Silicon Mac with virtualization, [Homebrew](https://brew.sh/),
-Git and [uv](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`;
-internet access; a free loopback port (default `8080`); and roughly 2 GiB guest
-RAM plus VM overhead. Do not run another Podman VM while starting this one.
-The initial VM has 2 CPUs and 20 GiB virtual disk capacity.
+Use a normal user on an Apple Silicon Mac (macOS 12+), with Git, native
+[uv](https://docs.astral.sh/uv/getting-started/installation/), internet access
+and an unused loopback port. This path is for a **new local instance** without
+jobs or forwarding. For existing data, use [native recovery](docs/backup-restore.md#recovery-on-this-or-a-clean-host)
+or the [one-time legacy procedure](docs/operations.md#one-time-migration-from-podman)
+before an empty start.
 
 ```sh
 git clone https://github.com/brucepucci/rss-aggregator.git
 cd rss-aggregator
 uv sync --locked
 uv run --locked rss setup
-# Choose an absolute private directory outside EVERY Git checkout.
+# Explicit private destination outside every Git checkout; choose your own.
 export RSS_BACKUP_DIR="$HOME/Library/Application Support/rss-aggregator/backups"
+export RSS_TAILSCALE=0
 uv run --locked rss start
-uv run --locked rss status
 ```
 
-`setup` inventories the host, installs missing Podman CLI dependencies and
-initializes the dedicated VM. It refuses ownership conflicts and unapproved
-upgrades of existing packages; do not bypass these checks. No Podman Desktop,
-privileged helper or automatic startup is needed. See
-[setup details and refusals](docs/operations.md#installation-and-ownership).
-
-After `start` succeeds:
-
-1. Open **http://127.0.0.1:8080** (or the returned URL). Complete the installer with
-   **SQLite**, **Web form authentication** and one FreshRSS user with a strong
-   password. Enter credentials only in the local browser; never choose “None” authentication.
-2. Sign in. The initial subscription is the public
-   [FreshRSS releases feed](https://github.com/FreshRSS/FreshRSS/releases.atom).
-   Run `uv run --locked rss fetch` and confirm articles appear.
-3. In **Configuration → Archiving**, confirm age and maximum-article purge limits
-   are unchecked; avoid feed/category purge overrides.
-4. Mark an article read and starred. Run `uv run --locked rss replace` and sign
-   in again; confirm the subscription, articles and reading state survived.
-   Check again after `uv run --locked rss stop` then `uv run --locked rss start`.
-
-Keep `RSS_BACKUP_DIR` set for shutdown. `stop` creates a verified backup before
-stopping the VM. This releases VM memory and stops serving/fetching; it preserves
-application data. **Do not manually delete the VM, prune Podman, or remove `.local/`
-to clean up.** Use the separate preview-first [safe cleanup runbook](docs/operations.md#safe-cleanup).
+Open the returned loopback URL (normally **http://127.0.0.1:8080**). After startup
+passes its PHP checks, complete the installer with **SQLite**, **Web form
+authentication** and one FreshRSS user. Enter a strong password only in the local
+browser. Sign in, check the initial public FreshRSS releases subscription and run
+`uv run --locked rss fetch`. In **Configuration → Archiving**, check the age and
+maximum-article limits before you rely on keeping history. To finish, run
+`uv run --locked rss stop` and confirm the returned backup was verified. Keep the
+backup directory configured for subsequent shutdowns. A local backup is not an
+independent copy. See [setup and ownership safeguards](docs/operations.md#installation-and-ownership).
 
 ## Routine CLI commands
 
-Run these from the checkout. Results are indented JSON on stdout; diagnostics go
-to stderr and failures return nonzero. `./scripts/rss` is an equivalent launcher.
+From the checkout, run `uv run --locked rss <command>` (or `./scripts/rss
+<command>`). Results are JSON on stdout; diagnostics are on stderr and failures
+return nonzero. A successful status query alone does not establish health.
 
 | Command | Use |
 | --- | --- |
-| `uv run --locked rss start` | Explicitly enable running intent and start/recheck; a repeated start briefly restarts it. |
-| `uv run --locked rss status` | Inspect the VM, application, scheduler and private forwarding without starting anything. |
-| `uv run --locked rss fetch` | Fetch publisher feeds now, subject to caching/backoff. |
-| `uv run --locked rss backup` | Make a complete backup, then attempt to restore the previous serving state. |
-| `uv run --locked rss backup-status --check` | Check daily protection, freshness and separate resumption problems; nonzero if unhealthy. |
-| `uv run --locked rss stop` | Persist stopped intent, back up, remove owned forwarding and stop only the project VM. |
-| `uv run --locked rss supervision-status` | Check optional supervision, intent, observed health and recovery failures without restarting anything. |
-| `uv run --locked rss api-check` | Prompt for separate API credentials and check private HTTPS/API access. |
-| `uv run --locked rss remove-vm` | Preview exact owned VM removal; does not delete without the current confirmation digest and a fresh verified backup. |
-| `uv run --locked rss --help` | Show commands; append `--help` to any subcommand for its syntax. |
+| `setup` | Install or check the reviewed native runtime without starting it. |
+| `start` / `verify` | Start and record running intent, or restart/recheck an already running service without changing intent. |
+| `status` / `fetch` | Inspect the selected instance, listener and scheduler, or fetch publisher feeds now subject to cache/backoff. |
+| `stop` / `backup` | Stop writers and verify a shutdown backup, or back up and attempt to resume the prior serving mode. |
+| `backup-status --check` | Check eligible daily protection, freshness, maintenance and resumption. |
+| `supervision-status` | Inspect optional recovery, intent and failures. |
+| `api-check` | Prompt locally for separate API credentials and diagnose private HTTPS/API. |
+| `restore ARCHIVE --instance NAME` / `select-instance NAME` | Restore into a fresh named target, then explicitly select while stopped. |
+| `upgrade` / `uninstall` | Preview owned runtime changes. Read the [safeguards](docs/operations.md#safe-cleanup) before approving. |
 
-When `start` itself starts a stopped owned VM, it can recreate a matching stopped
-application on the same named data volume after all preflight checks. Container-layer
-diagnostics/customizations are discarded and web sessions may expire; persisted
-subscriptions, articles and reading state remain. Warm starts retain reuse. See
-[startup safeguards](docs/operations.md#start-verify-and-replace); a verified backup
-is still required before significant live changes.
-
-For restore, volume selection, replacement and all arguments, flags, defaults,
-outputs and failures, use the [complete CLI reference](docs/cli.md).
+Use `rss --help`, `rss COMMAND --help` and the [complete CLI reference](docs/cli.md)
+for exact syntax, results and failures.
 
 ## Essential configuration
 
-Set environment variables in the terminal before running commands; repeat them in
-new shells. The CLI does not load a `.env` file automatically.
+Export settings in the shell that runs the CLI; `.env` is not automatically read.
 
 | Setting | Default and ordinary use |
 | --- | --- |
-| `RSS_BACKUP_DIR` | **No default; required for backups, shutdown with data and VM removal.** Absolute private directory outside Git. Permissions are not encryption; keep durable independent copies. |
-| `RSS_PORT` | Optional, `8080`. Choose an unused port in `1024–65535` consistently. For installed instances, follow the [guarded port-change procedure](docs/configuration.md#changing-the-loopback-port): verified backup and captured-job removal/disablement must precede base-URL/replacement changes. |
-| `RSS_TAILSCALE` | Optional, `0` (local browser only). Use the [guarded private-HTTPS activation procedure](docs/tailscale-readkit.md#connect-and-verify-the-server): verified backup and captured-job removal/disablement precede setting `1`; verify private access before explicit optional recapture. |
-| `RSS_STATE_DIR` | Optional, `<checkout>/.local`. Private ownership records, **not the database**. Keep one controlling checkout; another worktree must explicitly use the original directory, not copy/fabricate it. |
+| `RSS_STATE_DIR` | `<checkout>/.local/native`. Private owned directory for native runtime, instance data and records. Legacy `.local` remains separate; do not point native commands at it. Use a fresh private path for each rehearsal. |
+| `RSS_BACKUP_DIR` | **No default.** Explicit absolute private directory outside Git, required for backups and shutdown with data. Rehearsal uses a separate destination. |
+| `RSS_PORT` | `8080`; unused IPv4 loopback port in `1024–65535`. Follow the [port-change procedure](docs/configuration.md#changing-the-loopback-port) for an existing deployment. |
+| `RSS_TAILSCALE` | `0`. Follow the [private-HTTPS procedure](docs/tailscale-readkit.md#connect-and-verify-the-server) before setting `1`. `0` does not turn off unrelated forwarding to the same port. |
 
-Enter passwords and private feed URLs only locally: in FreshRSS, or the hidden
-API-password prompt for diagnostics. Keep backups, logs and generated state out
-of Git and shared messages. Use the
-[full configuration reference](docs/configuration.md) for applying port/image
-changes, managed records and existing-user versus new-user settings.
+Keep passwords, private URLs, logs and archives out of Git and shared messages.
+See the [full configuration reference](docs/configuration.md).
 
 ## Common troubleshooting
 
-Start with `uv run --locked rss status` and the command's stderr message.
-A failed operation can leave the VM running; do not assume failure means the
-service is closed.
-
-- **Setup/ownership/port conflict:** preserve other workloads and ownership files;
-  follow [setup troubleshooting](docs/operations.md#common-troubleshooting), not a global reset.
-- **Backup or shutdown failure:** check `RSS_BACKUP_DIR`, permissions and disk space.
-  After shutdown quiesces writers, backup failure leaves the application stopped
-  and VM running; fix the cause and retry `stop`. A failed explicit `backup` may
-  have resumed serving. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
-- **Missed/stale daily backups or interrupted maintenance:** inspect
-  `rss backup-status --check`; follow [daily failure/reconciliation procedures](docs/backup-restore.md#daily-check-and-failure-response), not a forced restart or deleted lock.
-- **HTTP ready but fresh login fails:** a successful readiness response is not an
-  authenticated check. Preserve backups and follow the [login troubleshooting safeguards](docs/operations.md#common-troubleshooting);
-  do not recreate users or reset passwords just to make a restore pass.
-- **Missing articles:** check the [fetching FAQ](#why-are-articles-missing-or-feeds-no-longer-updating)
-  and [logs](#how-do-i-view-service-logs-and-investigate-feed-fetching-errors).
-- **ReadKit/certificate/API failure:** use the separate API password; check Tailscale
-  on both devices and `/api/` diagnostics. Never disable TLS verification.
-  [Private-access runbook](docs/tailscale-readkit.md).
-- **Startup/recovery unavailable or intentionally stopped:** check `rss supervision-status`
-  and its `action`; follow the [session-recovery procedure](docs/operations.md#daily-check-and-failure-response).
-  Do not bypass a maintenance hold or repeatedly run `start` against a healthy service.
-- **Security gate failure:** do not enter credentials or bypass checks.
-  [Security policy](docs/architecture.md#image-and-php-security-policy).
+- **Setup, ownership or port refusal:** leave existing files, jobs and listeners
+  intact; see [operator troubleshooting](docs/operations.md#common-troubleshooting).
+- **Backup/shutdown failure:** inspect destination, free space and status. A failed
+  explicit `backup` can have resumed service; shutdown export failure after
+  quiescing leaves writers stopped. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
+- **Stale daily backups or interrupted maintenance:** use `backup-status --check`
+  and the [reconciliation procedure](docs/backup-restore.md#interrupted-maintenance-and-reconciliation).
+  Do not remove locks or holds to force startup.
+- **HTTP is ready but you cannot sign in:** check the selected instance, URL and
+  credentials locally; preserve the source archive rather than resetting a user
+  to make recovery appear to pass.
+- **Fetching or reader trouble:** see the [fetching FAQ](#why-are-articles-missing-or-feeds-no-longer-updating)
+  and [private-access diagnostics](docs/tailscale-readkit.md#troubleshooting).
+  Do not bypass TLS or the startup security checks.
 
 ## FAQ
 
 ### How do I subscribe to a new feed or remove a subscription?
 
-In FreshRSS's browser interface, use **Subscription management → Add a feed or
-category**, then **Add a feed**, and enter the URL locally. To unsubscribe, open
-the subscription's settings and choose **Remove**. This deletes its collected
-articles (including starred articles and reading state) and related user queries;
-make an [instance backup](docs/backup-restore.md) first if you may want them back.
-Synchronize your reader afterward. Private URLs require the
-[credential precautions below](#how-do-i-safely-handle-privatepaid-feed-credentials).
+Use **Subscription management → Add a feed or category** in FreshRSS. To unsubscribe,
+open the subscription's settings and choose **Remove**. This can delete collected
+articles and their markings; make a complete backup first if you might need them.
+Synchronize your reader afterward.
 
 ### How do I import or export subscriptions?
 
-Use FreshRSS **Subscription management → Import / export** to import an OPML
-file. For an OPML-only export, select **Export list of feeds (OPML)** and deselect
-article exports (otherwise you may receive a ZIP). Inspect imported subscriptions
-and fetch before expecting articles. OPML transfers subscriptions and some
-feed-specific settings, **not** users, complete configuration, article history or
-reading state; it is not an instance backup. Exports may contain credential-bearing
-URLs, cookies or headers: keep them private. Feedbin migration is unvalidated;
-see [upstream import/export help](https://freshrss.github.io/FreshRSS/en/users/04_Subscriptions.html#import-export).
+Use **Subscription management → Import / export** for OPML. For an OPML-only
+export select the feed list and deselect article exports. OPML is **not** an
+instance backup: it cannot restore users, complete settings, article history or
+reading state. Even a subscription export can include private URLs or tokens.
+Feedbin migration is not covered.
 
 ### How do I back up and restore the complete FreshRSS instance?
 
-Set `RSS_BACKUP_DIR` and run `uv run --locked rss backup`. It briefly stops writers
-and verifies an external archive before attempting to resume the prior state.
-`stop` also backs up. Daily scheduling is opt-in: follow the
-[owner-coordinated setup and daily checks](docs/backup-restore.md#opt-in-daily-mac-backups),
-with a verified pre-change backup and this deployment's explicit private
-`~/FreshRSS-Backups` destination. No schedule is enabled by ordinary manual use.
-An actual unattended run and the [owner-assisted Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill)
-are still required: verify destination protection, retrieve a scheduled archive
-from a completed copy into private staging, then check full state in an isolated
-restored application. Inclusion settings or a fresh local archive are not that
-proof. This drill does not authorize overwriting or selecting production data.
-Copy successful archives to independent durable storage;
-there is no automatic pruning, encryption or upload.
-
-Restore validates a **trusted archive into a fresh volume**, then requires explicit
-selection and startup. Follow the [complete recovery procedure](docs/backup-restore.md#recovery-on-this-or-a-clean-host),
-including the matching image requirement; do not overwrite the current volume or
-copy ownership records. Verify login, subscriptions, articles and reading state.
+Export `RSS_BACKUP_DIR` and run `backup`; `stop` also backs up. For restore, use a
+trusted native ZIP and the exact recorded pin, then explicitly select the fresh
+target and start. See [backup and recovery](docs/backup-restore.md), including
+[opt-in daily backups](docs/backup-restore.md#opt-in-daily-mac-backups) and the
+[Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill).
+There is no automatic pruning, encryption or upload.
 
 ### How do I deploy, start, stop, and update the service?
 
-Use [Getting started](#getting-started) for the supported Mac deployment, and
-`rss start` / `rss stop` through the launcher above for daily operation.
-Always-on Linux deployment is not implemented. A sleeping/stopped host cannot
-provide reliable fetching or synchronization.
-
-There is no automatic image update. Follow
-[image updates and rollback](docs/backup-restore.md#image-updates-and-rollback):
-verified backup and successful owned-supervision removal must precede a reviewed
-pin change. Guarded replacement and application/state verification precede explicit
-optional reinstallation with the new configuration; manual-only use stays disabled.
-Never assume an older image can open a newer database.
+Use [Getting started](#getting-started) and `start`/`stop`. Updating the checkout
+or rerunning `setup` does not upgrade the native runtime. Use the
+[explicit reviewed upgrade procedure](docs/operations.md#upgrade-the-pinned-runtime);
+do not assume a new runtime can activate old data or an older release can read
+newer data. No Linux or Intel Mac deployment is supported here.
 
 ### How do I enable automatic Mac startup and check recovery?
 
-Follow the [opt-in startup/recovery procedure](docs/operations.md#opt-in-mac-startup-and-recovery):
-obtain a verified private backup and owner approval before real installation,
-select a stable checkout, then explicitly install user-session supervision.
-`rss supervision-status` reports intent, session/health, recent failures and the
-next operator action. Healthy ticks do not restart FreshRSS; persistent failures
-have a bounded retry budget. `rss stop` remains stopped across ticks/login/reboot
-until `rss start`; backups never undo that intent. Safe removal preserves the app,
-data, backups and unrelated jobs. Actual reboot/login/security/power limitations
-require separately recorded owner acceptance; automated tests are not that evidence.
+After an owner-approved setup and verified backup, follow
+[opt-in startup and recovery](docs/operations.md#opt-in-mac-startup-and-recovery).
+Install only the wanted job. `supervision-status` distinguishes explicit stop,
+maintenance and failed recovery; only explicit `start` changes stopped intent.
+There is no service before login/unlock and no change to sleep or FileVault.
 
 ### How do I safely remove and recreate the environment?
 
-Use the [cleanup and recovery runbook](docs/operations.md#safe-cleanup), not a global
-Podman reset or directory sweep. `stop` retains data; `replace` retains its volume.
-`remove-vm` defaults to inspection and requires explicit current-plan confirmation,
-removed captured jobs and a fresh independently validated external backup before
-VM deletion. Unbacked secrets, artifacts, pods, custom networks and build caches on
-either inspected engine block removal. Only a verified synthetic stock network
-baseline is disposable: the selected APIs, fresh local listings and unchanged stock
-service/configuration provenance must agree. The conservative gate requires guest
-Podman 6.2.0/Netavark, Python 3.11+ and Linux service/process inspection tools;
-custom, stale or unavailable proof retains the VM without repair or restart.
-See [prerequisites and safeguards](docs/operations.md#preview-and-remove-the-vm).
-Packages and archives remain. [Automatic VM removal supports only a project-only VM](docs/operations.md#safe-cleanup),
-as approved in issue #5. Establish exclusive project use before applying: a shared
-or repurposed guest, other users' engines, historical/alternate stores, or uncertainty
-means retain the VM and recover/migrate the project instead. Preview does not prove
-VM-wide exclusivity. Optional `remove-package` is separately
-previewed/confirmed per project-added formula and requires an unused-elsewhere
-attestation; `delete-volume` is separate **irreversible**, unselected-volume deletion
-with **no automatic backup**. Backup deletion is manual exact-file review only.
-
-To recover after successful removal: `setup`, then `restore ARCHIVE --volume NEW`
-**before any empty `start`**, then `select-volume NEW` and `start`, using the recorded
-compatible image. Verify fresh login, subscriptions, article content and read/star
-state. Unavailable or partially removed VMs require inspection/recovery, never a
-data-loss override or fabricated ownership records. Use the [selected native drill](docs/development.md#cleanup-verification-and-remaining-native-evidence)
-for revision-specific full-state acceptance; default tests alone do not establish
-it or prove real host-uninstall/broader unrelated-resource preservation.
+Follow [safe cleanup](docs/operations.md#safe-cleanup). Stop and back up, remove
+both owned jobs if installed, then preview and explicitly confirm `uninstall`.
+It preserves data and archives; `setup` with the same pin can reinstall the
+runtime. Permanent data deletion is a separate decision. Do **not** delete legacy
+state or its VM: [retirement](docs/operations.md#legacy-retirement-gate) has separate
+owner gates.
 
 ### How do I move the aggregator to another machine?
 
-Make and privately transfer a verified instance backup plus the matching reviewed
-project configuration to a compatible Apple Silicon Mac. Follow the
-[clean-host recovery procedure](docs/backup-restore.md#recovery-on-this-or-a-clean-host),
-using fresh ownership records and rechecking base URL, backup destination and
-Tailscale access. Copying the checkout or exporting OPML alone does not move the
-instance. Physical second-host and cross-architecture/Linux recovery remain
-unverified; the automated recovery drill uses isolated state on one Mac.
+Transfer a verified native archive privately, keep the matching reviewed pin and
+follow the [clean-host recovery procedure](docs/backup-restore.md#recovery-on-this-or-a-clean-host)
+on a compatible Apple Silicon Mac. Make fresh ownership records and recheck
+host-specific configuration. Copying a checkout or OPML alone is not migration.
 
 ### How do I connect a reading app or access the instance from another device?
 
-Follow the [guarded private-HTTPS activation runbook](docs/tailscale-readkit.md#connect-and-verify-the-server).
-It uses the existing Tailscale installation on all devices, approved DNS/HTTPS and
-narrow TCP 443 access; port 8080 remains loopback-only. Obtain a verified backup
-and successfully remove/disable captured jobs **before** setting `RSS_TAILSCALE=1`.
-Verify private HTTPS/authentication before explicitly recapturing any wanted jobs;
-changing the shell alone can leave later recovery in loopback mode.
-
-In ReadKit choose **FreshRSS**, the **instance origin without `/api/greader.php`**,
-the same FreshRSS user on both devices, and a separate API password set locally
-in FreshRSS **Profile**. The web password is not the API password. Other readers
-are not verified here. The server Mac's self-HTTPS diagnostic has a known limitation;
-explicit `api-check --loopback` is supplemental and does not verify remote HTTPS.
+Follow the [private HTTPS/ReadKit runbook](docs/tailscale-readkit.md). In ReadKit
+choose **FreshRSS**, enter the HTTPS **origin** (without `/api/greader.php`), and use
+the same FreshRSS user and its **separate API password** on both devices. Native
+client acceptance is owner-assisted; loopback API checks are not HTTPS evidence.
 
 ### Why are articles missing or feeds no longer updating?
 
-Confirm the Mac/VM is awake and running, finish the installer, and check `rss status`.
-Run `rss fetch`; it reports that fetching ran, not that a publisher supplied new
-content. FreshRSS fetches at startup and UTC minutes 00/20/40, respecting feed TTL,
-HTTP caches and publisher backoff. Refreshing ReadKit only synchronizes with the
-instance. Check subscription errors and [logs below](#how-do-i-view-service-logs-and-investigate-feed-fetching-errors).
-Feeds may offer only excerpts; full-page scraping is not configured. Check user,
-category and feed archiving policies if older articles disappear.
+Check `status`, finish the installer and try `fetch`. FreshRSS respects feed TTL,
+HTTP caching and publisher backoff; a successful fetch need not produce new
+articles. ReadKit synchronization does not fetch publisher feeds. Check the
+subscription's errors and archiving rules; feeds can contain excerpts only.
 
 ### How do I view service logs and investigate feed-fetching errors?
 
-Use FreshRSS's **configuration (gear) menu → Logs** for user/feed warnings and
-errors; inspect affected subscriptions in **Subscription management**. For container
-startup output and the
-latest cron execution output, follow the exact commands in
-[service logs](docs/operations.md#service-logs-and-feed-errors). Production logs do
-not record every successful fetch, and cron output is transient. Logs can contain
-private feed URLs: inspect locally, redact before sharing, and never enable raw
-credential tracing just to collect evidence.
+Open FreshRSS **Configuration → Logs** or the affected subscription, and inspect
+`status` and the command's stderr. See [service logs](docs/operations.md#service-logs-and-feed-errors)
+for retained diagnostics and secret-handling rules.
 
 ### How do I safely handle private/paid feed credentials?
 
-Treat a subscriber-specific URL as a password. Enter it only in the local
-FreshRSS subscription form, never in command arguments, Git, chat, screenshots or
-issues. Keep exported subscriptions, logs and backups private; permissions alone
-do not encrypt them. If exposed, revoke/rotate the credential with the publisher.
-Paid entitlement and private authentication are different: not every paid feed uses
-the same mechanism. The planned paid-feed acceptance work is not complete; no
-claim is made that a particular publisher's authentication or full content works.
+Treat a private URL as a password. Enter it locally in FreshRSS, never in command
+arguments, Git, chat, screenshots or shared evidence. Keep exports, logs and
+backups private; permissions are not encryption. If exposed, rotate the credential
+with the publisher. Paid access is an entitlement, not an authentication mechanism;
+no particular paid publisher is certified here.
 
 ## Documentation
 
-- **Operator reference:** [CLI](docs/cli.md), [configuration](docs/configuration.md),
-  [operations and logs](docs/operations.md), [backup/recovery](docs/backup-restore.md),
+- **Operator:** [CLI reference](docs/cli.md), [configuration](docs/configuration.md),
+  [operations](docs/operations.md), [backup/recovery](docs/backup-restore.md),
   [private HTTPS/ReadKit](docs/tailscale-readkit.md).
-- **Development:** [setup, checks, Python adoption and verification limits](docs/development.md),
-  [architecture and ADRs](docs/architecture.md), [domain glossary](GLOSSARY.md).
-- **Agents:** [documentation rules and procedure index](AGENTS.md).
+- **Developer:** [setup, checks and limits](docs/development.md),
+  [architecture and decisions](docs/architecture.md), [glossary](GLOSSARY.md).
+- **Agent:** [documentation rules and procedure index](AGENTS.md).

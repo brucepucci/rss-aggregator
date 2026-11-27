@@ -1,0 +1,7 @@
+# Run pinned FreshRSS natively on Apple Silicon
+
+Status: Accepted ([issue #30](https://github.com/brucepucci/rss-aggregator/issues/30)). Supersedes [ADR 0001](0001-isolate-local-development-with-podman.md) for this deployment; retains [ADR 0002](0002-portable-state-with-consistent-external-backups.md) and [ADR 0003](0003-private-tailscale-access-and-shared-reading-state.md).
+
+Run the same upstream FreshRSS release as a normal macOS user with checksum-pinned FreshRSS source and FrankenPHP (PHP/Caddy) under project-owned state. Retaining Podman would keep VM isolation but still reserve guest memory; depending on globally upgraded Homebrew PHP would lose the reviewed per-installation runtime pin. Native operation removes the VM dependency but gives up its isolation: private files are not a sandbox, and the service has the user's permissions.
+
+Keep SQLite local, the listener on loopback, optional private Serve, independent opt-in user-session jobs, and consistent external instance backups. Use a one-way same-release import into fresh data, with separate selection and local verification, rather than sharing data or operating both backends indefinitely. Keep the stopped legacy instance intact until owner-assisted client and independent native recovery gates pass; it is not a rollback copy after native writes. Runtime upgrades and removal require explicit approval and do not delete data or archives.

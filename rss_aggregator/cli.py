@@ -33,7 +33,7 @@ def main() -> None:
 
 @main.command()
 def setup() -> None:
-    """Set up the owned rootless VM without starting services."""
+    """Verify and install the pinned native runtime without starting services."""
     _execute("setup")
 
 
@@ -45,7 +45,7 @@ def start() -> None:
 
 @main.command()
 def status() -> None:
-    """Report project machine, application, and available readiness metadata."""
+    """Report the native installation, active instance, readiness and scheduling."""
     _execute("status")
 
 
@@ -81,62 +81,28 @@ def fetch() -> None:
 
 @main.command()
 def verify() -> None:
-    """Recheck effective Apache PHP security before reopening service."""
+    """Recheck effective web PHP security before reopening service."""
     _execute("verify")
 
 
 @main.command()
-def replace() -> None:
-    """Replace the application container while preserving its named data volume."""
-    _execute("replace")
-
-
-@main.command()
 def stop() -> None:
-    """Back up stopped writers before stopping the project VM."""
+    """Stop native writers and verify a complete shutdown backup."""
     _execute("stop")
 
 
-@main.command("remove-vm")
-@click.option(
-    "--confirm",
-    help="Apply only the current preview's SHA-256 confirmation. Default: preview only.",
-)
-def remove_vm(confirm: str | None) -> None:
-    """Preview removal of the dedicated VM; applying first makes a fresh backup."""
-    _execute("remove-vm", confirm=confirm)
+@main.command()
+@click.option("--confirm", help="Apply only this SHA-256 preview confirmation.")
+def uninstall(confirm: str | None) -> None:
+    """Preview owned-runtime removal; preserve instance data and backups."""
+    _execute("uninstall", confirm=confirm)
 
 
-@main.command("delete-volume")
-@click.argument("volume")
-@click.option(
-    "--confirm",
-    help="Irreversibly delete only the current preview's target. Default: preview only.",
-)
-def delete_volume(volume: str, confirm: str | None) -> None:
-    """Preview permanent deletion of one inactive, owned VOLUME; preserve backups."""
-    _execute("delete-volume", volume=volume, confirm=confirm)
-
-
-@main.command("remove-package")
-@click.argument("package")
-@click.option(
-    "--confirm",
-    help="Apply only the current preview's SHA-256 confirmation. Default: preview only.",
-)
-@click.option(
-    "--unused-elsewhere",
-    is_flag=True,
-    help="Attest that this exact package is unused by other projects; required to apply.",
-)
-def remove_package(package: str, confirm: str | None, unused_elsewhere: bool) -> None:
-    """Preview removal of one project-added Homebrew formula, never a sweep."""
-    _execute(
-        "remove-package",
-        package=package,
-        confirm=confirm,
-        unused_elsewhere=unused_elsewhere,
-    )
+@main.command()
+@click.option("--confirm", help="Apply only this SHA-256 preview confirmation.")
+def upgrade(confirm: str | None) -> None:
+    """Preview an explicit upgrade to this checkout's reviewed runtime pin."""
+    _execute("upgrade", confirm=confirm)
 
 
 @main.command("api-check")
@@ -221,17 +187,25 @@ def backup_status(check: bool) -> None:
 @main.command()
 @click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
-    "--volume",
+    "--instance",
     required=True,
-    help="Fresh target volume name; never overwrites or activates.",
+    help="Fresh target instance name; never overwrites or activates.",
 )
-def restore(archive: Path, volume: str) -> None:
-    """Validate ARCHIVE and restore its data into a fresh owned volume."""
-    _execute("restore", archive=archive, volume=volume)
+def restore(archive: Path, instance: str) -> None:
+    """Validate a native ARCHIVE and restore it into a fresh owned instance."""
+    _execute("restore", archive=archive, instance=instance)
 
 
-@main.command("select-volume")
-@click.argument("volume")
-def select_volume(volume: str) -> None:
-    """Explicitly select an owned data volume while the application is stopped."""
-    _execute("select-volume", volume=volume)
+@main.command("select-instance")
+@click.argument("instance")
+def select_instance(instance: str) -> None:
+    """Explicitly select an owned instance while all writers are stopped."""
+    _execute("select-instance", instance=instance)
+
+
+@main.command("import-legacy", hidden=True)
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--instance", required=True, help="Fresh native target; never activates.")
+def import_legacy(archive: Path, instance: str) -> None:
+    """One-time migration: import a verified Podman ARCHIVE into a fresh instance."""
+    _execute("import-legacy", archive=archive, instance=instance)

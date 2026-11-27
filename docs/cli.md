@@ -1,469 +1,110 @@
 # CLI reference
 
-Complete project command syntax, defaults, outputs and failure contracts. Start
-with the [operator guide](../README.md); see [operations](operations.md) for
-lifecycle/troubleshooting, [configuration](configuration.md) for settings,
-[backup and recovery](backup-restore.md), and [private access](tailscale-readkit.md).
-Developer setup, verification scope and the callable Python interface are in
-[development](development.md).
+For procedures and safety checks, see [operations](operations.md), [backup and restore](backup-restore.md), and [Tailscale and ReadKit](tailscale-readkit.md). Select the intended [runtime configuration](configuration.md) before operating on an instance.
 
 ## Entrypoints and help
 
-Run from a synchronized checkout (`uv sync --locked` first):
-
-| Invocation | Purpose and accepted arguments/options |
-| --- | --- |
-| `uv run --locked rss [--help] COMMAND` | Runtime group; `COMMAND` is one of the twenty-three operations below. |
-| `uv run --locked python -m rss_aggregator [--help] COMMAND` | Identical runtime group through the Python module entrypoint; Python's `-m` selects the module. |
-| `./scripts/rss [--help] COMMAND` | Compatibility shell launcher; forwards all arguments unchanged to `uv run --locked --project <launcher-checkout> rss`. Works from another directory; requires executable script and uv on `PATH`. It is not a Python module to pass to `python3`. |
-| `uv run --locked rss-dev [--help] COMMAND` | Developer group; `COMMAND` is one of the four operations below. |
-
-`--help` at either group or any subcommand prints conventional text usage to
-stdout and exits 0 without operating on the instance or installing hooks:
+Run commands from the selected checkout after `uv sync --locked`:
 
 ```sh
 uv run --locked rss --help
-./scripts/rss start --help
-uv run --locked rss-dev setup --help
+uv run --locked rss restore --help
+uv run --locked rss-dev --help
 ```
 
-Click exposes `--help`, not `-h`. Invoking a group without a command displays usage
-and exits 2. Unknown commands, extra positional arguments and unsupported options
-also exit 2 with stderr usage/diagnostics, not operation JSON. There is no implicit
-operation. uv or launcher failures can occur before Click starts and produce
-stderr diagnostics/nonzero status without JSON.
+`rss COMMAND [ARGS]` manages the native runtime. `rss-dev` manages Python tooling, not FreshRSS. `uv run --locked python -m rss_aggregator` is equivalent to `rss`. Both groups and their subcommands accept `--help`, which prints text and exits 0 without running the operation. There are no other project-defined group options. Subcommand options belong after the subcommand.
 
-`rss` has no `--project` option. The launcher's `--project` is a **uv** option
-selecting its checkout, not a runtime option. In contrast, `rss-dev` subcommands
-have their own `--project`, described below. uv options such as `--locked` and
-`--offline` precede the executable name; `--offline` controls uv's network access,
-not the invoked application's access to live services.
+`rss` emits one indented JSON object on successful operations (exit 0). Diagnostics and prompts go to stderr. Guard, configuration and operation failures exit 1 and normally have no result JSON; see the exception for `backup-status --check`. Invalid CLI usage exits 2. Commands may initialize private control state even for inspection. Some errors occur after work has started: a nonzero exit does not establish that no files changed, no archive was published, or forwarding was withdrawn. Use the corresponding status commands and follow the runbooks before retrying. JSON can contain local paths, private hostnames, or aggregate counts; redact before sharing.
 
 ## Runtime commands and results
 
-Use `uv run --locked rss COMMAND` or either runtime alias above. Every subcommand
-accepts `--help`. Except for `api-check`, `restore`, `select-volume`,
-`backup-enable`, `backup-status`, `remove-vm`, `delete-volume` and `remove-package`, commands
-have **no positional arguments or options other than `--help`**.
+Use `uv run --locked` before each command below. There are no arguments or flags beyond those shown and `--help`.
 
-Successful operations emit exactly one indented JSON object on stdout and exit 0.
-Progress/underlying command chatter goes to stderr. Runtime/configuration/external
-command failures exit 1 with stderr diagnostics and **no result JSON**; invalid
-usage exits 2. Exception: `backup-status --check` emits inspection JSON and exits
-1 when protection is unhealthy. Capture stdout separately when consuming results. Results are
-operation-specific, not a universal envelope; there is no extra text-output mode.
+| Command | Purpose, behavior and result |
+| --- | --- |
+| `rss setup` | Install the checkout's checksum-pinned Apple Silicon runtime, or verify a matching existing installation. Returns the native ownership receipt (`schema`, `token`, `manifest`, `source_tree_sha256`). Does not start services or install jobs. Refuses foreign paths, drift, and implicit upgrades. |
+| `rss start` | Record running intent after the maintenance guard and start, reopen, or retain the verified matching backend on loopback. A new local instance allows the upstream installer; an initialized instance gets authentication/SQLite checks and startup fetching. A requested private route is published only after the startup gates. Returns `runtime`, `application`, `url`, `instance`, `security`, `scheduler`, `fetch`, and `forwarding` when private; a retained service also includes status fields. `fetch.status` is `installer_pending`, `completed` or `already_running`. |
+| `rss status` | Inspect without starting writers. Always reports `runtime` (`installed`/`absent`), `application` (`running`/`stopped`/`unconfirmed`) and `http_ready`. For an installed runtime it includes `instance`, `scheduler` and `forwarding`; `url` and `port` appear when a live generation is observed. A successful status is not a health attestation; check `http_ready`, scheduler and forwarding separately. |
+| `rss fetch` | Attempt an immediate upstream fetch on the selected, verified running service, respecting FreshRSS cache, TTL and backoff. JSON `status` is `completed` or `installer_pending`. An overlapping fetch or unready service can be refused. Completion is not a count of new articles. |
+| `rss verify` | Reopen the live owned service through the startup checks, preserving its observed private/local mode. Requires a running service; can briefly interrupt access. Returns the `start` result plus `verified: true`. Not a trusted-client HTTPS check. |
+| `rss stop` | Persist explicit stopped intent, withdraw owned forwarding, stop writers and verify a shutdown backup when selected data exist. Returns `application: "stopped"`, `already_stopped`, and `backup` (a verified archive result or `{"status":"no_data"}` on a pristine installation). A backup failure can leave writers stopped and still return exit 1. Inspect `backup-status`; correct the cause before retrying. A maintenance hold may block further work even when stopped intent was recorded. |
+| `rss api-check [--loopback]` | Prompt locally for the FreshRSS username and hidden **separate API password**. Default uses the owned trusted HTTPS origin; `--loopback` explicitly tests only the owned `127.0.0.1` backend, without checking TLS. Both require a verified running service. Returns `diagnostics: "PASS"`, `authenticated`, `subscriptions` and `sample_articles` counts, `transport` (`https`/`loopback`) and `https_verified`; never returns credentials, tokens or response bodies. Refuses redirects, untrusted HTTPS, rejected credentials or unusable responses. |
+| `rss backup` | Quiesce writers and publish a complete verified archive to the configured destination. Attempt to restore the observed prior running/forwarding mode if allowed by intent. Returns `archive` (absolute ZIP path), `sha256` (whole ZIP), `verified`, `manifest`. Publication and resumption can succeed or fail independently; inspect `backup-status` on failure. |
+| `rss restore ARCHIVE --instance NAME` | Read an existing native v2 archive into a **fresh** owned instance without selecting or starting it. `ARCHIVE` must be an existing file path; `--instance` is required and has no default. Returns `restored: true`, `instance`, `selected: false`, `manifest`, `next_step`. Refuses incompatible runtime metadata, unsafe archives, the selected name and existing targets. |
+| `rss select-instance NAME` | Select a complete, compatible owned instance by name (not a path) while all writers are stopped and maintenance is clear. Returns `instance`, `selected: true`, `next_step`; starting is separate. A later enabled supervisor may honor retained running intent; explicitly stop before changing selection. |
 
-| Command | Purpose and prerequisites | JSON result fields |
-| --- | --- | --- |
-| `rss setup` | Inventory/install the missing Podman CLI and initialize the owned rootless VM. Does not start or stop services. Existing unowned resource names and installation plans upgrading/reinstalling existing packages are refused; there is no bypass. | `machine: "rss-aggregator"`, `created: boolean`. |
-| `rss start` | After the maintenance guard passes, persist running intent (even if subsequent startup fails), reset recovery attempts, then start the VM if necessary, restart/reuse or create the application (including guarded cold recreation described below), copy both new-user templates while stopped, pass security/readiness/scheduler/fetching gates, and optionally configure private HTTPS/API. Repeated starts interrupt the application, not create duplicate data/users/subscriptions. | `machine: "running"`, `url` (HTTPS when opted in, otherwise loopback), `security`, `scheduler`, `fetch`; private starts also include `forwarding: {status: "running", url}`. |
-| `rss status` | Inspect without starting services. Checks scheduler and HTTP readiness when the app runs; unhealthy cron/readiness, ownership or forwarding checks fail rather than return a healthy result. | `machine`, `application`, selected `volume`, `forwarding`; when available `http_ready`, `scheduler`, `security`. An unconfigured checkout returns only machine/application `"absent"`. With a stopped VM, application is `"unknown"`, not a claim its container disappeared. |
-| `rss api-check [--loopback]` | Prompt locally; check GReader diagnostics and authenticated read access without changing reading state. Requires an owned running app, a matching application security audit and active owned forwarding in **both** modes. | `diagnostics: "PASS"`, `authenticated: true`, integer `subscriptions`, integer `sample_articles` (at most one requested article, not a total), `transport: "https"` / `"loopback"`, `https_verified: true` / `false`. |
-| `rss fetch` | Run feed actualization immediately; requires the owned VM/application to be running. | `status: "installer_pending"` or `"completed"`. Completion means actualization ran, not that new publisher content was guaranteed; upstream cache/TTL/backoff still apply. |
-| `rss verify` | Requires a running owned VM; runs the normal start/restart path, including effective Apache PHP, cron and immediate fetching checks. Can start a stopped application; briefly interrupts a running one. | Start fields plus `verified: true`. |
-| `rss replace` | Requires a running owned VM and selected owned data volume. Stop/remove only the owned application container, then recreate it with current configuration, preserving named volumes. First-recovery-activation pin and opt-in checks precede removal. | Start fields plus `replaced: true`. |
-| `rss backup` | Quiesce writers, create/verify an external archive in `RSS_BACKUP_DIR`, then attempt to restore prior application/forwarding/VM state, even on snapshot failure. Can temporarily start an owned stopped VM without starting the application. | `archive`, `sha256`, `verified: true`, `manifest`. |
-| `rss backup-enable [--hour H] [--minute M]` | Explicitly install/activate the owned daily Mac LaunchAgent. Requires the normal user's GUI session, synchronized selected checkout `.venv`, absolute dependency PATH, existing VM ownership, private state/destination and a verified pre-change backup plus owner coordination for production. Captures settings; identical repeats are safe. | `enabled: true`, `job`, `daily_utc`, `next_expected_attempt` (UTC ISO timestamp). Activation failure is not successful protection. |
-| `rss backup-disable` | Remove only the exact unchanged owned job under the project lock; never interrupts active work. Refuses foreign/changed definitions and unexpected launchd inspection errors, preserving registration for inspection/retry. | `enabled: false`; removal also returns `archives_preserved: true`. Already unconfigured is a no-op; preserves archives and evidence. |
-| `rss backup-due` | Scheduler entrypoint: execute eligible daily work through existing backup guards. No automatic installation. Requires the exact unchanged owned definition and matching loaded identity before reserving an attempt or touching resources. Uses captured settings/dependencies; refuses a mismatching invocation or uncertain launchd inspection. | `outcome: "disabled"`, `"not_due"` (with `next_expected_attempt`) or `"success"` (with nested `backup` archive result). Failures/contention exit 1, not a successful archive. Manual invocation is not unattended timing evidence. |
-| `rss backup-status [--check]` | Inspect private evidence, scheduler/dependencies and freshness without changing runtime resources; remains read-only when the lock is busy. | Status fields below; a successful inspection need not mean protection is healthy. |
-| `rss backup-reconcile` | After owner inspection, validate maintenance ownership and confirm both engines idle, safely stopping only owned writers/forwarding if needed. Does not start a stopped VM or resume the app. Surviving exports/foreign workloads/uncertain forwarding refuse. | `reconciled: boolean`, `resumed: false`, `action`. No hold is a no-op. Clear through this command or the exact absent-VM removal receipt completion below; never hand-edit records. |
-| `rss restore ARCHIVE --volume NAME` | Validate locally, then import into a fresh owned volume. May start only the owned VM; leaves it running. Does not activate the imported data, overwrite an existing volume, or require `RSS_BACKUP_DIR`. | `restored: true`, `volume`, `selected: false`, `manifest`, `next_step`. |
-| `rss select-volume NAME` | Select an owned volume while the VM runs and the application is stopped/absent. Refuses incomplete imports or recorded-image mismatch. Does not start the app or delete the original volume. | `volume`, `selected: true`, `next_step`. |
-| `rss stop` | After acquiring the project lock, persist stopped intent before maintenance refusal or shutdown (even if already stopped or shutdown fails). Check both engines for foreign workloads, stop writers/owned forwarding, create and verify an external backup when data exists, then stop only the owned VM. Repeating an already-stopped shutdown does not restart it to back up; it still removes stale owned forwarding. | `machine: "stopped"`, `already_stopped: boolean`, `backup` (archive result or `{status: "already_stopped"}` / `{status: "no_data"}`). |
+Use lowercase names of up to 48 characters for recovery targets: start with a letter or digit, then use letters, digits or hyphens. `default` is initially selected; choose a different fresh name when recovering. See [backup and restore](backup-restore.md) before using an archive. The `scheduler` result reports `running`, `cron` (`*/20 * * * *`), `timezone` (`UTC`) and `last_fetch` (last periodic result for this generation, or null). `security` reports the effective web `sapi`, `php`, `upload_progress`, `expose_php`, `display_errors`, `sqlite`, `loaded_ini`, `scanned_ini`, `initialized`, `authenticated_settings`, and `verified`; it is not just CLI PHP metadata. `forwarding.status` is `unconfigured`, `stopped` or `running`, with a `url` for a recorded route. It is not end-to-end client verification.
 
-### Cleanup commands
+### Preview-first runtime changes
 
-These are three separate operations, not a teardown sweep. Default previews use
-native read-only inspection under the existing `command.lock`; they do not stop
-services, export data, create `RSS_BACKUP_DIR` or rewrite audit/ownership records.
-The lock itself is opened for writing. Exception: an absent VM after interrupted
-removal may finalize only its exact validated receipt/hold, as described below.
-See the [full cleanup runbook](operations.md#safe-cleanup) before applying.
-**Approved project-only VM precondition:** before applying `remove-vm`, the operator
-must establish exclusive project use under [issue #5](https://github.com/brucepucci/rss-aggregator/issues/5).
-Shared/repurposed guests, other users' Podman engines and historical/alternate
-stores/cache locations are unsupported; known or uncertain such use requires
-retaining the VM and recovering/migrating the project without deleting that VM.
-The tool does not prove VM-wide exclusivity. This precondition does not waive any
-current-resource, selected-service identity or backup safeguard, and introduces no
-new flag or deletion override.
-See the [enforcement limits](architecture.md#preview-first-removal-and-generation-retirement).
+| Command | Preview and apply |
+| --- | --- |
+| `rss upgrade [--confirm TOKEN]` | Explicitly change to this checkout's reviewed PHP/web runtime pin for the **same FreshRSS source and platform**. If instances exist, apply requires the selected instance's recorded verified archive, revalidated against the installed pin. Stages and verifies replacement before publishing; does not start FreshRSS. Matching pins need no replacement. Returns `status: "installed"` and `manifest`. This does not migrate FreshRSS versions or make earlier archives compatible with a different runtime. |
+| `rss uninstall [--confirm TOKEN]` | Remove only the verified owned runtime, retaining instance data, ownership and archives. Does not remove global packages, Tailscale or a legacy VM. Returns `status: "uninstalled"` and `preserves_data_and_archives: true`. |
 
-| Command | Purpose, prerequisites and failure behavior | JSON result |
-| --- | --- | --- |
-| `rss remove-vm [--confirm SHA256]` | Preview exact owned VM, connections, labelled app/preflight containers, selected volume and pinned images. Requires removed supervision/daily jobs, accessible running owned VM, exactly the selected owned volume, no other rootless containers/images, and no rootful containers/volumes/images. Both inventories include external/build containers and intermediate images. Both engines must have no secrets, artifacts, pods, build-cache directories or custom networks. Typed storage/backend identities must match between guest-local inspection and the actual selected rootless API service plus explicit rootful socket API; missing/unavailable/mismatching identities refuse, and the identities are bound to confirmation and rechecked after capture. Matching usernames alone never establishes the selected store. Explicit guest-user SSH with local-mode/privilege attestation runs `podman --log-level=warn --remote=false secret ls --quiet` (rootful via noninteractive sudo), never the error-swallowing secret tunnel; success requires exactly empty stdout and no diagnostics. Metadata-only artifact/pod quiet lists and cache/secret-storage name checks also fail closed. Secret metadata/driver remnants, even an empty old secret database, retain the VM for owner review. The audited gate requires guest Podman **6.2.0**, Netavark and non-transient storage. The actual selected rootless API and explicit rootful socket API must each list the exact stock network shape with valid time and diagnostic-free success. API results alone cannot prove provenance: bracketing guest helper proof and two fresh local listings are also required, as detailed below. Persisted replacements, custom/stale/changed/unavailable provenance, warnings or malformed metadata refuse. No unrelated names or secret payloads are exposed. Validates derived root connection and preserves foreign identities/defaults; refuses a project default among other connections. Requires explicit private external `RSS_BACKUP_DIR`. Apply repeats inspection, quiesces through existing lifecycle/owned-forwarding guards, creates and independently validates a **fresh full** archive, rechecks the plan and both engines' idle state immediately before stopping the VM, then invokes native `machine rm` with confirmation stdin, never force/reset/prune. Missing source, old backup or `no_data` cannot authorize deletion. | Preview: `preview: true`, `targets` (`machine`, `connections`, `containers`, `volumes`, `images`, `networks: {rootless, rootful}`), `ownership`, `backup_directory`, `backup_required`, `packages`, `retained`, `confirmation`. Success: `preview: false`, `removed: true`, `targets`, fresh `backup`, `retained`. Fully absent VM/connections: `machine`, `status: "absent"`, `preview: true`, no wider cleanup. |
-| `rss delete-volume NAME [--confirm SHA256]` | Separate irreversible deletion of one explicit owner-labelled **unselected** volume on the running owned VM. Requires zero `MountCount` and no attachment to any container, even stopped. No automatic backup. Rechecks before native nonforce `volume rm`; all other resources/backups remain. Selected, mounted, attached, foreign or changed targets refuse. | Preview: `preview: true`, `volume`, `ownership`, `irreversible: true`, `backup_created: false`, `retained`, `confirmation`. Success adds `deleted: true`, sets `preview: false`. Already absent: `preview: true`, `volume`, `status: "absent"`. |
-| `rss remove-package NAME [--confirm SHA256] [--unused-elsewhere]` | Preview one plain Homebrew formula. Fresh baseline/additions/version, recursive installed reverse dependencies (formulae and casks, including optional/build/test) and all Podman machine/connection inventories determine retention. Apply to an installed candidate requires both current digest and per-candidate unused-elsewhere attestation. Pre-existing, unknown, upgraded, shared or externally adopted packages must remain. Uses normal `brew uninstall --formula NAME` with native dependent checks enabled and `HOMEBREW_NO_AUTOREMOVE=1` forced in the subprocess regardless of inherited settings; no force/ignore-dependencies/autoremove/cleanup. Inspection/native refusal fails closed. Remove Podman first, then preview each remaining addition afresh. | `preview`, `status` (`"preview"`, `"absent"`, `"removed"`), `targets: {package, version}`, `ownership: {baseline, addition, recorded_version, version_matches}`, `dependents`, `retain` (reasons), `confirmation`. Ineligible candidates can still return a successful preview with nonempty `retain`; this is not permission to uninstall. |
+Both require stopped writers and no running intent, no supervision or daily backup registration, and no active or uncertain owned forwarding. Resolve maintenance first, verify a backup and follow [operations](operations.md#safe-cleanup). Omit `--confirm` for the preview (`status: "preview"`, `operation`, `runtime_path`, `installed`, `preserves_data_and_archives`, `confirmation`, plus `reviewed_manifest` for upgrade). To apply, rerun the same command with `--confirm` and the exact SHA-256 token from the current preview. An incorrect or stale token refuses without applying. Preview is not authorization to delete data or repair ownership records.
 
-**VM network proof and prerequisites.**
+### One-time migration command
 
-`remove-vm` additionally requires guest **Python 3.11+ with `tomllib`**, `systemctl`,
-readable Linux `/proc`, native `podman unshare` for rootless inspection and
-noninteractive sudo for rootful inspection. These are inspection prerequisites,
-not host Python changes or new CLI flags/settings; cleanup does not install them.
-The supported success profile is the audited stock Podman 6.2.0/Netavark service,
-not every theoretically equivalent custom service.
+`rss import-legacy ARCHIVE --instance NAME` is intentionally hidden from group help; its own `--help` works. Its arguments and non-activation behavior match `restore`; its success result adds `imported: true`. It accepts only the reviewed legacy v1 image identity at the same FreshRSS release, validates the full payload and publishes a fresh private native instance. It never operates on the legacy VM. This is **not** ongoing legacy restore support or a reverse importer; follow the [one-time migration handoff](operations.md#one-time-migration-from-podman).
 
-Both APIs and both fresh local `network ls --format json` results must contain
-exactly the stock bridge shape with valid RFC3339Nano `created`, with no diagnostics
-or extra fields. Only the **local** timestamps must strictly increase. The API
-service caches synthetic timestamps, so a stable API timestamp is accepted; it
-need not match the local values. API-only lists omit server loader warnings and
-persisted-network provenance. Local commands force `--log-level=warn`; any warning
-refuses even when native exit status is zero.
-
-Before/after those listings, the guest helper must prove the same stock systemd
-service process owns the actual selected socket listener, shares the helper's
-filesystem root and mount/user/network namespaces, and has unchanged configuration
-fingerprints. It requires exact native stock service argv, rejects startup
-configuration/remote/storage/module/custom-network selectors and unsupported
-environment selectors, and inspects vendor/system/user main containers/storage
-configuration and applicable drop-in candidates, including absent paths/ancestors.
-Files are hashed **inside the guest**; ctime/mtime must safely predate service startup
-with trusted boot/clock agreement. Unrecognized symlinks, network-directory overrides
-or `engine.env` values refuse; the audited Fedora `/root` → `/var/roothome` alias is
-accepted. Only fingerprints leave this provenance helper, not config payloads, raw
-names, argv, environment or diagnostics; it never reads Podman secret payloads.
-Unknown/custom/stale/changed/unavailable proof fails exit 1 with no result JSON and
-retains the VM; there is no service restart, corrective mutation or bypass. These
-checks repeat at preview, apply admission and post-capture. They do not serialize
-independent native/root clients or establish every effective configuration input.
-See the [deep algorithm](architecture.md#preview-first-removal-and-generation-retirement).
-
-`confirmation` is a SHA-256 digest of the current plan/private evidence, not a
-password or reusable blanket consent. VM consent binds ownership, native resource
-and image identity, directory and connection/default inventories, plus the guest
-network configuration fingerprint. A changed fingerprint stales consent. The
-service PID/start/listener cookie is only a bracketing guard; an idle stock service
-restart between complete inspections does not itself stale consent. Package consent
-also binds baseline/additions, current installed version/dependents and executable
-and Podman identities. For present targets, a stale/invalid digest fails with exit 1
-and no JSON; obtain and review a new preview rather than retrying an old digest.
-Once inspection verifies an already-absent target, the command instead succeeds
-with exit 0 and absence JSON without validating the digest; package absence also
-requires no `--unused-elsewhere` attestation. These no-ops authorize no further
-resource deletion; other inspection, ownership and maintenance safeguards still apply.
-`--unused-elsewhere` alone never applies; it is an operator assertion that metadata
-cannot establish.
-All normal success/usage/failure stream and exit conventions above apply.
-
-VM export/validation failure before deletion retains source data and prior archives;
-writers may already be stopped while the VM runs. If the fallback idle inspection
-also fails (for example, a post-export disconnect), exit 1 with no result JSON and
-only fixed owner-inspection/guarded-reconciliation guidance; preserve the source,
-archives and maintenance rather than exposing native diagnostics or clearing an
-uncertain hold. Restore source access and establish idle engines before guarded
-reconciliation and a new preview/fresh capture. A resumed writer or failed final
-idle-engine inspection refuses before VM stop/removal and retains maintenance;
-it does not stop that writer and reuse the earlier capture. Inspect and reconcile,
-then obtain a new preview and fresh quiesced capture before retrying removal.
-Interrupted/partial stop/removal
-retains maintenance and private `removed-vm.json` (`version: 1`, status
-`removing`/`removed`, `owner`, `plan`, `backup`, `foreign_connections`). Inspect locally;
-never delete records or override the hold. After abrupt death following native rm,
-repeat `remove-vm`: only absent exact machine/connections plus the exact owned receipt,
-`stopping_vm` hold, independently reverified archive and unchanged foreign connections
-permit completion. Other cases need manual inspection and guarded reconciliation,
-not record deletion or broader cleanup. Successful absence never sweeps packages,
-archives or directories. See [interrupted removal](operations.md#failed-or-interrupted-removal).
-
-`setup` after successful removal retires only that exact old generation's owner,
-selection/provenance, security, Serve, intent and recovery records into private
-`retired-<hash>/`, preserving inventories/additions, backup locators/evidence, receipt
-and checkout, then creates fresh ownership. It never fabricates a record to adopt a
-reappearing machine. Restore before any empty startup: `setup`,
-`restore ARCHIVE --volume NEW` (starts only the owned VM), `select-volume NEW`,
-`start`, with the recorded compatible image. Use a fresh `NEW` name, not the initial
-`rss-aggregator-data` selection even when absent; verify the old original volume
-is absent. See [recreation](operations.md#recreate-and-restore-after-removal).
-
-### Start and cold recreation
-
-`start` takes no options except `--help`. If this call starts a stopped owned VM,
-a matching stopped application container is removed without force or volume
-deletion and recreated through the pinned-image path on the **same selected named
-volume**. Ownership/port/image/effective-PHP preflight and all existing application
-image/binding/entrypoint/default-command/internal-`LISTEN`/selected-volume checks
-must pass first. A final owned inspection must be unchanged and still stopped;
-foreign, mismatching, changed or running containers do not qualify. Refusal retains
-the container rather than forcing replacement. A running app follows the normal
-restart path. Warm starts (VM already running) retain reuse, including retrying
-both template copies after partial failure.
-
-Cold recreation discards container-layer diagnostics/customizations and may expire
-web sessions, not persisted subscriptions, articles or reading state. Take a
-verified backup before significant live changes. This is not an error-triggered
-fallback: security/readiness failures do not authorize automatic replacement, and
-all post-create security/probe-cleanup/readiness/authentication/forwarding gates
-still apply. See [startup safeguards](operations.md#start-verify-and-replace).
+`replace`, `select-volume`, `remove-vm`, `delete-volume`, and `remove-package` are not native commands. The [legacy CLI and guarded removal documentation](https://github.com/brucepucci/rss-aggregator/blob/28664ab936f8872da6ff3ddca1c4b0a725dfb0ec/docs/cli.md#cleanup-commands) stay with their own revision and deployment.
 
 ### Mac supervision commands
 
-All four commands accept only `--help`; there are no positional arguments or
-additional flags. Install/remove operate on the current normal Mac user's session,
-never system launchd. See the [backup-before-install and owner acceptance
-procedure](operations.md#opt-in-mac-startup-and-recovery) before real activation.
+| Command | Purpose and result |
+| --- | --- |
+| `rss supervision-install` | Explicitly register/activate the owned normal-user GUI-session job, capturing this checkout and its settings. Returns supervision status; does not set running intent. Refuses a missing session, foreign/changed definitions or changed capture rather than replacing them. |
+| `rss supervision-remove` | Unload and remove only unchanged owned supervision; preserve intent, service and data. Returns supervision status; refuses foreign/changed jobs. |
+| `rss supervision-status` | Report `enabled`, `state`, `intent`, `maintenance`, `session`, `observed`, `recovery`, and `action`; registered jobs also include `job`, `root`, `state_dir`. Observation does not start/restart writers. Disabled, inactive, stopped, unavailable, maintenance and unhealthy states are reportable results, not necessarily command errors. |
+| `rss supervision-tick` | Run one supervision health/recovery cycle from the selected state. No recovery without a matching enabled job, positive running intent, and clear guards. Returns status with the observed state or `recovered` after recovery. Backoff, exhausted attempts, configuration, maintenance or failed recovery can exit nonzero. |
 
-| Command | Purpose/defaults and failure behavior | JSON result |
-| --- | --- | --- |
-| `rss supervision-install` | Explicitly capture the selected stable checkout, its `.venv/bin/python`, existing ownership and non-secret configuration; write/activate the owned user LaunchAgent. Requires macOS, non-root user, normal GUI session, owned Podman VM and available captured dependencies. Tailscale is required/captured for private mode or retained forwarding state, even inactive state in loopback mode. Does not create running intent. Repeated identical installation is safe; changed configuration requires explicit removal/reinstallation. Foreign/changed/symlinked jobs and loaded-label conflicts are preserved/refused. Partial activation retains registration for retry/removal. | Same supervision-status shape below; `enabled: true` means a registration ledger exists, not that the app is healthy or session available. |
-| `rss supervision-remove` | Unload/remove only the unchanged owned job (including the exact pre-fix definition without process-group abandonment); repeatable if absent. Preserve app, VM, data, backups and intent. Failures preserve registration for inspection/retry; changed/unowned jobs are never overwritten/deleted. | Supervision-status shape with `enabled: false`, `state: "disabled"`. |
-| `rss supervision-status` | Read registration, captured dependency availability, normal user session, intent and observed service readiness without starting/restarting it. An unavailable/unhealthy state is a successful **query**, not recovery success. Malformed/foreign ownership/state and lock failures still exit 1. | `enabled`, `intent` (`"unset"`, `"running"`, `"stopped"`), `maintenance`, `session` (`"not_checked"`, `"available"`, `"unavailable"`), `observed`, `state`, `action`, `recovery`; registered results add absolute `job`, `root`, `state_dir`. |
-| `rss supervision-tick` | One serialized reconciliation. Disabled/stopped/unset intent is a no-op. Healthy observations do not restart service. Otherwise at most three consecutive normal guarded starts, with minimum 60s and 300s backoff. Maintenance, unavailable/inactive registration, backoff, failed/exhausted recovery and lock contention exit 1 with no result JSON; inspect status for response. No shell/.env assumptions or insecure TLS fallback. | Status shape; successful recovery has `state: "recovered"` and updated `observed`/`recovery`. |
+Use [captured configuration](configuration.md#captured-mac-supervision-configuration) and [operations](operations.md) to change job settings. Daily backup is independent.
 
-`observed.availability` is `"unknown"`, `"healthy"` or `"unhealthy"`; when known,
-`machine`/`application` describe the owned resources. Query/guard failures produce
-an actionable sanitized observation, not raw underlying output. `state` is one of
-`disabled`, `maintenance`, `configuration_unavailable`, `session_unavailable`,
-`inactive`, `intentionally_stopped`, `intent_unset`, `healthy`, `unhealthy`,
-`recovery_failed`, `retry_exhausted` (plus `recovered` for a successful tick).
+### Daily backup commands and results
 
-`recovery` contains `version: 1`, `attempts` (0–3), `next_retry_at` (UTC Unix seconds
-or null), `history` (last ten outcomes). Each event has UTC Unix `at`, `attempt`
-and `outcome` (`interrupted_or_in_progress`, `failed`, `recovered`). Failed events and
-failed observations also contain sanitized `reason` and `action`, never raw exception
-text. Reasons distinguish `ownership_conflict`, `configuration_conflict`,
-`private_access_refused`, `security_gate_failed`, `readiness_failed`,
-`fetching_unhealthy`, `external_command_failed` and fallback `recovery_guard_failed`.
-Reserving an
-attempt before mutation survives process interruption. Healthy ticks and explicit
-`start` reset the retry count/backoff but retain history. Raw process errors and
-credentials are neither recorded nor copied into the job; background stdout/stderr
-are discarded. Configuration/job failures before the worker can run are exposed
-by status rather than falsely recorded as successful checks.
-
-Only explicit `start`, after its maintenance guard passes, changes stopped/unset
-intent to running. Public `stop` writes stopped intent before maintenance refusal.
-`verify`, `replace` and backup resumption do not change it. Any maintenance marker
-presence, including malformed data or dangling links, blocks public writer commands
-and supervisor recovery. `backup-reconcile` validates ownership and idle engines,
-then clears the hold without starting anything; retained running intent permits a
-later supervisor tick. Run `stop` before reconciliation to keep stopped intent.
-A backup never resumes an intentionally stopped app. Default manual operation
-installs no job; actual reboot/login evidence remains separately required.
-
-### Arguments and flags
-
-| Command argument/flag | Required/default | Meaning and failure behavior |
-| --- | --- | --- |
-| `api-check --loopback` | Optional boolean flag; absent means trusted HTTPS. | Select only the owned app's actual sole IPv4 `127.0.0.1` HTTP publication. Prints an explicit stderr warning; **does not verify HTTPS**. No implicit HTTPS-to-HTTP fallback. |
-| `restore ARCHIVE` | Required existing local file; no default. Relative paths resolve from the process working directory. | Missing/nonexistent/directory arguments are usage errors (exit 2). Invalid/corrupt/incompatible archive content fails the operation (exit 1) before VM startup or volume creation. |
-| `restore --volume NAME` | Required option, no default. | Fresh target name, different from the selected name even when that selected volume is absent. Every existing target is refused, including empty owned volumes. Failed imports retain an incomplete, unselected target; choose a different fresh name to retry. |
-| `select-volume NAME` | Required positional volume name, no default. | Existing owned target; selection alone does not activate it. Use `replace` afterward if an old application container exists, otherwise `start`. |
-| `backup-enable --hour H` | Optional integer `0–23`, default `3`. | Daily UTC hour, not local time; invalid range/type is usage error 2. Changing an installed policy requires disable/re-enable. |
-| `backup-enable --minute M` | Optional integer `0–59`, default `0`. | Daily UTC minute; invalid range/type is usage error 2. Wakeups may lag the target by up to 15 minutes while the session/host is available. |
-| `backup-status --check` | Optional boolean, default absent. | Emit the same status JSON, then exit 1 with sanitized stderr guidance unless `protected` is true; inspection errors still fail without JSON. |
-| Cleanup `--confirm SHA256` | Optional text, absent means preview only; applies to all three cleanup commands. | Pass the exact current preview's `confirmation` to request apply. For present targets, invalid/stale text fails exit 1 without JSON, not a bypass. Verified already-absent targets succeed with absence JSON without digest validation (or package unused-elsewhere attestation). No interactive project prompt substitutes for this digest. |
-| `delete-volume NAME` | Required positional volume name, no default. | Exactly one unselected labelled volume; selected/mounted/attached/foreign targets refuse. Already absent reports absence. |
-| `remove-package NAME` | Required positional formula name, no default. | One plain lowercase formula name (letters/digits, `+`, `_`, `.`, `-`, optional `@version`); no tap paths, casks, paths, options or multiple names. Invalid name fails exit 1. |
-| `remove-package --unused-elsewhere` | Optional boolean, default false; mandatory for apply to an installed candidate. | Attest this exact package has not been adopted by other work. Cannot override retention reasons/dependent checks or replace `--confirm`. |
-| Volume name syntax | Applies to `restore --volume`, `select-volume` and `delete-volume`. | 1–128 characters, first ASCII letter/digit, remaining ASCII letters/digits/`_`/`.`/`-`. Not a path or option; invalid names fail the operation (exit 1). |
-
-`api-check` accepts no positional arguments, credential flags/environment variables
-or URL argument. It prompts on stderr for the FreshRSS username and hidden separate
-API password; cancel/EOF fails nonzero without JSON. Invalid credentials,
-TLS/connectivity failures, redirects, invalid loopback publication, incompatible
-API, oversized/malformed responses or unmet ownership/security/forwarding
-requirements fail with sanitized stderr and no result JSON. Both modes POST
-credentials, bypass ambient proxies and refuse redirects. Success never includes
-passwords, tokens, feed URLs or article content. See the
-[HTTPS/ReadKit runbook](tailscale-readkit.md) for the known host-side TLS limitation.
-
-### Nested results and failure safeguards
-
-- `scheduler`: `running`, `cron` (`"*/20 * * * *"`), `timezone` (`"UTC"`).
-- `forwarding`: `status` (`"unconfigured"`, `"running"` or `"stopped"`); a
-  recorded route also includes its private `url`. Treat origins as private.
-- `security`: the sanitized audit stored in `security.json`: `checked_at`,
-  `checked_container`, `image`, `image_id`, `platform`, `platform_manifest`,
-  `freshrss`, `advisory_review_date`, `web` (PHP/SAPI/INI metadata), `cli_php`,
-  `official_command`. A past check is not an advisory scan or a future-security
-  guarantee; see [architecture](architecture.md).
-- Backup/restore `manifest`: the [versioned archive metadata](backup-restore.md#format-version-1).
-  `sha256` is the whole ZIP checksum, not just the payload checksum.
-
-Both Mac job definitions set `AbandonProcessGroup=true`, without a new flag or
-command, so required native descendants survive launchd parent-exit cleanup.
-Explicit stop, ownership and inherited native-work leases remain enforced. A
-`supervision-tick` returning `recovered` establishes only its in-invocation check,
-not sustained post-exit availability or reboot acceptance. Existing definitions
-are never silently rewritten: follow [safe job upgrade](operations.md#upgrade-installed-mac-jobs-safely).
-The exact legacy owned supervision definition is removal-only; install/tick refuse
-it. `backup-disable` accepts an unchanged pre-fix definition matching its ledger's
-digest/loaded identity; re-enable captures the new policy identity and needs new
-daily evidence. `supervision-install` also refuses a missing plist while that
-owned job remains loaded, preserving the ledger and loaded job without recreating
-the file; use `supervision-remove` then reinstall. It may recreate a missing file
-only when the job is confirmed unloaded. Failures preserve registration, not
-permission to hand-edit it.
+| Command | Purpose and result |
+| --- | --- |
+| `rss backup-enable [--hour HOUR] [--minute MINUTE]` | Explicitly install/activate the owned user-session daily backup job with a private backup destination. UTC hour `0–23` (default `3`), minute `0–59` (default `0`). Result includes `enabled`, `job`, `daily_utc`, `next_expected_attempt`. Activation is not evidence of protection; changed captures require explicit disable/re-enable. |
+| `rss backup-disable` | Remove only the unchanged owned daily job; keep evidence and archives. Returns `enabled: false` and, on removal, `archives_preserved: true`. Foreign/changed jobs are refused. |
+| `rss backup-due` | Run only eligible daily work for the configured job. `outcome` is `disabled`, `not_due` (with `next_expected_attempt`) or `success` (with `backup`). Guard, contention or capture/resumption failures can exit 1; inspect `backup-status`. Not a force-backup command; use `backup` for a manual capture. |
+| `rss backup-reconcile` | Release an interrupted maintenance hold only after checking ownership and confirming idle writers and no active owned forwarding. Returns `reconciled`, `resumed: false`, `action`. Does not start writers or change intent. Refuses unknown holds and unconfirmed writers/forwarding. |
+| `rss backup-status [--check]` | Report daily protection and backup/maintenance evidence without starting writers. Default exits 0 for a report even if unprotected. `--check` emits the same JSON then exits 1 with a stderr diagnostic unless `protected` is true. |
 
 ### Daily backup status results
 
-`backup-status` returns:
-
-- `enabled` (captured schedule activated), `registered` (matching file and loaded
-  path/program/arguments/captured environment), `scheduler_problem` (null or sanitized remediation), `busy`.
-- `daily_attempt`: null or `{slot, count, attempted_at, outcome, volume, policy_id}`;
-  outcome is running/success/failed. `next_expected_attempt`: UTC ISO target or
-  null when unconfigured; an overdue target stays in the past rather than being
-  silently advanced. `daily_due`, `missed` (no attempt 15 minutes after target).
-- `latest_attempt`: null or `{started_at, kind, outcome, resumption?, action?}`;
-  kind is backup/stop, outcome is running/success/failed/interrupted/already_stopped/
-  no_data. A running record observed with a free lock is interrupted, not success.
-  An already-stopped shutdown preserves the prior effective attempt when present,
-  including a failure; its no-op does not refresh success/freshness or count as a capture.
-- `latest_success`: null or verified archive result plus `completed_at`, `volume`;
-  survives a later failed resumption. `age_seconds`: nonnegative age or null;
-  `overdue`: no success or age over 26 hours; `archive_available` checks existence,
-  not a new whole-archive integrity scan.
-- `latest_defer`: null or `{outcome: "deferred", at, action}`, recorded separately
-  on lock contention without overwriting the active attempt.
-- `resumption`: preserved/failed/unresolved/not_resumed/not_attempted;
-  `maintenance_required`: any hold exists. `protected`: active registration and
-  dependencies, recent successful eligible daily work and available selected-volume
-  success, no overdue/due/maintenance/latest-attempt failure. Manual/normal-stop
-  success alone never satisfies daily protection; no Time Machine or unattended
-  timing verification is implied.
-
-The policy is daily at 03:00 UTC by default, with 15-minute launchd wakeups and
-at most three actual attempts per UTC daily target, at least 15 minutes apart.
-Contention defers to a later wakeup without a queued backlog or consuming the
-actual-attempt budget. Daily evidence is bound to the exact captured policy; a
-changed destination or time requires new eligible success. No pre-target backfill of older missed days occurs.
-See [daily procedures and interruption recovery](backup-restore.md#opt-in-daily-mac-backups).
-
-Commands share one nonblocking `command.lock`: concurrent callers fail rather than
-queue (except read-only busy `backup-status`). Short-lived native subprocesses
-inherit the lock so an abruptly killed parent cannot authorize writers during a
-surviving export. Only `podman machine start`, in both startup and recovery, omits
-inheritance to prevent long-lived VM helpers retaining the lease; the Python
-parent still holds the lock through the launcher. This is private behavior, not
-a CLI flag. Export/import inheritance and durable maintenance are unchanged.
-The lock does not serialize independent Podman/Tailscale clients or other external writers.
-Durable maintenance blocks writer operations until explicit reconciliation.
-Resources are normally retained for diagnosis, not automatically rolled back or
-deleted. A failed startup can leave the VM running; first-run loopback readiness
-failure can leave the app serving. Private/previously private post-start failures
-instead attempt ownership-checked application shutdown; inability to confirm
-cleanup explicitly warns of possible remaining exposure. Preflight refusals can
-leave existing serving state untouched. Inspect `status` and the
-[operations guide](operations.md), not just the exit code.
-
-**Backup and shutdown failures differ:** explicit `backup` attempts prior-mode
-resumption even after snapshot failure, regardless of this shell's `RSS_TAILSCALE`,
-but never resumes an intentionally stopped application.
-A failure is not proof that remote access is closed. Resume failure also exits 1,
-even if an archive was published; inspect private `last-backup.json`. Shutdown
-backup failure after quiescing leaves writers/forwarding stopped, VM running, data
-and prior archives intact; fix the cause and retry `stop`. Foreign-workload or
-forwarding-ownership preflight refusals can leave serving untouched. See
-[recovery failure handling](backup-restore.md).
+- `enabled`, `registered`, `scheduler_problem`, `next_expected_attempt` describe the captured schedule and session registration, not a successful backup. `busy` means the operation lock is held; status can still report recorded evidence.
+- `daily_attempt`, `daily_due`, `missed`, `latest_defer` describe daily work and contention; `latest_attempt`, `latest_success`, `resumption` distinguish the latest operation, verified publication and restart outcome.
+- `age_seconds`, `overdue` and `archive_available` describe the last known archive (no success or age over 26 hours is overdue). File presence does not revalidate archive bytes or prove independent recovery.
+- `maintenance_required` indicates a hold; inspect and reconcile rather than removing the record. `protected` is the combined local daily health signal for the selected instance, requiring a matching healthy schedule and recent success without outstanding work, failed latest attempt or maintenance. It is not Time Machine evidence.
 
 ## Developer commands and results
 
-Each command has syntax:
-
-```text
-uv run --locked rss-dev COMMAND [--project DIRECTORY] [--help]
-```
-
-There are no positional arguments. Optional `--project DIRECTORY` belongs **after
-`check`, `setup`, `format` or `fix`**, not at group level. It defaults to the
-process's **current working directory**, resolving relative paths from there,
-not automatically the executable's source checkout. Files are usage errors;
-select a synchronized project directory (the Git repository root for `setup`).
-There are no other project-defined flags. `--help` prints help only.
+Each command has syntax `uv run --locked rss-dev COMMAND [--project DIRECTORY] [--help]`. There are no positional arguments. Optional `--project DIRECTORY` belongs after the subcommand and defaults to the current working directory; relative paths resolve from there. Select a synchronized project directory (the Git repository root for `setup`). Files are usage errors.
 
 | Command | Purpose, defaults and result |
 | --- | --- |
-| `rss-dev check [--project DIRECTORY]` | Run the complete non-live pytest suite, Ruff lint and Ruff format checks without source fixes. All three run even when an earlier check fails. JSON `checks` names: `pytest`, `lint`, `format`. Pytest gets explicit `-m 'not live'`; Ruff gets `--no-fix --no-fix-only`, overriding configured autofixes. |
-| `rss-dev setup [--project DIRECTORY]` | Inspect Git and safely activate pre-push hooks. JSON has `ok`, `active`; no-remote/manual-resolution cases also have `reason`, `next_step`. No remote: success with `active: false`, rerun after adding one. Conflicting/recognized nonexecutable hooks: exit 1, `active: false`, bytes/mode preserved. Recognized executable hooks remain unchanged. See [managed hooks](development.md#managed-pre-push-hooks). |
-| `rss-dev format [--project DIRECTORY]` | Explicitly rewrite Python formatting with Ruff, no lint fixes. JSON `checks` name: `format`. |
-| `rss-dev fix [--project DIRECTORY]` | Explicitly apply safe Ruff lint fixes only; unsafe fixes disabled, no formatting. JSON `checks` name: `fix`. |
+| `rss-dev check [--project DIRECTORY]` | Complete non-live pytest, Ruff lint and Ruff format checks. All three run even after an earlier failure. JSON `checks` names: `pytest`, `lint`, `format`. No source fixes. |
+| `rss-dev setup [--project DIRECTORY]` | Inspect Git and activate pre-push hooks safely; returns `ok`, `active`, and for no-remote/manual-resolution cases `reason`, `next_step`. No remote: success with `active: false`; rerun after adding one. Refuses foreign/legacy/nonexecutable arrangements without changing them, and preserves recognized executable hooks. See [managed hooks](development.md#managed-pre-push-hooks). |
+| `rss-dev format [--project DIRECTORY]` | Rewrite Python formatting with Ruff; no lint fixes. JSON `checks` name: `format`. |
+| `rss-dev fix [--project DIRECTORY]` | Apply only safe Ruff lint fixes; no formatting or unsafe fixes. JSON `checks` name: `fix`. |
 
-Examples:
-
-```sh
-uv run --locked rss-dev check
-uv sync --locked --project /path/to/checkout
-uv run --locked rss-dev check --project /path/to/checkout
-```
-
-`check`, `format` and `fix` emit one indented JSON object like
-`{"ok": true, "checks": [{"name": "pytest", "returncode": 0}, ...]}`; entries
-vary by command. `ok` is true only when every child succeeds. OS-level child launch
-failures are recorded as return code 127. `setup` emits its hook-status object,
-not a `checks` array. Logical failures still emit JSON with `ok: false` and exit 1;
-success exits 0, including inactive no-remote setup. Child output goes to stderr.
-Invalid CLI usage exits 2 without result JSON. Explicit format/fix mutate files;
-neither they nor the baseline start FreshRSS.
-
-Tools use the **selected checkout's local `.venv` interpreter**, not the invoking
-checkout's editable installation. Python uses isolated import mode; child
-environments remove `PYTHONPATH`, `PYTHONHOME`, all `PYTEST_*` variables and
-inherited Git repository selectors. This prevents ambient test selection/imports
-or a push hook's Git context from redirecting work into another checkout. Git
-configuration/authentication variables remain intact; global/system configuration
-and `core.hooksPath` safeguards still apply. Full filter details are in
-[development](development.md#selected-checkout-isolation).
-
-These commands do not create/synchronize environments or fall back to another
-checkout's packages. Missing interpreters/tools fail; rerun the selected checkout's
-sync after dependency changes. `UV_PROJECT_ENVIRONMENT` external/shared environments
-are not selected: use checkout-local `.venv`. New hook installation also uses that
-local interpreter; no-remote setup and existing-hook inspection retain their
-behavior. Checks suppress bytecode and pytest/Ruff caches.
+`check`, `format`, and `fix` emit `{"ok": true, "checks": [{"name": "pytest", "returncode": 0}, ...]}`, with entries appropriate to the command. `ok` is true when every child succeeded; OS-level launch failures are recorded as return code 127. Logical failures still emit JSON with `ok: false` and exit 1. Child output goes to stderr. Invalid CLI usage exits 2; help exits 0. Commands use the selected checkout's local `.venv` and isolated child environment, not the caller's editable installation or a shared environment. They do not create/synchronize environments or start FreshRSS. See [selected-checkout isolation](development.md#selected-checkout-isolation).
 
 ## Pytest selection
 
-`uv run --locked pytest [OPTIONS] [file_or_dir ...]` gives normal human-readable
-pytest reports, not CLI JSON. With no paths, configuration selects `tests/`;
-explicit paths/node IDs narrow a direct run, **not** the required full baseline.
+`uv run --locked pytest [OPTIONS] [file_or_dir ...]` prints normal pytest reports, not CLI JSON. No path selects `tests/`; paths/node IDs narrow direct runs, not the full baseline. The default marker expression is `not live`. Select the native integration explicitly with `uv run --locked pytest -m live tests/integration/test_native.py` after reading the [platform prerequisites and limits](development.md#explicit-liveplatform-checks).
 
-| Argument/option | Purpose and default | Example |
-| --- | --- | --- |
-| `[file_or_dir ...]` | Optional paths/node IDs; omit for the complete configured suite. | `uv run --locked pytest tests/test_commands.py` |
-| `-m EXPRESSION` | Marker expression; project default `not live`. Explicit `live` requires the selected test's documented platform/service prerequisites. | `uv run --locked pytest -m live` |
-| `-s` | Disable normally enabled output capture. | `uv run --locked pytest -m live -s` |
-| `-p no:cacheprovider` | Disable pytest's cache plugin; the baseline does this automatically. | `uv run --locked pytest -p no:cacheprovider` |
-| `-q`, `--quiet` | Reduce report verbosity; absent by default. | `uv run --locked pytest -q` |
-| `--tb=short` | Short failure tracebacks instead of default `auto`. | `uv run --locked pytest --tb=short` |
-| `-h`, `--help` | Conventional text help/configuration, exit 0 without running tests. | `uv run --locked --offline pytest --help` |
-
-Other upstream options are in pytest help. Direct runs retain normal pytest
-environment handling; use `rss-dev check` for the guarded baseline. Pytest exits
-0 on success, 1 for failed tests, 2 for interruption/collection errors, 3 for
-internal errors, 4 for usage errors, or 5 when no tests are collected.
-
-Read [live/platform checks](development.md#explicit-liveplatform-checks) before
-selecting `live`; they interrupt the project session. `RSS_LIVE`,
-`RSS_OBSERVE_CRON` and the old unittest commands are unsupported. The removed
-`--observe-cron` option is a pytest usage error; routine tests do not observe
-natural production cron intervals. Do not publish `--showlocals` output, which
-can expose secrets.
+`-m EXPRESSION` selects markers; `-s` disables capture; `-p no:cacheprovider` disables the cache plugin; `-q`/`--quiet` reduces verbosity; `--tb=short` shortens tracebacks; `-h`/`--help` prints upstream help. `rss-dev check` is the guarded baseline; direct runs retain normal pytest environment handling. Pytest exits 0 on success, 1 for test failure, 2 for interruption/collection errors, 3 for internal errors, 4 for usage errors, and 5 for no tests collected. `RSS_LIVE`, `RSS_OBSERVE_CRON`, `--observe-cron` and old unittest paths are unsupported here. Do not publish `--showlocals` output.
 
 ## uv setup and dependency commands
 
-These are upstream uv commands used by this project, not extra `rss` operations.
-They produce uv's text progress/diagnostics, not operation JSON. Environment,
-resolution, download or build failures exit nonzero before any project command;
-`uv run` propagates the invoked command's status when it runs successfully.
+These upstream commands produce uv text/progress rather than project JSON. Resolution, environment and build failures exit nonzero before a project command runs.
 
-| Command/option | Purpose, defaults and failure behavior |
+| Command or option | Purpose |
 | --- | --- |
-| `uv sync --locked` | Synchronize the checkout-local `.venv`, including the default development dependency group and editable project. May download Python/packages/build backend. Refuses a missing/stale lock requiring changes rather than silently updating it. No hook installation or FreshRSS startup. |
-| `uv sync --locked --project DIRECTORY` | Synchronize the selected checkout instead of the discovered current project. Needed before targeting another checkout with `rss-dev --project`. |
-| `uv run --locked EXECUTABLE [ARGS ...]` | Run the chosen command in the project environment, synchronizing as needed but refusing lock changes. Put executable-specific flags after `EXECUTABLE`. |
-| `--offline` (uv option) | Optional; disable uv network access and rely on cached resources. Missing caches fail. Does **not** prevent `pytest -m live` or `rss` from contacting services. Used by the pre-push entrypoint. |
-| `uv lock` | Intentionally regenerate `uv.lock` after reviewed dependency changes; may resolve/download metadata. Mutates the lock, not an implicit step in normal setup/checks. Follow with locked sync and the full baseline. |
-| `uv sync --help`, `uv run --help`, `uv lock --help` | Upstream text help for further uv options, exit 0 without performing those operations. |
-
-Operational uses of upstream Homebrew/Podman commands are scoped in
-[operations](operations.md), [configuration](configuration.md#changing-the-loopback-port)
-and [recovery](backup-restore.md). Credential-free curl diagnostics and their
-flags/HTTP-status semantics belong to the canonical [private-access runbook](tailscale-readkit.md#real-https-checks--human-assisted).
-[Cleanup commands](#cleanup-commands) cover only guarded owned VM removal, separate
-unselected-volume deletion and one confirmed project-added formula. There is no
-project command for global prune/reset, automatic package/cache/directory sweeps,
-automatic image updates, forwarding adoption/reset or an insecure TLS bypass.
+| `uv sync --locked [--project DIRECTORY]` | Synchronize the selected checkout's `.venv` with the lock and default development group. May download Python/packages/build tools; refuses stale or missing lock requiring changes. No hooks or FreshRSS startup. |
+| `uv run --locked EXECUTABLE [ARGS ...]` | Use the project environment, syncing if needed without changing the lock. Options after the executable go to that executable. Propagates its exit status. |
+| `--offline` (uv option) | Use cached resources only; missing caches fail. Does not block network access by a command such as native setup or selected integration. Used by the pre-push gate. |
+| `uv lock` | Intentionally regenerate `uv.lock` after reviewed changes; follow with locked sync and baseline checks. |
+| `uv sync --help`, `uv run --help`, `uv lock --help` | Upstream help for additional options; no operation is performed. |

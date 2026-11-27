@@ -1,0 +1,16 @@
+{
+  "freshrss": {
+    "version": "1.30.4",
+    "revision": "08f97bd497ace733c151ea1c709d85cd5b65cc53",
+    "url": "https://codeload.github.com/FreshRSS/FreshRSS/tar.gz/08f97bd497ace733c151ea1c709d85cd5b65cc53",
+    "sha256": "1e7fbd444f43725d328e26007ce782fcbbd2cde1894603a47ceabd535d814c38"
+  },
+  "runtime": {
+    "version": "1.14.0",
+    "php": "8.6.0",
+    "caddy": "2.11.9",
+    "url": "https://github.com/php/frankenphp/releases/download/v1.14.0/frankenphp-mac-arm64",
+    "sha256": "68f78ef2f13f9d15ee196faa88ff842b47ae13137b15feb78bfbf98173a6d797"
+  },
+  "platform": "darwin/arm64"
+}

@@ -86,7 +86,7 @@ class PrivateAccess:
         return record
 
     def prepare(self, owner: dict[str, Any], port: int) -> str:
-        """Refuse listener conflicts before changing the VM or application."""
+        """Refuse listener conflicts before changing the native application."""
         status = self._query("status", "--json")
         if status.get("BackendState") != "Running":
             raise self.failure(
@@ -257,7 +257,7 @@ class PrivateAccess:
         }
 
     def stop(self, owner: dict[str, Any]) -> bool:
-        """Remove only an exactly matching owned route, even with the VM stopped."""
+        """Remove only an exactly matching owned route, even with writers stopped."""
         record = self._record(owner)
         if record is None:
             return False

@@ -1,1358 +1,904 @@
-"""Private-access behavior at project-command and callable runtime boundaries."""
+"""Private forwarding and credential guards without a daemon or live traffic."""
 
 import copy
-import errno
+import fcntl
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
+from functools import partial
 from http.client import BadStatusLine
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
-from unittest.mock import MagicMock
-from urllib.error import HTTPError, URLError
-from urllib.request import OpenerDirector
+from types import SimpleNamespace
+from urllib.error import URLError
+from urllib.parse import parse_qs
+from urllib.request import HTTPHandler, HTTPSHandler
+from urllib.response import addinfourl
 
 import pytest
 from click.testing import CliRunner
-from test_commands import CommandFixture
-from test_runtime_recovery import ROOT, Engine
+from test_native_install import Checkout
+from test_serve_config import ControlledSocket, reply
 
 from rss_aggregator.cli import main
+from rss_aggregator.native_install import manifest_identity
+from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.runtime import Runtime, RuntimeFailure, ServeConfigRejected
-from rss_aggregator.serve_config import ServeConfigClient
+
+HOST = "reader.example.ts.net"
+ORIGIN = f"https://{HOST}"
+PORT = 18080
+BACKEND = f"http://127.0.0.1:{PORT}"
+ADDRESS = f"{HOST}:443"
+OTHER = "other.example.ts.net:8443"
+LOCAL_SECRET = "synthetic-localapi-password"
+REMOTE_SECRET = "synthetic-private-remote-diagnostic"
+API_PASSWORD = "synthetic-api-password"
+API_TOKEN = "synthetic-api-token"
+PRIVATE_FEED = "https://feeds.invalid/subscriber-only"
 
 
-@pytest.fixture
-def private_command(tmp_path):
-    command = CommandFixture(tmp_path)
-    command.machine(running=True)
-    command.env["RSS_TAILSCALE"] = "1"
-    config = {
-        "TCP": {"443": {"HTTPS": True}},
-        "Web": {
-            "reader.example.ts.net:443": {
-                "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
-            }
-        },
+def route(address=OTHER, target=BACKEND, *, funnel=False):
+    port = address.rsplit(":", 1)[1]
+    return {
+        "TCP": {port: {"HTTPS": True}},
+        "Web": {address: {"Handlers": {"/": {"Proxy": target}}}},
+        **({"AllowFunnel": {address: True}} if funnel else {}),
     }
 
-    class LocalAPI(BaseHTTPRequestHandler):
-        def do_GET(self):
-            assert self.path == "/localapi/v0/serve-config"
-            self.send_response(200)
-            self.send_header("Etag", "fixture-unowned")
-            self.end_headers()
-            self.wfile.write(json.dumps(config).encode())
 
-        def log_message(self, *args):
-            pass
-
-    server = HTTPServer(("127.0.0.1", 0), LocalAPI)
-    thread = Thread(target=server.serve_forever)
-    thread.start()
-    command.env["FIXTURE_LOCALAPI_PORT"] = str(server.server_port)
-    command.tool(
-        "tailscale",
-        """import json, os, sys
-args = sys.argv[1:]
-if args == ['status', '--json']:
- print(json.dumps({'BackendState':'Running','Self':{'DNSName':'reader.example.ts.net.'},'CertDomains':['reader.example.ts.net']}))
-elif args == ['debug', 'local-creds']:
- print('curl -u:fixture http://localhost:' + os.environ['FIXTURE_LOCALAPI_PORT'] + '/localapi/v0/status')
-else: raise SystemExit('UNEXPECTED TAILSCALE MUTATION')
-""",
-    )
-    try:
-        yield command
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
-
-
-def test_start_refuses_unowned_serve_listener_before_changing_application(
-    private_command,
-):
-    result = private_command.run("start")
-    assert result.returncode == 1
-    assert "Serve HTTPS port 443 is not exclusively project-owned" in result.stderr
-    assert "UNEXPECTED" not in result.stderr
-    assert not (private_command.state / "serve.json").exists()
-
-
-class PrivateEngine(Engine):
-    def __init__(self, runtime, port):
-        super().__init__(runtime, port)
-        self.machine = {"Name": "rss-aggregator", "State": "running"}
-        self.connection = {
-            "Name": "rss-aggregator",
-            "URI": "fixture",
-            "Identity": "fixture",
+class LocalAPI:
+    def __init__(self):
+        self.config = route(target="http://127.0.0.1:8001")
+        self.etag = '"snapshot-A"'
+        self.sockets = []
+        self.gets = []
+        self.posts = []
+        self.before_get = None
+        self.before_post = None
+        self.next_get_status = 200
+        self.post_status = 200
+        self.fail_connect_at = None
+        self.commands = {
+            ("status", "--json"): (
+                0,
+                json.dumps(
+                    {
+                        "BackendState": "Running",
+                        "Self": {"DNSName": HOST + "."},
+                        "CertDomains": [HOST],
+                    }
+                ),
+            ),
+            ("debug", "local-creds"): (
+                0,
+                f"curl -u:{LOCAL_SECRET} http://localhost:41112/localapi/v0/status\n",
+            ),
         }
-        self.config = {
-            "TCP": {"8443": {"HTTPS": True}},
-            "Web": {
-                "other.example.ts.net:8443": {"Handlers": {"/": {"Text": "unrelated"}}}
-            },
-        }
-        self.original = copy.deepcopy(self.config)
-        self.tailscale_calls = []
-        self.installed = True
-        self.fail_serve = False
-        self.before_mutation = None
-        self.fail_security = False
-        self.reconfigured = []
-        self.backend = "Running"
-        self.cert_domains = ["reader.example.ts.net"]
-        self.policy_ports = [{"First": 443, "Last": 443}]
-        self.settings = {
-            "api_enabled": False,
-            "auth_type": "form",
-            "allow_anonymous": False,
-            "allow_anonymous_refresh": False,
-            "base_url": "http://127.0.0.1:" + str(port),
-        }
-        self.settings_override = {}
+        self.grant(443)
 
-    def read(self):
-        return copy.deepcopy(self.config), json.dumps(self.config, sort_keys=True)
-
-    def write(self, config, etag):
-        if self.before_mutation:
-            self.before_mutation()
-        if etag != json.dumps(self.config, sort_keys=True):
-            raise ServeConfigRejected(
-                "Serve configuration changed concurrently; no change applied."
-            )
-        assert self.published and not self.probes
-        if self.fail_serve:
-            raise RuntimeFailure(
-                "Project Serve change failed; inspect authorization locally."
-            )
-        self.config = copy.deepcopy(config)
-
-    def run(self, *args, check=True, input=None):
-        if args[0] == "tailscale":
-            self.tailscale_calls.append(args[1:])
-            tail = args[1:]
-            status = 0
-            if tail == ("status", "--json"):
-                output = {
-                    "BackendState": self.backend,
-                    "Self": {"DNSName": "reader.example.ts.net."},
-                    "CertDomains": self.cert_domains,
-                }
-            elif tail == ("serve", "status", "--json"):
-                output = self.config
-            elif tail == ("debug", "netmap"):
-                output = {
+    def grant(self, port):
+        self.commands["debug", "netmap"] = (
+            0,
+            json.dumps(
+                {
                     "PacketFilter": [
                         {
                             "IPProto": [6],
                             "Srcs": ["fixture-reader"],
-                            "Dsts": [{"Ports": port} for port in self.policy_ports],
+                            "Dsts": [{"Ports": {"First": port, "Last": port}}],
                         }
                     ]
                 }
-            else:
-                raise AssertionError(f"Unexpected Tailscale command: {tail}")
-            return subprocess.CompletedProcess(args, status, json.dumps(output), "")
-        if args == ("podman", "machine", "inspect", "rss-aggregator"):
-            return subprocess.CompletedProcess(args, 0, json.dumps([self.machine]), "")
-        if args == ("podman", "machine", "list", "--format", "json"):
-            return subprocess.CompletedProcess(args, 0, "[]", "")
-        if args == ("podman", "system", "connection", "list", "--format", "json"):
-            return subprocess.CompletedProcess(
-                args, 0, json.dumps([self.connection]), ""
+            ),
+        )
+
+    def run_cli(self, args, **_kwargs):
+        if args[0] == "/bin/df":
+            return subprocess.CompletedProcess(args, 0, "Filesystem\n/dev/disk1\n", "")
+        assert args[0] == "tailscale", f"Unexpected external command: {args[0]}"
+        command = tuple(args[1:])
+        if command == ("serve", "status", "--json"):
+            code, stdout = 0, json.dumps(self.config)
+        else:
+            assert command in self.commands, f"Unexpected Tailscale command: {command}"
+            code, stdout = self.commands[command]
+        return subprocess.CompletedProcess(args, code, stdout, REMOTE_SECRET)
+
+    def connect(self, address, timeout, source_address):
+        assert address == ("127.0.0.1", 41112)
+        assert source_address is None
+        assert timeout > 0
+        if self.fail_connect_at == len(self.sockets):
+            self.sockets.append(None)
+            raise ConnectionRefusedError(REMOTE_SECRET)
+        sock = LocalAPISocket(self)
+        self.sockets.append(sock)
+        return sock
+
+    def respond(self, request):
+        line, headers, body = request
+        assert headers["Host"] == "local-tailscaled.sock"
+        if line == "GET /localapi/v0/serve-config HTTP/1.1":
+            assert not body
+            self.gets.append(self.etag)
+            if self.before_get:
+                self.before_get()
+            return reply(
+                json.dumps(self.config).encode(),
+                status=self.next_get_status,
+                headers=[("ETag", self.etag)],
             )
-        if args == (
-            "podman",
-            "machine",
-            "start",
-            "--update-connection=false",
-            "rss-aggregator",
-        ):
-            self.machine["State"] = "running"
-            return subprocess.CompletedProcess(args, 0, "", "")
-        if args == ("podman", "machine", "stop", "rss-aggregator"):
-            self.machine["State"] = "stopped"
-            return subprocess.CompletedProcess(args, 0, "", "")
-        if args[:4] == ("podman", "--connection", "rss-aggregator", "exec"):
-            if "applied_migrations.txt" in args[-1]:
-                return subprocess.CompletedProcess(
-                    args, 0 if self.installed else 1, "", ""
-                )
-            if "cli/reconfigure.php" in args:
-                self.reconfigured.append(args)
-                # PHP getopt optional values must use '='; an unconsumed
-                # positional 'false' ends parsing, even with later flags present.
-                flags = iter(args[args.index("cli/reconfigure.php") + 1 :])
-                for flag in flags:
-                    if not flag.startswith("--"):
-                        break
-                    key, sep, value = flag[2:].partition("=")
-                    if key in ("base-url", "auth-type"):
-                        self.settings[key.replace("-", "_")] = (
-                            value if sep else next(flags)
-                        )
-                    else:
-                        self.settings[key.replace("-", "_")] = (
-                            value == "true" if sep else True
-                        )
-                return subprocess.CompletedProcess(args, 0, "", "")
-            if (
-                "FreshRSS_Context::systemConf()" in args[-1]
-                and "api_enabled" in args[-1]
-            ):
-                return subprocess.CompletedProcess(
-                    args, 0, json.dumps({**self.settings, **self.settings_override}), ""
-                )
-            if args[-1] == "-l":
-                return subprocess.CompletedProcess(
-                    args, 0, "*/20 * * * * php app/actualize_script.php", ""
-                )
-            if "crond.pid" in args[-1] or args[-1] == "app/actualize_script.php":
-                return subprocess.CompletedProcess(args, 0, "", "")
-            if self.fail_security and 'file_get_contents("http:' in args[-1]:
-                return subprocess.CompletedProcess(
-                    args,
-                    0,
-                    json.dumps(
-                        {
-                            "php": "8.4.27",
-                            "sapi": "apache2handler",
-                            "upload_progress": "1",
-                        }
-                    ),
-                    "",
-                )
-        return super().run(*args, check=check, input=input)
+        assert line == "POST /localapi/v0/serve-config HTTP/1.1"
+        replacement = json.loads(body)
+        self.posts.append((headers.get("If-Match"), replacement))
+        if self.before_post:
+            self.before_post()
+        if headers.get("If-Match") != self.etag:
+            return reply(REMOTE_SECRET.encode(), status=412)
+        if self.post_status == 200:
+            self.config = replacement
+            self.etag = '"snapshot-B"'
+            return reply(b"")
+        return reply(REMOTE_SECRET.encode(), status=self.post_status)
+
+
+class LocalAPISocket(ControlledSocket):
+    def __init__(self, api):
+        super().__init__(b"")
+        self.api = api
+
+    def makefile(self, mode):
+        self.response = self.api.respond(self.request())
+        return super().makefile(mode)
+
+
+@pytest.fixture(scope="module")
+def installed_checkout(tmp_path_factory):
+    checkout = Checkout(tmp_path_factory.mktemp("private-install"))
+    checkout.prepare_source()
+    checkout.prepare_runtime()
+    installed = checkout.run("setup")
+    assert installed.returncode == 0, installed.stderr
+    return checkout, json.loads(installed.stdout)
 
 
 @pytest.fixture
-def private_runtime(tmp_path, monkeypatch):
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    runtime = Runtime(root=ROOT, state_dir=tmp_path)
-    engine = PrivateEngine(runtime, port)
-    engine.run("podman", "--connection", "rss-aggregator", "create")
-    engine.app["State"].update(Running=True, Status="running")
-    (tmp_path / "owner.json").write_text(
-        json.dumps(
-            {
-                "token": "test-owner",
-                "machine": engine.machine,
-                "connection": engine.connection,
-            }
-        )
-    )
-    response = MagicMock()
-    response.__enter__.return_value.status = 200
-    monkeypatch.setattr(
-        "rss_aggregator.runtime.urlopen", MagicMock(return_value=response)
-    )
-    monkeypatch.setattr(runtime, "_run", engine.run)
-    monkeypatch.setattr(
-        "rss_aggregator.private_access.ServeConfigClient", lambda runtime: engine
-    )
-    monkeypatch.setenv("RSS_PORT", str(port))
+def native(installed_checkout, tmp_path, monkeypatch):
+    checkout, owner = installed_checkout
+    state = tmp_path / "state"
+    shutil.copytree(checkout.state, state)
+    assert not (state / "instances").exists()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("RSS_STATE_DIR", str(state))
+    monkeypatch.setenv("RSS_BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setenv("RSS_TAILSCALE", "1")
-    return runtime, engine
+    monkeypatch.setenv("RSS_PORT", str(PORT))
+    monkeypatch.setattr(
+        "rss_aggregator.cli.Runtime", partial(Runtime, root=checkout.root)
+    )
+
+    def forbid_io(*_args, **_kwargs):
+        raise AssertionError("Unexpected native writer or network I/O")
+
+    api = LocalAPI()
+    monkeypatch.setattr(subprocess, "run", api.run_cli)
+    monkeypatch.setattr(subprocess, "Popen", forbid_io)
+    monkeypatch.setattr(socket, "create_connection", api.connect)
+    monkeypatch.setattr(socket, "socket", forbid_io)
+    monkeypatch.setattr(HTTPHandler, "http_open", forbid_io)
+    monkeypatch.setattr(HTTPSHandler, "https_open", forbid_io)
+    return SimpleNamespace(
+        state=state,
+        owner=owner,
+        api=api,
+        access=PrivateAccess(Runtime(root=checkout.root)),
+        record=state / "serve.json",
+        manifest=checkout.manifest,
+        run=partial(CliRunner().invoke, main, catch_exceptions=False),
+    )
 
 
-@pytest.mark.parametrize("funnel", [False, True])
-@pytest.mark.parametrize("installed", [False, True])
-@pytest.mark.parametrize("machine_state", ["running", "stopped"])
-def test_foreground_443_conflict_refused_before_application_changes(
-    private_runtime, funnel, installed, machine_state
-):
-    runtime, engine = private_runtime
-    engine.installed = installed
-    engine.machine["State"] = machine_state
-    engine.app["State"]["Running"] = machine_state == "running"
-    engine.config["Foreground"] = {
-        "other-session": {
-            "TCP": {"443": {"HTTPS": True}},
-            "Web": {
-                "reader.example.ts.net:443": {
-                    "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
-                }
-            },
-            "AllowFunnel": {"reader.example.ts.net:443": funnel},
-        }
+def seed_owned_route(native, phase="active"):
+    owned = route(ADDRESS)
+    for section, entries in owned.items():
+        native.api.config.setdefault(section, {}).update(entries)
+    record = {
+        "owner": native.owner["token"],
+        "host": HOST,
+        "target": BACKEND,
+        "phase": phase,
     }
-    before = copy.deepcopy(engine.config)
-    app_before = copy.deepcopy(engine.app)
-    with pytest.raises(RuntimeFailure, match="project-owned"):
-        runtime.run("start")
-    assert engine.config == before
-    assert engine.machine["State"] == machine_state
-    assert engine.app == app_before
-    assert not engine.reconfigured
-    assert not engine.probes
-    assert not engine.published
-    assert not (runtime.state_dir / "serve.json").exists()
+    native.record.write_text(json.dumps(record))
+    return record
 
 
-@pytest.mark.parametrize("foreground", [False, True])
-@pytest.mark.parametrize("installed", [False, True])
-@pytest.mark.parametrize("machine_state", ["running", "stopped"])
-def test_non443_funnel_to_backend_refused_before_application_changes(
-    private_runtime, foreground, installed, machine_state
-):
-    runtime, engine = private_runtime
-    engine.installed = installed
-    engine.machine["State"] = machine_state
-    engine.app["State"]["Running"] = machine_state == "running"
-    public = {
-        "TCP": {"8443": {"HTTPS": True}},
-        "Web": {
-            "reader.example.ts.net:8443": {
-                "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
-            }
-        },
-        "AllowFunnel": {"reader.example.ts.net:8443": True},
-    }
-    if foreground:
-        engine.config["Foreground"] = {"other-session": public}
-    else:
-        engine.config.update(public)
-    before = copy.deepcopy(engine.config)
-    app_before = copy.deepcopy(engine.app)
-    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
-        runtime.run("start")
-    assert engine.config == before
-    assert engine.machine["State"] == machine_state
-    assert engine.app == app_before
-    assert not engine.reconfigured
-    assert not engine.probes
-    assert not engine.published
-    assert not (runtime.state_dir / "serve.json").exists()
+def refused(result, diagnostic, *secrets):
+    assert result.exit_code == 1, result.output
+    assert result.stdout == ""
+    assert diagnostic in result.stderr
+    for secret in (LOCAL_SECRET, REMOTE_SECRET, API_PASSWORD, API_TOKEN, *secrets):
+        assert secret not in result.output
 
 
-@pytest.mark.parametrize("variant", ["cross_scope", "port_only"])
-@pytest.mark.parametrize("installed", [False, True])
-@pytest.mark.parametrize("machine_state", ["running", "stopped"])
-def test_supported_public_routes_refused_before_backend_changes(
-    private_runtime, variant, installed, machine_state
-):
-    runtime, engine = private_runtime
-    engine.installed = installed
-    engine.machine["State"] = machine_state
-    engine.app["State"]["Running"] = machine_state == "running"
-    address = "reader.example.ts.net:8443"
-    handler = {
-        "TCP": {"8443": {"HTTPS": True}},
-        "Web": {address: {"Handlers": {"/": {"Proxy": str(engine.port)}}}},
-    }
-    engine.config = {"AllowFunnel": {address: True}}
-    if variant == "cross_scope":
-        handler["Web"][address]["Handlers"]["/"]["Proxy"] = (
-            f"http://127.0.0.1:{engine.port}"
-        )
-        engine.config["Foreground"] = {"other-session": handler}
-    else:
-        engine.config.update(handler)
-    before = copy.deepcopy(engine.config)
-    app_before = copy.deepcopy(engine.app)
-    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
-        runtime.run("start")
-    assert engine.config == before
-    assert engine.app == app_before
-    assert engine.machine["State"] == machine_state
-    assert not engine.published
-    assert not engine.probes
-    assert not engine.reconfigured
-    assert not (runtime.state_dir / "serve.json").exists()
+def preflight_refuses(native, diagnostic, *secrets):
+    before = copy.deepcopy(native.api.config)
+    refused(native.run(["start"]), diagnostic, *secrets)
+    assert native.api.config == before
+    assert not native.api.posts
+    for path in ("instances", "service", "service.json", "security.json", "serve.json"):
+        assert not (native.state / path).exists(), path
+
+
+@pytest.mark.parametrize("scope", ["background", "foreground", "foreground-funnel"])
+def test_start_refuses_unowned_443_before_touching_application(native, scope):
+    config = route(ADDRESS, funnel=scope == "foreground-funnel")
+    native.api.config = (
+        config if scope == "background" else {"Foreground": {"foreign": config}}
+    )
+    preflight_refuses(native, "Serve HTTPS port 443 is not exclusively project-owned")
 
 
 @pytest.mark.parametrize(
-    "tcp,target",
+    "scope",
     [
-        (False, "http://127.0.0.1:{port}/subpath"),
-        (False, "http://localhost:{port}"),
-        (False, "127.0.0.1:{port}"),
-        (False, "localhost:{port}"),
-        (False, "{port}"),
-        (False, ":{port}"),
-        (False, "http://:{port}"),
-        (False, "https+insecure://[::1]:{port}/subpath"),
-        (False, "http://[::ffff:127.0.0.1]:{port}"),
-        (False, "http://[::ffff:7f00:1]:{port}/subpath"),
-        (False, "http://0.0.0.0:{port}"),
-        (True, "127.0.0.1:{port}"),
-        (True, ":{port}"),
-        (True, "[::1]:{port}"),
-        (True, "[::ffff:127.0.0.1]:{port}"),
-        (True, "[::ffff:7f00:1]:{port}"),
-        (True, "0.0.0.0:{port}"),
+        "background",
+        "foreground",
+        "cross-scope",
+        "service",
+        "split-foreground-http",
+        "split-foreground-tcp",
     ],
 )
-def test_public_backend_detection_checks_endpoint_not_handler_path(
-    private_runtime, target, tcp
-):
-    runtime, engine = private_runtime
-    target = target.format(port=engine.port)
-    engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
-    if tcp:
-        engine.config["TCP"]["8443"] = {"TCPForward": target}
-    else:
-        engine.config["Web"]["other.example.ts.net:8443"]["Handlers"] = {
-            "/nested": {"Proxy": target}
+def test_start_refuses_funnel_reaching_backend_on_another_port(native, scope):
+    public = route(funnel=True)
+    if scope == "background":
+        native.api.config = public
+    elif scope == "foreground":
+        native.api.config = {"Foreground": {"foreign": public}}
+    elif scope == "service":
+        native.api.config = {"Services": {"svc:foreign": public}}
+    elif scope == "cross-scope":
+        native.api.config = {
+            "AllowFunnel": public.pop("AllowFunnel"),
+            "Foreground": {"listener": public},
         }
-    before = copy.deepcopy(engine.config)
-    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
-        runtime.run("start")
-    assert engine.config == before
-    assert not engine.published
-    assert not engine.reconfigured
-
-
-@pytest.mark.parametrize("foreground", [False, True])
-@pytest.mark.parametrize("funnel", [False, True])
-def test_private_start_preserves_unrelated_funnel_or_private_backend_route(
-    private_runtime, foreground, funnel
-):
-    runtime, engine = private_runtime
-    # Enabled public forwarding points elsewhere; forwarding to this backend
-    # on a different port is acceptable only when it remains private.
-    port = (1024 if engine.port != 1024 else 1025) if funnel else engine.port
-    other = {
-        "TCP": {"8443": {"HTTPS": True}},
-        "Web": {
-            "other.example.ts.net:8443": {
-                "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{port}"}}
-            }
-        },
-        "AllowFunnel": {"other.example.ts.net:8443": funnel},
-    }
-    if foreground:
-        engine.config["Foreground"] = {"other-session": other}
     else:
-        engine.config.update(other)
-    before = copy.deepcopy(engine.config)
-    runtime.run("start")
-    engine.volumes.clear()
-    runtime.run("stop")
-    assert engine.config == before
-
-
-@pytest.mark.parametrize("tcp_forward", [False, True])
-def test_funnel_authorization_and_handlers_can_span_foreground_sessions(
-    private_runtime, tcp_forward
-):
-    runtime, engine = private_runtime
-    address = "reader.example.ts.net:8443"
-    engine.config = {
-        "AllowFunnel": {address: False},
-        "Foreground": {
-            "authorization": {"AllowFunnel": {address: True}},
-            "listener": {"TCP": {"8443": {"HTTPS": True}}},
-            "handler": {
-                "Web": {address: {"Handlers": {"/": {"Proxy": str(engine.port)}}}}
+        authorization = public["AllowFunnel"]
+        listener = public["TCP"]
+        if scope.endswith("tcp"):
+            listener = {"8443": {"TCPForward": f"127.0.0.1:{PORT}"}}
+        native.api.config = {
+            "AllowFunnel": {OTHER: False},
+            "Foreground": {
+                "authorization": {"AllowFunnel": authorization},
+                "listener": {"TCP": listener},
+                "handler": {"Web": {OTHER: {"Handlers": {"/": {"Proxy": str(PORT)}}}}},
             },
-        },
-    }
-    if tcp_forward:
-        engine.config["Foreground"]["listener"]["TCP"]["8443"] = {
-            "TCPForward": f"127.0.0.1:{engine.port}"
         }
-    before = copy.deepcopy(engine.config)
-    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
-        runtime.run("start")
-    assert engine.config == before
-    assert not engine.published
-    assert not engine.reconfigured
+        if scope.endswith("tcp"):
+            del native.api.config["Foreground"]["handler"]
+    preflight_refuses(native, "Existing Funnel reaches this FreshRSS backend")
 
 
-@pytest.mark.parametrize("separation", ["hostname", "service", "foreground_shadow"])
-def test_public_scanner_preserves_independent_or_shadowed_handlers(
-    private_runtime, separation
-):
-    runtime, engine = private_runtime
-    address = "other.example.ts.net:8443"
-    backend_handler = {"Handlers": {"/": {"Proxy": str(engine.port)}}}
-    engine.config["AllowFunnel"] = {address: True}
-    if separation == "hostname":
-        engine.config["Web"]["different.example.ts.net:8443"] = backend_handler
-    elif separation == "service":
-        engine.config["Services"] = {
-            "svc:other": {
-                "TCP": {"8443": {"HTTPS": True}},
-                "Web": {address: backend_handler},
-            }
-        }
-    else:
-        engine.config["Web"][address] = backend_handler
-        engine.config["Foreground"] = {
-            "other-session": {
-                "Web": {address: {"Handlers": {"/": {"Text": "unrelated"}}}}
-            }
-        }
-    before = copy.deepcopy(engine.config)
-    runtime.run("start")
-    engine.volumes.clear()
-    runtime.run("stop")
-    assert engine.config == before
-
-
-@pytest.mark.parametrize("snapshot_number", [1, 2])
-def test_funnel_added_before_final_snapshot_is_also_refused(
-    private_runtime, monkeypatch, snapshot_number
-):
-    runtime, engine = private_runtime
-    original_read = engine.read
-    snapshots = []
-
-    def read():
-        if len(snapshots) == snapshot_number:
-            engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
-            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-                "Proxy": f"http://127.0.0.1:{engine.port}"
-            }
-        snapshot = original_read()
-        snapshots.append(snapshot)
-        return snapshot
-
-    monkeypatch.setattr(engine, "read", read)
-    with pytest.raises(RuntimeFailure, match="Funnel.*backend"):
-        runtime.run("start")
-    assert len(snapshots) == snapshot_number + 1
-    assert engine.config == snapshots[-1][0]
-    assert "443" not in engine.config["TCP"]
-    assert not (runtime.state_dir / "serve.json").exists()
-    assert not engine.app["State"]["Running"]
-    assert (
-        "podman",
-        "--connection",
-        "rss-aggregator",
-        "stop",
-        "--time",
-        "60",
-        "rss-aggregator-freshrss",
-    ) in engine.calls
-
-
-@pytest.mark.parametrize("failure", [OSError, ValueError])
-def test_final_private_start_persistence_error_closes_backend(
-    private_runtime, monkeypatch, failure
-):
-    runtime, engine = private_runtime
-    original_save = runtime._save
-
-    def save(name, value):
-        if name == "serve.json":
-            # A client exposes the backend just before intent persistence fails.
-            engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
-            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-                "Proxy": str(engine.port)
-            }
-            raise failure("Fixture intent persistence failed")
-        return original_save(name, value)
-
-    monkeypatch.setattr(runtime, "_save", save)
-    with pytest.raises(failure, match="intent persistence failed"):
-        runtime.run("start")
-    assert not engine.app["State"]["Running"]
-    assert engine.config["AllowFunnel"]["other.example.ts.net:8443"]
-    assert "443" not in engine.config["TCP"]
-    assert not (runtime.state_dir / "serve.json").exists()
-
-
-@pytest.mark.parametrize("cleanup_failure", ["stop", "stop_oserror", "ownership"])
-def test_late_public_conflict_reports_unconfirmed_backend_shutdown(
-    private_runtime, monkeypatch, cleanup_failure
-):
-    runtime, engine = private_runtime
-    original_read = engine.read
-    snapshots = []
-
-    def read():
-        if len(snapshots) == 2:
-            engine.config["AllowFunnel"] = {"other.example.ts.net:8443": True}
-            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-                "Proxy": str(engine.port)
-            }
-            if cleanup_failure == "ownership":
-                engine.app["Config"]["Labels"]["io.rss-aggregator.owner"] = (
-                    "foreign-owner"
-                )
-        snapshot = original_read()
-        snapshots.append(snapshot)
-        return snapshot
-
-    def run(*args, **kwargs):
-        if (
-            cleanup_failure in ("stop", "stop_oserror")
-            and len(snapshots) == 3
-            and args[3:4] == ("stop",)
-        ):
-            error = OSError if cleanup_failure == "stop_oserror" else RuntimeFailure
-            raise error("Injected private engine diagnostic")
-        return engine.run(*args, **kwargs)
-
-    monkeypatch.setattr(engine, "read", read)
-    monkeypatch.setattr(runtime, "_run", run)
-    with pytest.raises(RuntimeFailure, match="could not be confirmed") as error:
-        runtime.run("start")
-    assert "may still be exposed" in str(error.value)
-    assert "private engine diagnostic" not in str(error.value)
-    assert engine.app["State"]["Running"]
-    assert engine.config == snapshots[-1][0]
-    assert "443" not in engine.config["TCP"]
-    assert not (runtime.state_dir / "serve.json").exists()
-
-
-@pytest.mark.parametrize("rejected_status", [401, 403, 412])
 @pytest.mark.parametrize(
-    "prior_phase,restoration_fails",
-    [(None, False), ("inactive", False), ("inactive", True), ("active", True)],
+    "protocol,target",
+    [
+        ("http", "http://127.0.0.1:{port}/subpath"),
+        ("http", "http://localhost:{port}"),
+        ("http", "127.0.0.1:{port}"),
+        ("http", "localhost:{port}"),
+        ("http", "{port}"),
+        ("http", ":{port}"),
+        ("http", "http://:{port}"),
+        ("http", "https+insecure://[::1]:{port}/subpath"),
+        ("http", "http://[::ffff:127.0.0.1]:{port}"),
+        ("http", "http://[::ffff:7f00:1]:{port}/subpath"),
+        ("http", "http://0.0.0.0:{port}"),
+        ("tcp", "127.0.0.1:{port}"),
+        ("tcp", ":{port}"),
+        ("tcp", "[::1]:{port}"),
+        ("tcp", "[::ffff:127.0.0.1]:{port}"),
+        ("tcp", "[::ffff:7f00:1]:{port}"),
+        ("tcp", "0.0.0.0:{port}"),
+    ],
 )
-def test_rejected_start_does_not_authorize_identical_foreign_route(
-    private_runtime, monkeypatch, prior_phase, rejected_status, restoration_fails
+def test_funnel_matches_backend_endpoint_not_handler_path(native, protocol, target):
+    native.api.config = route(funnel=True)
+    resolved = target.format(port=PORT)
+    if protocol == "tcp":
+        native.api.config["TCP"]["8443"] = {"TCPForward": resolved}
+        del native.api.config["Web"]
+    else:
+        native.api.config["Web"][OTHER]["Handlers"] = {"/nested": {"Proxy": resolved}}
+    preflight_refuses(native, "Existing Funnel reaches this FreshRSS backend")
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["private", "different-port", "different-host", "service-namespace", "shadowed"],
+)
+def test_start_does_not_misidentify_unrelated_routes_as_public_backend(native, variant):
+    if variant == "private":
+        native.api.config = route()
+    elif variant == "different-port":
+        native.api.config = route(target="http://127.0.0.1:8001", funnel=True)
+    elif variant == "different-host":
+        native.api.config = route("different.example.ts.net:8443")
+        native.api.config["AllowFunnel"] = {OTHER: True}
+    elif variant == "service-namespace":
+        native.api.config = route(target="http://127.0.0.1:8001", funnel=True)
+        native.api.config["Services"] = {"svc:foreign": route()}
+    else:
+        native.api.config = route(funnel=True)
+        native.api.config["Foreground"] = {
+            "shadow": route(target="http://127.0.0.1:8001")
+        }
+    # Reaching the next preflight guard proves acceptance without opening writers.
+    native.api.grant(22)
+    preflight_refuses(native, "has no incoming TCP 443 grant")
+
+
+@pytest.mark.parametrize(
+    "failure,diagnostic",
+    [
+        ("invalid-setting", "RSS_TAILSCALE must be 0"),
+        ("disconnected", "Connect the existing Tailscale installation"),
+        ("certificate", "HTTPS certificates are not enabled"),
+        ("failed-query", "Tailscale query failed"),
+        ("invalid-json", "Unusable Tailscale JSON"),
+        ("failed-discovery", "Unable to discover a supported Tailscale LocalAPI"),
+        ("invalid-etag", "Invalid Tailscale Serve configuration response"),
+    ],
+)
+def test_start_preflight_keeps_upstream_diagnostics_private(
+    native, monkeypatch, failure, diagnostic
 ):
-    runtime, engine = private_runtime
-    record_path = runtime.state_dir / "serve.json"
-    previous = {
-        "owner": "test-owner",
-        "host": "reader.example.ts.net",
-        "target": f"http://127.0.0.1:{engine.port}",
-        "phase": prior_phase,
+    if failure == "invalid-setting":
+        monkeypatch.setenv("RSS_TAILSCALE", "invalid")
+    elif failure == "invalid-etag":
+        native.api.etag = "W/" + REMOTE_SECRET
+    elif failure == "failed-discovery":
+        _, credentials = native.api.commands["debug", "local-creds"]
+        native.api.commands["debug", "local-creds"] = (1, credentials)
+    else:
+        command = ("status", "--json")
+        _, response = native.api.commands[command]
+        status = json.loads(response)
+        if failure == "disconnected":
+            status["BackendState"] = "Stopped"
+        elif failure == "certificate":
+            status["CertDomains"] = []
+        native.api.commands[command] = (
+            1 if failure == "failed-query" else 0,
+            REMOTE_SECRET
+            if failure in ("failed-query", "invalid-json")
+            else json.dumps(status),
+        )
+    preflight_refuses(native, diagnostic)
+
+
+@pytest.mark.parametrize(
+    "conflict", ["handler", "target", "funnel", "owner", "foreground", "inactive"]
+)
+def test_stop_refuses_changed_ownership_without_touching_foreign_route(
+    native, conflict
+):
+    record = seed_owned_route(native)
+    config = native.api.config
+    if conflict == "handler":
+        config["Web"][ADDRESS]["Handlers"]["/other"] = {"Text": REMOTE_SECRET}
+    elif conflict == "target":
+        config["Web"][ADDRESS]["Handlers"]["/"]["Proxy"] = PRIVATE_FEED
+    elif conflict == "funnel":
+        config["AllowFunnel"] = {ADDRESS: True}
+    elif conflict == "foreground":
+        config["Foreground"] = {"foreign": {"TCP": {"443": {"HTTPS": True}}}}
+    elif conflict == "inactive":
+        record["phase"] = "inactive"
+    else:
+        record["owner"] = REMOTE_SECRET
+    native.record.write_text(json.dumps(record))
+    before = copy.deepcopy(config)
+    diagnostic = (
+        "Serve ownership differs"
+        if conflict == "owner"
+        else "not exclusively project-owned"
+    )
+    refused(native.run(["stop"]), diagnostic, PRIVATE_FEED)
+    assert native.api.config == before
+    assert not native.api.posts
+    assert json.loads(native.record.read_text()) == record
+
+
+@pytest.mark.parametrize("phase", ["pending", "active"])
+def test_stop_idempotently_removes_only_owned_forwarding(native, phase):
+    native.api.config["Foreground"] = {"foreign": route()}
+    native.api.config["Services"] = {"svc:foreign": route("service.example.ts.net:443")}
+    native.api.config["AllowFunnel"] = {OTHER: True}
+    remaining = copy.deepcopy(native.api.config)
+    record = seed_owned_route(native, phase)
+    native.api.config["AllowFunnel"][ADDRESS] = False
+    status = native.run(["status"])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.stdout)["forwarding"] == {
+        "status": "running",
+        "url": ORIGIN,
     }
+
+    for _ in range(2):
+        stopped = native.run(["stop"])
+        assert stopped.exit_code == 0, stopped.output
+        assert json.loads(stopped.stdout)["application"] == "stopped"
+        status = native.run(["status"])
+        assert status.exit_code == 0, status.output
+        assert json.loads(status.stdout)["forwarding"] == {
+            "status": "stopped",
+            "url": ORIGIN,
+        }
+    assert native.api.config == remaining
+    assert native.api.posts == [('"snapshot-A"', remaining)]
+    assert json.loads(native.record.read_text()) == {**record, "phase": "inactive"}
+
+
+@pytest.mark.parametrize("changed", ["root", "unrelated"])
+def test_stop_refuses_etag_conflict_without_overwriting_competing_route(
+    native, changed
+):
+    record = seed_owned_route(native)
+
+    def race():
+        address = ADDRESS if changed == "root" else OTHER
+        native.api.config["Web"][address]["Handlers"]["/"] = {"Text": REMOTE_SECRET}
+        native.api.etag = '"competing"'
+
+    native.api.before_post = race
+    refused(native.run(["stop"]), "changed concurrently")
+    assert [tag for tag, _ in native.api.posts] == ['"snapshot-A"']
+    assert native.api.etag == '"competing"'
+    address = ADDRESS if changed == "root" else OTHER
+    assert native.api.config["Web"][address]["Handlers"]["/"] == {"Text": REMOTE_SECRET}
+    assert json.loads(native.record.read_text()) == record
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [
+        (401, "authorization rejected"),
+        (403, "authorization rejected"),
+        (412, "changed concurrently"),
+        (None, "before transmission"),
+    ],
+)
+@pytest.mark.parametrize("prior_phase", [None, "inactive"])
+def test_definitive_start_refusal_grants_no_authority_over_identical_route(
+    native, status, message, prior_phase
+):
     if prior_phase:
-        record_path.write_text(json.dumps(previous))
-    discovery = MagicMock()
-    discovery._run.return_value = subprocess.CompletedProcess(
-        [], 0, "curl -u:fixture http://localhost:1234/localapi/v0/status\n", ""
-    )
-    client = ServeConfigClient(discovery)
-    statuses = []
-    competing = []
+        before = copy.deepcopy(native.api.config)
+        previous = seed_owned_route(native, prior_phase)
+        native.api.config = before
 
-    def respond(method, body=None, etag=None):
-        assert method == "POST"
-        if not statuses:
-            # A concurrent winner can cause 412; after an authorization refusal,
-            # an authorized client can independently create that identical route.
-            competing.append(json.loads(body))
-            if rejected_status == 412:
-                engine.config = copy.deepcopy(competing[0])
-            statuses.append(rejected_status)
-            return rejected_status, [], b""
-        engine.config = json.loads(body)
-        statuses.append(200)
-        return 200, [], b""
+    def competing_client():
+        for section, entries in route(ADDRESS).items():
+            native.api.config[section].update(entries)
+        native.api.etag = '"competing"'
 
-    monkeypatch.setattr(client, "_request", respond)
-    monkeypatch.setattr(
-        engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
-    )
-    monkeypatch.setattr(engine, "write", client.write)
-    open_file = os.open
-
-    def open_with_full_storage(path, *args, **kwargs):
-        if restoration_fails and path == record_path.with_suffix(".tmp") and statuses:
-            raise OSError(errno.ENOSPC, "Fixture full filesystem")
-        return open_file(path, *args, **kwargs)
-
-    # Keep production durable _save intact; fail only its post-rejection file I/O.
-    with monkeypatch.context() as storage:
-        storage.setattr(os, "open", open_with_full_storage)
-        with pytest.raises(
-            RuntimeFailure,
-            match="concurrent|authorization|unknown|could not be restored",
-        ):
-            runtime.run("start")
-    assert not engine.app["State"]["Running"]
-    after_rejection = (
-        json.loads(record_path.read_text()) if record_path.exists() else None
-    )
-    if rejected_status != 412:
-        assert engine.config == engine.original
-        engine.config = copy.deepcopy(competing[0])
-    try:
-        forwarding = runtime.run("status")["forwarding"]["status"]
-    except RuntimeFailure:
-        forwarding = "refused"
-    engine.volumes.clear()
-    try:
-        runtime.run("stop")
-    except RuntimeFailure as error:
-        assert "project-owned" in str(error)
-    assert statuses == [rejected_status]
-    assert engine.config == competing[0]
-    assert forwarding != "running"
-    assert after_rejection == (
-        previous if prior_phase and not restoration_fails else None
-    )
-
-
-def test_preconnect_refusal_does_not_authorize_identical_foreign_route(
-    private_runtime, monkeypatch
-):
-    from test_serve_config import ControlledSocket, reply
-
-    runtime, engine = private_runtime
-    discovery = MagicMock()
-    discovery._run.return_value = subprocess.CompletedProcess(
-        [], 0, "curl -u:fixture http://localhost:1234/localapi/v0/status\n", ""
-    )
-    client = ServeConfigClient(discovery)
-    later_socket = ControlledSocket(reply(b""))
-    connections = []
-
-    def connect(*args):
-        connections.append(args)
-        if len(connections) == 1:
-            raise ConnectionRefusedError("Fixture daemon unavailable")
-        return later_socket
-
-    monkeypatch.setattr(socket, "create_connection", connect)
-    monkeypatch.setattr(
-        engine, "read", lambda: (copy.deepcopy(engine.config), '"fixture-snapshot"')
-    )
-    monkeypatch.setattr(engine, "write", client.write)
-    with pytest.raises(
-        RuntimeFailure, match="before transmission|outcome may be unknown"
-    ):
-        runtime.run("start")
-    assert not later_socket.wire
-    assert not engine.app["State"]["Running"]
-    competing = copy.deepcopy(engine.original)
-    competing["TCP"]["443"] = {"HTTPS": True}
-    competing["Web"]["reader.example.ts.net:443"] = {
-        "Handlers": {"/": {"Proxy": f"http://127.0.0.1:{engine.port}"}}
-    }
-    engine.config = copy.deepcopy(competing)
-    try:
-        forwarding = runtime.run("status")["forwarding"]["status"]
-    except RuntimeFailure:
-        forwarding = "refused"
-    engine.volumes.clear()
-    try:
-        runtime.run("stop")
-    except RuntimeFailure:
-        pass
-    assert not later_socket.wire, "A foreign route must not receive a deletion POST"
-    assert len(connections) == 1
-    assert engine.config == competing
-    assert forwarding != "running"
-    assert not (runtime.state_dir / "serve.json").exists()
-
-
-@pytest.mark.parametrize("verification", ["read", "unrelated", "recreated"])
-def test_confirmed_removal_retires_authority_before_verification(
-    private_runtime, monkeypatch, verification
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    owned_config = copy.deepcopy(engine.config)
-    record_path = runtime.state_dir / "serve.json"
-    original_read, original_write = engine.read, engine.write
-    reads, writes = [], []
-
-    def read():
-        reads.append(True)
-        if len(reads) == 2:
-            if verification == "read":
-                raise RuntimeFailure("Verification GET failed; inspect locally.")
-            if verification == "unrelated":
-                engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-                    "Text": "concurrent unrelated change"
-                }
-            else:
-                engine.config = copy.deepcopy(owned_config)
-        return original_read()
-
-    def write(config, etag):
-        original_write(config, etag)
-        writes.append(copy.deepcopy(config))
-
-    monkeypatch.setattr(engine, "read", read)
-    monkeypatch.setattr(engine, "write", write)
-    engine.volumes.clear()
-    with pytest.raises(
-        RuntimeFailure, match="GET failed|changed concurrently|did not stop"
-    ):
-        runtime.run("stop")
-    record_after_failure = json.loads(record_path.read_text())
-    assert "443" not in writes[0]["TCP"]
-    # A foreign client recreates the exact old listener after confirmed removal.
-    engine.config = copy.deepcopy(owned_config)
-    try:
-        forwarding = runtime.run("status")["forwarding"]["status"]
-    except RuntimeFailure:
-        forwarding = "refused"
-    try:
-        runtime.run("stop")
-    except RuntimeFailure as error:
-        assert "project-owned" in str(error)
-    assert len(writes) == 1
-    assert engine.config == owned_config
-    assert forwarding != "running"
-    assert record_after_failure["phase"] == "inactive"
-
-
-def test_retirement_persistence_failure_prevents_removal_request(
-    private_runtime, monkeypatch
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    before = copy.deepcopy(engine.config)
-    record_path = runtime.state_dir / "serve.json"
-    record_before = json.loads(record_path.read_text())
-    original_save, original_write = runtime._save, engine.write
-    writes = []
-
-    def save(name, value):
-        if name == "serve.json" and value["phase"] == "inactive":
-            raise OSError("Fixture retirement persistence failed")
-        return original_save(name, value)
-
-    def write(config, etag):
-        writes.append(copy.deepcopy(config))
-        original_write(config, etag)
-
-    monkeypatch.setattr(runtime, "_save", save)
-    monkeypatch.setattr(engine, "write", write)
-    engine.volumes.clear()
-    with pytest.raises(OSError, match="retirement persistence failed"):
-        runtime.run("stop")
-    assert not writes
-    assert engine.config == before
-    assert json.loads(record_path.read_text()) == record_before
-    monkeypatch.setattr(runtime, "_save", original_save)
-    runtime.run("stop")
-    assert len(writes) == 1
-    assert json.loads(record_path.read_text())["phase"] == "inactive"
-
-
-@pytest.mark.parametrize(
-    "rejected,applied", [(False, False), (False, True), (True, False)]
-)
-def test_removal_failure_preserves_intent_without_new_deletion_authority(
-    private_runtime, monkeypatch, rejected, applied
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    before = copy.deepcopy(engine.config)
-    record_path = runtime.state_dir / "serve.json"
-    record_before = json.loads(record_path.read_text())
-    original_write = engine.write
-    writes = []
-
-    def write(config, etag):
-        writes.append(copy.deepcopy(config))
-        if rejected:
-            raise ServeConfigRejected("Fixture definite rejection")
-        if applied:
-            original_write(config, etag)
-        raise RuntimeFailure("Fixture unknown removal outcome")
-
-    monkeypatch.setattr(engine, "write", write)
-    engine.volumes.clear()
-    with pytest.raises(RuntimeFailure, match="rejection|unknown removal"):
-        runtime.run("stop")
-    record_after_failure = json.loads(record_path.read_text())
-    if rejected:
-        assert record_after_failure == record_before
-        assert engine.config == before
+    if status is None:
+        native.api.fail_connect_at = 2
+    elif status == 412:
+        # Winning concurrently must invalidate the snapshot even when the new
+        # route is identical to the one the project attempted to publish.
+        native.api.before_post = competing_client
     else:
-        assert record_after_failure == {**record_before, "phase": "inactive"}
-        # Whether removal applied or not, an identical route might now be foreign.
-        engine.config = copy.deepcopy(before)
-        with pytest.raises(RuntimeFailure, match="project-owned"):
-            runtime.run("status")
-        with pytest.raises(RuntimeFailure, match="project-owned"):
-            runtime.run("stop")
-        assert len(writes) == 1
-        assert engine.config == before
+        native.api.post_status = status
+    with pytest.raises(ServeConfigRejected, match=message) as error:
+        native.access.start(native.owner, PORT, ORIGIN)
+    assert LOCAL_SECRET not in str(error.value)
+    assert REMOTE_SECRET not in str(error.value)
+    assert [tag for tag, _ in native.api.posts] == (
+        [] if status is None else ['"snapshot-A"']
+    )
+    assert (ADDRESS in native.api.config["Web"]) == (status == 412)
+    if prior_phase:
+        assert json.loads(native.record.read_text()) == previous
+    else:
+        assert not native.record.exists()
+
+    if status != 412:
+        # An independently authorized client can also publish after rejection.
+        competing_client()
+    competing = copy.deepcopy(native.api.config)
+    result = native.run(["status"])
+    if prior_phase:
+        refused(result, "not exclusively project-owned")
+    else:
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["forwarding"] == {"status": "unconfigured"}
+    stopped = native.run(["stop"])
+    if prior_phase:
+        refused(stopped, "not exclusively project-owned")
+    else:
+        assert stopped.exit_code == 0, stopped.output
+    assert len(native.api.posts) == (0 if status is None else 1)
+    assert native.api.config == competing
+
+
+def test_repeated_forwarding_start_preserves_unrelated_routes(native):
+    native.api.config["Foreground"] = {"foreign": route()}
+    native.api.config["Services"] = {"svc:foreign": route("service.example.ts.net:443")}
+    original = copy.deepcopy(native.api.config)
+    for _ in range(2):
+        assert native.access.start(native.owner, PORT, ORIGIN) == {
+            "status": "running",
+            "url": ORIGIN,
+        }
+        assert json.loads(native.record.read_text())["phase"] == "active"
+    assert [tag for tag, _ in native.api.posts] == ['"snapshot-A"', '"snapshot-B"']
+    stopped = native.run(["stop"])
+    assert stopped.exit_code == 0, stopped.output
+    assert native.api.config == original
+
+
+def test_final_start_snapshot_refuses_new_funnel_without_publishing(native):
+    def add_funnel():
+        if len(native.api.gets) == 2:
+            native.api.config = route(funnel=True)
+            native.api.etag = '"with-new-funnel"'
+
+    native.api.before_get = add_funnel
+    with pytest.raises(
+        RuntimeFailure, match="Existing Funnel reaches this FreshRSS backend"
+    ):
+        native.access.start(native.owner, PORT, ORIGIN)
+    assert native.api.config == route(funnel=True)
+    assert not native.api.posts
+    assert not native.record.exists()
 
 
 @pytest.mark.parametrize("applied", [False, True])
-def test_uncertain_start_retains_pending_recovery_intent(
-    private_runtime, monkeypatch, applied
-):
-    runtime, engine = private_runtime
-    original_write = engine.write
+def test_unknown_start_retains_intent_for_owned_recovery(native, applied):
+    original = copy.deepcopy(native.api.config)
+    native.api.post_status = 500
 
-    def uncertain_write(config, etag):
+    def lose_confirmation():
         if applied:
-            original_write(config, etag)
-        raise RuntimeFailure("Write outcome may be unknown; inspect locally.")
+            native.api.config = copy.deepcopy(native.api.posts[-1][1])
 
-    monkeypatch.setattr(engine, "write", uncertain_write)
-    with pytest.raises(RuntimeFailure, match="unknown"):
-        runtime.run("start")
-    record = json.loads((runtime.state_dir / "serve.json").read_text())
-    assert record["phase"] == "pending"
-    assert not engine.app["State"]["Running"]
-    assert runtime.run("status")["forwarding"]["status"] == (
+    native.api.before_post = lose_confirmation
+    with pytest.raises(RuntimeFailure, match="outcome may be unknown"):
+        native.access.start(native.owner, PORT, ORIGIN)
+    assert json.loads(native.record.read_text())["phase"] == "pending"
+    status = native.run(["status"])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.stdout)["forwarding"]["status"] == (
         "running" if applied else "stopped"
     )
-    monkeypatch.setattr(engine, "write", original_write)
-    engine.volumes.clear()
-    runtime.run("stop")
-    assert engine.config == engine.original
+    native.api.before_post = None
+    native.api.post_status = 200
+    stopped = native.run(["stop"])
+    assert stopped.exit_code == 0, stopped.output
+    assert native.api.config == original
+    assert json.loads(native.record.read_text())["phase"] == "inactive"
 
 
-def test_private_start_preserves_unrelated_foreground_and_virtual_services(
-    private_runtime,
-):
-    runtime, engine = private_runtime
-    engine.config["Foreground"] = {
-        "other-session": {
-            "TCP": {"8443": {"HTTPS": True}},
-            "Web": {
-                "reader.example.ts.net:8443": {"Handlers": {"/": {"Text": "other"}}}
-            },
-            "Services": {
-                "svc:other": {
-                    "TCP": {"443": {"HTTPS": True}},
-                    "Web": {
-                        "other.example.ts.net:443": {
-                            "Handlers": {"/": {"Text": "service"}}
-                        }
-                    },
-                }
-            },
-        }
-    }
-    engine.config["Services"] = copy.deepcopy(
-        engine.config["Foreground"]["other-session"]["Services"]
-    )
-    before = copy.deepcopy(engine.config)
-    runtime.run("start")
-    engine.volumes.clear()
-    runtime.run("stop")
-    assert engine.config == before
-
-
-def test_private_start_effectively_enables_api_and_disables_anonymous_access(
-    private_runtime,
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    assert engine.settings == {
-        "api_enabled": True,
-        "auth_type": "form",
-        "allow_anonymous": False,
-        "allow_anonymous_refresh": False,
-        "base_url": "https://reader.example.ts.net",
-    }
+@pytest.mark.parametrize("status", [401, 403])
+def test_definitive_removal_refusal_restores_prior_intent(native, status):
+    record = seed_owned_route(native)
+    before = copy.deepcopy(native.api.config)
+    native.api.post_status = status
+    refused(native.run(["stop"]), "authorization rejected")
+    assert len(native.api.posts) == 1
+    assert native.api.config == before
+    assert json.loads(native.record.read_text()) == record
 
 
 @pytest.mark.parametrize(
-    "key,value",
+    "failure,diagnostic",
     [
-        ("api_enabled", False),
-        ("auth_type", "none"),
-        ("allow_anonymous", True),
-        ("allow_anonymous_refresh", True),
-        ("base_url", "http://127.0.0.1:8080"),
+        ("unknown", "outcome may be unknown"),
+        ("verification-get", "Unable to read Tailscale Serve configuration"),
+        ("unrelated-change", "Unrelated Serve configuration changed concurrently"),
+        ("recreated", "Project Serve forwarding did not stop"),
     ],
 )
-def test_private_start_refuses_ineffective_configuration_before_forwarding(
-    private_runtime, key, value
+def test_uncertain_or_confirmed_removal_retires_authority_before_verification(
+    native, failure, diagnostic
 ):
-    runtime, engine = private_runtime
-    engine.settings_override = {key: value}
-    with pytest.raises(RuntimeFailure, match="effective HTTPS/API configuration"):
-        runtime.run("start")
-    assert engine.config == engine.original
+    record = seed_owned_route(native)
+    owned = copy.deepcopy(native.api.config)
+
+    def verification():
+        if len(native.api.gets) == 2:
+            if failure == "verification-get":
+                native.api.next_get_status = 500
+            elif failure == "unrelated-change":
+                native.api.config["Web"][OTHER]["Handlers"]["/"] = {
+                    "Text": REMOTE_SECRET
+                }
+            elif failure == "recreated":
+                native.api.config = copy.deepcopy(owned)
+
+    native.api.before_get = verification
+    if failure == "unknown":
+        native.api.post_status = 500
+    refused(native.run(["stop"]), diagnostic)
+    assert len(native.api.posts) == 1
+    assert ADDRESS not in native.api.posts[0][1]["Web"]
+    assert json.loads(native.record.read_text()) == {**record, "phase": "inactive"}
+    native.api.config = owned
+    refused(native.run(["status"]), "not exclusively project-owned")
+    assert len(native.api.posts) == 1
 
 
-def test_repeat_start_and_stop_manage_only_project_forwarding(private_runtime):
-    runtime, engine = private_runtime
-    for _ in range(2):
-        result = runtime.run("start")
-        assert result["url"] == "https://reader.example.ts.net"
-        assert result["forwarding"]["status"] == "running"
-        assert "--api-enabled=true" in engine.reconfigured[-1]
-        assert "--auth-type" in engine.reconfigured[-1]
-        assert (
-            engine.config["Web"]["other.example.ts.net:8443"]
-            == engine.original["Web"]["other.example.ts.net:8443"]
-        )
-    # No source data: stop can test forwarding lifecycle without a synthetic archive.
-    engine.volumes.clear()
-    for _ in range(2):
-        assert runtime.run("stop")["machine"] == "stopped"
-        assert engine.config == engine.original
-
-
-def test_replace_rejects_invalid_private_setting_before_any_mutation(
-    private_runtime, monkeypatch
+@pytest.mark.parametrize(
+    "stage", ["start-intent", "start-restoration", "stop-retirement"]
+)
+def test_forwarding_persistence_failure_cannot_grant_new_deletion_authority(
+    native, monkeypatch, stage
 ):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    before = copy.deepcopy(engine.config)
-    monkeypatch.setenv("RSS_TAILSCALE", "invalid")
-    with pytest.raises(RuntimeFailure, match="RSS_TAILSCALE"):
-        runtime.run("replace")
-    assert engine.config == before
-    assert engine.app["State"]["Running"]
-
-
-def test_reserved_live_fixture_record_cannot_touch_real_forwarding_record(
-    private_runtime, monkeypatch
-):
-    runtime, _engine = private_runtime
-    actual = runtime.state_dir / "serve.json"
-    actual.write_text('{"owner":"real-project-sentinel"}')
-    monkeypatch.setattr(
-        "rss_aggregator.private_access.SERVE_RECORD",
-        "test-1234-serve.json",
-        raising=False,
-    )
-    runtime.run("start")
-    assert actual.read_text() == '{"owner":"real-project-sentinel"}'
-    assert (
-        json.loads((runtime.state_dir / "test-1234-serve.json").read_text())["phase"]
-        == "active"
-    )
-
-
-def test_missing_tcp443_policy_fails_before_publishing_or_configuring_api(
-    private_runtime,
-):
-    runtime, engine = private_runtime
-    engine.policy_ports = [{"First": 22, "Last": 22}]
-    with pytest.raises(RuntimeFailure, match="TCP 443 grant"):
-        runtime.run("start")
-    assert engine.config == engine.original
-    assert not engine.reconfigured
-
-
-def test_missing_certificate_authorization_fails_without_account_changes(
-    private_runtime,
-):
-    runtime, engine = private_runtime
-    engine.cert_domains = []
-    with pytest.raises(RuntimeFailure, match="HTTPS certificates are not enabled"):
-        runtime.run("start")
-    assert engine.config == engine.original
-    assert not engine.reconfigured
-
-
-@pytest.mark.parametrize("private", [False, True])
-@pytest.mark.parametrize("failure", [None, "auth", "fetch"])
-def test_access_gate_closes_backend_through_preserved_private_route(
-    private_runtime, monkeypatch, private, failure
-):
-    runtime, engine = private_runtime
-    monkeypatch.setenv("RSS_TAILSCALE", "1" if private else "0")
-    engine.app["State"].update(Running=False, Status="exited")
-    engine.policy_ports.append({"First": 8443, "Last": 8443})
-    engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-        "Proxy": f"http://127.0.0.1:{engine.port}"
-    }
-    foreign = copy.deepcopy(engine.config)
-    if not private:
-        # The loopback fallback of a previously private instance also gates auth.
-        (runtime.state_dir / "serve.json").write_text(
+    if stage == "start-restoration":
+        native.record.write_text(
             json.dumps(
                 {
-                    "owner": "test-owner",
-                    "host": "reader.example.ts.net",
-                    "target": f"http://127.0.0.1:{engine.port}",
+                    "owner": native.owner["token"],
+                    "host": HOST,
+                    "target": BACKEND,
                     "phase": "inactive",
                 }
             )
         )
-    if failure is None:
-        runtime.run("start")
-        assert engine.app["State"]["Running"]
-        assert ("443" in engine.config["TCP"]) == private
-        assert (
-            engine.config["Web"]["other.example.ts.net:8443"]
-            == foreign["Web"]["other.example.ts.net:8443"]
-        )
-    else:
-        engine.settings_override = {"auth_type": "none", "allow_anonymous": True}
+        native.api.post_status = 403
+    elif stage == "stop-retirement":
+        seed_owned_route(native)
+    before = native.record.read_bytes() if native.record.exists() else None
+    replace = os.replace
 
-        def run(*args, **kwargs):
-            if failure == "fetch" and args[-1] == "app/actualize_script.php":
-                return subprocess.CompletedProcess(args, 1, "", "")
-            return engine.run(*args, **kwargs)
-
-        monkeypatch.setattr(runtime, "_run", run)
-        with pytest.raises(
-            RuntimeFailure,
-            match="required authenticated settings|Immediate feed fetching failed",
+    def storage(source, target, **kwargs):
+        if target == native.record and (
+            stage != "start-restoration" or native.api.posts
         ):
-            runtime.run("start")
-        assert not engine.app["State"]["Running"]
-        assert engine.published
-        assert engine.config == foreign
-        assert engine.machine["State"] == "running"
+            raise OSError("synthetic storage failure")
+        return replace(source, target, **kwargs)
 
-
-@pytest.mark.parametrize("failure", ["security", "serve", "installer", "disconnected"])
-def test_failed_private_start_does_not_expose_application(private_runtime, failure):
-    runtime, engine = private_runtime
-    if failure == "security":
-        runtime.run("start")
-        engine.fail_security = True
-    elif failure == "serve":
-        engine.fail_serve = True
-    elif failure == "installer":
-        engine.installed = False
+    monkeypatch.setattr(os, "replace", storage)
+    if stage == "start-restoration":
+        with pytest.raises(
+            RuntimeFailure, match="preceding intent could not be restored"
+        ):
+            native.access.start(native.owner, PORT, ORIGIN)
+        assert len(native.api.posts) == 1
+        assert not native.record.exists()
+    elif stage == "start-intent":
+        with pytest.raises(OSError, match="synthetic storage failure"):
+            native.access.start(native.owner, PORT, ORIGIN)
+        assert not native.api.posts
+        assert not native.record.exists()
     else:
-        engine.backend = "Stopped"
-    with pytest.raises(RuntimeFailure) as error:
-        runtime.run("start")
-    assert "private-admin-url" not in str(error.value)
-    assert "secret" not in str(error.value)
-    assert engine.config == engine.original
-    assert not engine.probes
+        refused(native.run(["stop"]), "synthetic storage failure")
+        assert not native.api.posts
+        assert native.record.read_bytes() == before
 
 
-@pytest.mark.parametrize(
-    "conflict", ["handler", "target", "funnel", "owner", "foreground"]
-)
-def test_stop_refuses_changed_ownership_without_removing_routes(
-    private_runtime, conflict
+def http_response(request, body, status=200, headers=None):
+    response = addinfourl(io.BytesIO(body), headers or {}, request.full_url, status)
+    response.msg = REMOTE_SECRET
+    return response
+
+
+@pytest.fixture
+def ready_native(native, monkeypatch):
+    nonce = "synthetic-generation"
+    for name, value in {
+        "service.json": {
+            "nonce": nonce,
+            "port": PORT,
+            "url": ORIGIN,
+            "runtime": manifest_identity(native.manifest),
+        },
+        "service-status.json": {"nonce": nonce, "web": "started"},
+        "security.json": {"nonce": nonce},
+    }.items():
+        (native.state / name).write_text(json.dumps(value))
+    native.requests = []
+
+    def ready(_handler, request):
+        assert not request.data
+        if request.full_url == BACKEND + "/i/":
+            return http_response(request, b"")
+        assert request.full_url == BACKEND + "/__rss_ready"
+        assert request.get_header("Host") == f"rss-{nonce}.invalid"
+        return http_response(request, nonce.encode())
+
+    monkeypatch.setattr(HTTPHandler, "http_open", ready)
+    with (
+        (native.state / "writers.lock").open("wb") as writers,
+        (native.state / "controller.lock").open("wb") as controller,
+    ):
+        for lock in (writers, controller):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield native
+
+
+def test_private_preflight_conflict_does_not_stop_existing_backend(
+    ready_native, monkeypatch
 ):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    if conflict == "handler":
-        engine.config["Web"]["reader.example.ts.net:443"]["Handlers"]["/other"] = {
-            "Text": "another project"
-        }
-    elif conflict == "target":
-        engine.config["Web"]["reader.example.ts.net:443"]["Handlers"]["/"]["Proxy"] = (
-            "http://127.0.0.1:9000"
-        )
-    elif conflict == "funnel":
-        engine.config["AllowFunnel"] = {"reader.example.ts.net:443": True}
-    elif conflict == "foreground":
-        engine.config["Foreground"] = {
-            "other-session": {"TCP": {"443": {"HTTPS": True}}}
-        }
-    else:
-        path = runtime.state_dir / "serve.json"
-        record = json.loads(path.read_text())
-        record["owner"] = "another-project"
-        path.write_text(json.dumps(record))
-    before = copy.deepcopy(engine.config)
-    with pytest.raises(RuntimeFailure, match="ownership|project-owned"):
-        runtime.run("stop")
-    assert engine.config == before
-    assert engine.app["State"]["Running"]
+    native = ready_native
+    native.api.config = route(ADDRESS)
+    evidence = [
+        native.state / name
+        for name in ("service.json", "service-status.json", "security.json")
+    ]
+    before = [path.read_bytes() for path in evidence]
+    replace = os.replace
 
+    def refuse_stop_request(source, target, **kwargs):
+        # There is no real controller to act on a stop request; fail immediately.
+        assert target != native.state / "stop-service.json"
+        return replace(source, target, **kwargs)
 
-@pytest.mark.parametrize("operation", ["start", "stop"])
-@pytest.mark.parametrize("change", ["root", "unrelated"])
-def test_concurrent_serve_change_is_not_overwritten(private_runtime, operation, change):
-    runtime, engine = private_runtime
-    if operation == "stop":
-        runtime.run("start")
-    raced = []
+    monkeypatch.setattr(os, "replace", refuse_stop_request)
+    refused(native.run(["start"]), "not exclusively project-owned")
 
-    def replace_configuration():
-        if change == "root":
-            engine.config.setdefault("TCP", {})["443"] = {"HTTPS": True}
-            engine.config.setdefault("Web", {})["reader.example.ts.net:443"] = {
-                "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
-            }
-        else:
-            engine.config["Web"]["other.example.ts.net:8443"]["Handlers"]["/"] = {
-                "Text": "concurrent replacement"
-            }
-        raced.append(copy.deepcopy(engine.config))
-
-    engine.before_mutation = replace_configuration
-    with pytest.raises(RuntimeFailure, match="concurrent"):
-        runtime.run(operation)
-    assert len(raced) == 1
-    assert engine.config == raced[0]
-    assert not any("reset" in call for call in engine.tailscale_calls)
-
-
-def test_backup_restores_private_forwarding_even_without_opt_in_environment(
-    private_runtime, monkeypatch, tmp_path
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    monkeypatch.setenv("RSS_TAILSCALE", "0")
-    monkeypatch.setenv("RSS_BACKUP_DIR", str(tmp_path / "backups"))
-    # Snapshot fails on our deliberately non-exportable engine fixture; the
-    # recovery contract must still restore the prior application/forwarding state.
-    with pytest.raises((RuntimeFailure, KeyError)):
-        runtime.run("backup")
-    assert engine.app["State"]["Running"]
-    assert engine.config["Web"]["reader.example.ts.net:443"]["Handlers"]["/"][
-        "Proxy"
-    ].startswith("http://127.0.0.1:")
-
-
-def test_api_check_returns_only_sanitized_diagnostics_and_authentication(
-    private_runtime, monkeypatch
-):
-    runtime, _engine = private_runtime
-    runtime.run("start")
-    requests = []
-
-    def respond(self, request, timeout):
-        requests.append(request)
-        assert request.full_url.startswith(
-            "https://reader.example.ts.net/api/greader.php/"
-        )
-        assert "secret-password" not in request.full_url
-        if request.full_url.endswith("/check/compatibility"):
-            return io.BytesIO(b"PASS")
-        if request.full_url.endswith("/accounts/ClientLogin"):
-            assert request.get_method() == "POST"
-            assert b"Passwd=secret-password" in request.data
-            return io.BytesIO(b"SID=private-session\nAuth=private-token\n")
-        assert request.get_header("Authorization") == "GoogleLogin auth=private-token"
-        if "subscription/list" in request.full_url:
-            return io.BytesIO(b'{"subscriptions":[{"id":"private-feed-url"}]}')
-        return io.BytesIO(b'{"items":[{"id":"private-article-id"}]}')
-
-    monkeypatch.setattr(OpenerDirector, "open", respond)
-    result = runtime.run("api-check", username="reader", api_password="secret-password")
-    assert result == {
-        "diagnostics": "PASS",
-        "authenticated": True,
-        "subscriptions": 1,
-        "sample_articles": 1,
-        "transport": "https",
-        "https_verified": True,
-    }
-    assert len(requests) == 4
-    assert "private-" not in json.dumps(result)
-
-
-def test_explicit_loopback_api_check_reports_no_https_verification(
-    private_runtime, monkeypatch
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-
-    def respond(self, request, timeout):
-        assert request.full_url.startswith(
-            f"http://127.0.0.1:{engine.port}/api/greader.php/"
-        )
-        assert "secret-password" not in request.full_url
-        if request.full_url.endswith("/check/compatibility"):
-            return io.BytesIO(b"PASS")
-        if request.full_url.endswith("/accounts/ClientLogin"):
-            assert request.get_method() == "POST"
-            return io.BytesIO(b"Auth=private-token\n")
-        if "subscription/list" in request.full_url:
-            return io.BytesIO(b'{"subscriptions":[{}]}')
-        return io.BytesIO(b'{"items":[{}]}')
-
-    monkeypatch.setattr(OpenerDirector, "open", respond)
-    result = runtime.run(
-        "api-check", username="reader", api_password="secret-password", loopback=True
-    )
-    assert result == {
-        "diagnostics": "PASS",
-        "authenticated": True,
-        "subscriptions": 1,
-        "sample_articles": 1,
-        "transport": "loopback",
-        "https_verified": False,
-    }
-
-
-@pytest.mark.parametrize(
-    "bindings",
-    [
-        [],
-        [{"HostIp": "0.0.0.0", "HostPort": "8080"}],
-        [{"HostIp": "::1", "HostPort": "8080"}],
-        [{"HostIp": "127.0.0.1", "HostPort": "bad"}],
-        [{"HostIp": "127.0.0.1", "HostPort": "80"}],
-        [
-            {"HostIp": "127.0.0.1", "HostPort": "8080"},
-            {"HostIp": "127.0.0.1", "HostPort": "8081"},
-        ],
-    ],
-)
-def test_loopback_authentication_refuses_unverified_publication_before_sending_credentials(
-    private_runtime, monkeypatch, bindings
-):
-    runtime, engine = private_runtime
-    runtime.run("start")
-    engine.app["HostConfig"]["PortBindings"]["80/tcp"] = bindings
-
-    def never_send(*args, **kwargs):
-        raise AssertionError(
-            "Credentials must not be sent to an unverified publication"
-        )
-
-    monkeypatch.setattr(OpenerDirector, "open", never_send)
-    with pytest.raises(RuntimeFailure, match="loopback|Loopback"):
-        runtime.run(
-            "api-check",
-            username="reader",
-            api_password="secret-password",
-            loopback=True,
-        )
+    assert [path.read_bytes() for path in evidence] == before
+    assert not (native.state / "stop-service.json").exists()
+    assert not native.record.exists()
+    assert not native.api.posts
+    assert native.api.config == route(ADDRESS)
 
 
 @pytest.mark.parametrize("flags", [[], ["--loopback"]])
-def test_api_check_cli_hides_password_and_keeps_failure_stdout_empty(tmp_path, flags):
-    result = CliRunner().invoke(
-        main,
-        ["api-check", *flags],
-        input="reader\nnever-print-this\n",
-        env={"RSS_STATE_DIR": str(tmp_path)},
-    )
-    assert result.exit_code == 1
-    assert result.stdout == ""
-    assert "never-print-this" not in result.stderr
+def test_api_cli_refuses_unverified_instance_without_echoing_password(native, flags):
+    result = native.run(["api-check", *flags], input=f"reader\n{API_PASSWORD}\n")
+    refused(result, "verified running instance")
     assert "API password" in result.stderr
+    assert not native.api.sockets
+
+
+def test_loopback_api_does_not_send_credentials_to_wrong_service_generation(
+    ready_native, monkeypatch
+):
+    def wrong_generation(_handler, request):
+        assert request.full_url == BACKEND + "/__rss_ready"
+        assert not request.data
+        return http_response(request, b"stale-generation")
+
+    monkeypatch.setattr(HTTPHandler, "http_open", wrong_generation)
+    result = ready_native.run(
+        ["api-check", "--loopback"], input=f"reader\n{API_PASSWORD}\n"
+    )
+    refused(result, "verified running instance")
+
+
+@pytest.mark.parametrize("forwarding", ["missing", "foreign"])
+def test_api_cli_requires_owned_https_before_sending_credentials(
+    ready_native, forwarding
+):
+    if forwarding == "foreign":
+        seed_owned_route(ready_native)
+        ready_native.api.config["Web"][ADDRESS]["Handlers"]["/"]["Proxy"] = PRIVATE_FEED
+    result = ready_native.run(["api-check"], input=f"reader\n{API_PASSWORD}\n")
+    diagnostic = (
+        "Start with RSS_TAILSCALE=1 before testing trusted HTTPS"
+        if forwarding == "missing"
+        else "not exclusively project-owned"
+    )
+    refused(result, diagnostic, PRIVATE_FEED)
+
+
+@pytest.mark.parametrize("loopback", [False, True])
+def test_api_cli_authenticates_only_to_verified_origin_and_returns_sanitized_counts(
+    ready_native, monkeypatch, loopback
+):
+    native = ready_native
+    if not loopback:
+        seed_owned_route(native)
+    origin = BACKEND if loopback else ORIGIN
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:9999")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:9999")
+
+    def respond(handler, request):
+        native.requests.append(request)
+        assert request.full_url.startswith(origin + "/api/greader.php/")
+        assert request.host == origin.split("://", 1)[1]
+        assert API_PASSWORD not in request.full_url
+        if request.full_url.endswith("/check/compatibility"):
+            assert request.get_method() == "GET"
+            assert request.data is None
+            return http_response(request, b"PASS")
+        if request.full_url.endswith("/accounts/ClientLogin"):
+            assert request.get_method() == "POST"
+            assert parse_qs(request.data.decode()) == {
+                "Email": ["reader"],
+                "Passwd": [API_PASSWORD],
+            }
+            return http_response(
+                request, f"SID=synthetic-session\nAuth={API_TOKEN}\n".encode()
+            )
+        assert request.get_header("Authorization") == f"GoogleLogin auth={API_TOKEN}"
+        if "subscription/list" in request.full_url:
+            return http_response(
+                request, json.dumps({"subscriptions": [{"id": PRIVATE_FEED}]}).encode()
+            )
+        assert "stream/contents/" in request.full_url
+        return http_response(request, b'{"items":[{"id":"synthetic-private-article"}]}')
+
+    if loopback:
+        ready = HTTPHandler.http_open
+
+        def dispatch(handler, request):
+            if request.full_url in (BACKEND + "/__rss_ready", BACKEND + "/i/"):
+                return ready(handler, request)
+            return respond(handler, request)
+
+        monkeypatch.setattr(HTTPHandler, "http_open", dispatch)
+    else:
+        monkeypatch.setattr(HTTPSHandler, "https_open", respond)
+    flags = ["--loopback"] if loopback else []
+    result = native.run(["api-check", *flags], input=f"reader\n{API_PASSWORD}\n")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "diagnostics": "PASS",
+        "authenticated": True,
+        "subscriptions": 1,
+        "sample_articles": 1,
+        "transport": "loopback" if loopback else "https",
+        "https_verified": not loopback,
+    }
+    for value in (
+        API_PASSWORD,
+        API_TOKEN,
+        PRIVATE_FEED,
+        "synthetic-session",
+        "synthetic-private-article",
+    ):
+        assert value not in result.output
+    assert len(native.requests) == 4
 
 
 @pytest.mark.parametrize(
-    "failure", ["invalid", "redirect", "certificate", "compatibility", "protocol"]
+    "failure,diagnostic,requests",
+    [
+        ("unauthorized", "API authentication rejected", 2),
+        ("redirect", "Redirects are refused", 2),
+        ("certificate", "certificate untrusted", 1),
+        ("compatibility", "compatibility check failed", 1),
+        ("protocol", "certificate untrusted", 2),
+        ("malformed", "unusable API diagnostics", 3),
+    ],
 )
-def test_api_failures_are_sanitized_and_never_return_credentials(
-    private_runtime, monkeypatch, failure
+def test_api_cli_never_reveals_upstream_response_or_forwards_redirect(
+    ready_native, monkeypatch, failure, diagnostic, requests
 ):
-    runtime, _engine = private_runtime
-    runtime.run("start")
-    requests = []
+    native = ready_native
+    seed_owned_route(native)
+    redirect = "https://unrelated.invalid/private-target"
 
-    def respond(self, request, timeout):
-        requests.append(request)
+    def respond(_handler, request):
+        native.requests.append(request)
+        assert request.full_url.startswith(ORIGIN + "/api/greader.php/")
         if request.full_url.endswith("/check/compatibility"):
-            if failure == "compatibility":
-                return io.BytesIO(b"private-invalid-response")
             if failure == "certificate":
-                raise URLError("private-certificate-details")
-            return io.BytesIO(b"PASS")
-        if failure == "protocol":
-            raise BadStatusLine("private-api-token")
-        if failure == "invalid":
-            raise HTTPError(
-                request.full_url,
-                403,
-                "private-response",
-                {},
-                io.BytesIO(b"secret-token"),
+                raise URLError(REMOTE_SECRET)
+            return http_response(
+                request,
+                REMOTE_SECRET.encode() if failure == "compatibility" else b"PASS",
             )
-        raise HTTPError(
-            "https://unrelated.invalid/secret",
-            302,
-            "private-response",
-            {"Location": "https://unrelated.invalid/secret"},
-            io.BytesIO(b"secret-token"),
-        )
+        if request.full_url.endswith("/accounts/ClientLogin"):
+            if failure == "protocol":
+                raise BadStatusLine(REMOTE_SECRET)
+            if failure == "unauthorized":
+                return http_response(request, REMOTE_SECRET.encode(), 403)
+            if failure == "redirect":
+                return http_response(
+                    request, REMOTE_SECRET.encode(), 302, {"location": redirect}
+                )
+            return http_response(request, f"Auth={API_TOKEN}\n".encode())
+        return http_response(request, PRIVATE_FEED.encode())
 
-    monkeypatch.setattr(OpenerDirector, "open", respond)
-    with pytest.raises(RuntimeFailure) as error:
-        runtime.run("api-check", username="reader", api_password="secret-password")
-    assert not any(
-        value in str(error.value)
-        for value in ("private-", "secret", "unrelated.invalid")
-    )
-    assert len(requests) == (1 if failure in ("certificate", "compatibility") else 2)
+    monkeypatch.setattr(HTTPSHandler, "https_open", respond)
+    result = native.run(["api-check"], input=f"reader\n{API_PASSWORD}\n")
+    refused(result, diagnostic, PRIVATE_FEED, redirect)
+    assert len(native.requests) == requests
