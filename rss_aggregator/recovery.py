@@ -24,7 +24,6 @@ from rss_aggregator.archives import (
     write_data_tar,
 )
 from rss_aggregator.backup_schedule import SUCCESS, BackupSchedule
-from rss_aggregator.private_access import PrivateAccess
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -138,7 +137,7 @@ class Recovery:
             )
 
     def _directory(self) -> Path:
-        """Require a private destination separate from checkout and native state."""
+        """Require a private destination outside Git and receipt-marked state."""
         setting = os.environ.get("RSS_BACKUP_DIR")
         if not setting or not Path(setting).expanduser().is_absolute():
             raise self.failure(
@@ -158,11 +157,17 @@ class Recovery:
                 raise self.failure(
                     "RSS_BACKUP_DIR must be outside and not contain the checkout."
                 )
-            if any(
-                os.path.lexists(parent / ".git")
-                for parent in (candidate, *candidate.parents)
-            ):
+            ancestry = (candidate, *candidate.parents)
+            if any(os.path.lexists(parent / ".git") for parent in ancestry):
                 raise self.failure("RSS_BACKUP_DIR must be outside every Git checkout.")
+            # Like the state selector, treat receipt presence as a boundary
+            # even if the receipt is damaged or the runtime has been removed.
+            if any(
+                os.path.lexists(parent / "native-owner.json") for parent in ancestry
+            ):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside every native state directory."
+                )
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             self._private(path, directory=True)
@@ -370,17 +375,6 @@ class Recovery:
                 ) from None
             sync_directory(directory)
 
-    def _quiesce(self, owner: dict[str, Any]) -> bool:
-        """Stop all writers and report whether owned forwarding was withdrawn."""
-        self._require_lock()
-        try:
-            withdrawn = PrivateAccess(self.runtime).stop(owner)
-        finally:
-            self.runtime._stop_writers()
-        if not self.runtime._idle():
-            raise self.failure("FreshRSS writers are still running; snapshot refused.")
-        return withdrawn
-
     def _snapshot(
         self,
         data: Path,
@@ -453,7 +447,7 @@ class Recovery:
         settled = False
         try:
             maintenance.phase("quiescing")
-            withdrawn = self._quiesce(owner)
+            withdrawn = runtime._quiesce(owner)
             maintenance.phase("snapshot")
             try:
                 result = self._snapshot(

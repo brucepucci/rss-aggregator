@@ -40,9 +40,12 @@ an equivalent launcher.
 - `start` records running intent after the maintenance guard. Startup checks
   ownership and exact installed pin, prepares the selected data, checks effective
   **web** PHP (not only PHP CLI), readiness and scheduling, and verifies rejection
-  of anonymous API access on an initialized instance before opening private
-  forwarding. It removes the temporary PHP probe after each check. Repeated
-  `start` rechecks effective settings and anonymous API refusal before retaining
+  of anonymous API access on an initialized instance. Private startup refreshes
+  the forwarding check after preparation; ordinary HTTP requests receive 503 until
+  that generation is approved. It removes the temporary PHP probe after each check.
+  A known occupied replacement port is refused before interrupting the old
+  generation; a later bind race can still leave it stopped. Repeated `start`
+  rechecks effective settings and anonymous API refusal before retaining
   an initialized service. Installer completion, reconfiguration or a failed
   health check can trigger a guarded restart. Use `status`
   for routine health checks.
@@ -71,14 +74,17 @@ Startup (including a restart via `verify` or backup resumption) and manual
 fails the operation without emitting upstream output; inspect logs and slow feeds
 locally. On a restart timeout, serving may remain stopped; check `status` and, if
 resuming a backup, `backup-status` before retrying.
-The scheduler and manual fetch serialize to avoid overlapping fetches. When the
-instance is stopped, neither the service nor its feed scheduler runs. Reader
+The scheduler and manual fetch serialize to avoid overlapping fetches. Scheduled
+fetches have the same 10-minute execution budget; on timeout the controller stops
+and reaps its child, reports a failed `last_fetch` in `status`, and can try again
+at a later eligible slot. When the instance is stopped, neither the service nor
+its feed scheduler runs. Reader
 synchronization does not fetch feeds. Archiving policies can remove older articles;
 check the user/category/feed settings before changing them.
 
 ## Backups and stopping
 
-Export an explicit private `RSS_BACKUP_DIR` outside Git. `stop` records stopped
+Export an explicit private `RSS_BACKUP_DIR` outside Git and every native state directory. `stop` records stopped
 intent, removes only owned forwarding, and proves web and fetch writers idle
 before reading the selected instance, backup attempt or runtime layout for an
 archive. Missing previously provisioned data or a lost explicit selection is a
@@ -296,10 +302,32 @@ owner's migration handoff, regardless of the implementation issue's status.
 Final removal needs **separate owner approval** using the
 [pinned guarded legacy removal runbook](https://github.com/brucepucci/rss-aggregator/blob/28664ab936f8872da6ff3ddca1c4b0a725dfb0ec/docs/operations.md#preview-and-remove-the-vm)
 and its existing ownership/inventory/fresh-archive prerequisites. The gate does
-not waive those checks. If there is any uncertainty about exclusivity, sources,
-unrelated contents or current backup, keep the VM stopped and intact; never run
-a global prune/reset or a raw machine deletion. Retire the importer separately
-after the owner gates pass.
+not waive those checks.
+
+**Plan a separate service interruption.** Native and legacy have different Serve
+ownership receipts even at the same hostname and port. Legacy removal confirmation
+checks/withdraws legacy forwarding; the preview does not exercise that step and
+does not authorize it to remove a native route. If the interruption is not
+approved, retain the stopped VM.
+
+1. In the approved window, record the installed native jobs and settings. Remove
+   native supervision and disable daily backup if enabled, using their owning
+   checkout and selectors, so they cannot republish access during removal.
+2. With the **native** checkout and selectors, run `rss stop` for a verified
+   shutdown archive and to withdraw the exact native-owned route. Confirm native
+   writers and forwarding are stopped. Stop on uncertainty; never clear a receipt
+   or reset Serve to get past either ownership guard.
+3. In the pinned **legacy** checkout with its original selectors, follow the
+   guarded legacy preview and confirmation. If the legacy operation refuses, do
+   not bypass it. Keep the VM stopped and intact if exclusivity, sources, unrelated
+   contents or current backup cannot be confirmed; never use global prune/reset or
+   a raw machine deletion.
+4. After retirement work has finished (or been safely abandoned), return to the
+   **native** checkout and original selectors. Reopen access through the
+   [private-access procedure](tailscale-readkit.md#connect-and-verify-the-server)
+   and verify the intended native instance and trusted client access before
+   explicitly recapturing approved jobs. Retire the importer separately after the
+   owner gates pass.
 
 ## Service logs and feed errors
 

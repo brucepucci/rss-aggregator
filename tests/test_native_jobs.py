@@ -76,6 +76,14 @@ class Clock(datetime):
         return instant.astimezone(tz)
 
 unlink = Path.unlink
+replace = os.replace
+
+def fault_at_publication(source, target, *args, **kwargs):
+    if os.environ.get('SYNTHETIC_REPLACE_FAILURE') == Path(target).name:
+        raise PermissionError('synthetic record publication failure')
+    replace(source, target, *args, **kwargs)
+    if os.environ.get('SYNTHETIC_EXIT_AFTER_REPLACE') == Path(target).name:
+        os._exit(71)
 
 def fail_requested_unlink(path, *args, **kwargs):
     target = os.environ.get('SYNTHETIC_UNLINK_FAILURE')
@@ -88,6 +96,7 @@ with (
     patch.object(recovery, 'datetime', Clock),
     patch.object(supervision.time, 'time', instant.timestamp),
     patch.object(Path, 'unlink', fail_requested_unlink),
+    patch.object(os, 'replace', fault_at_publication),
 ):
     exec({CLI_IN_CHECKOUT!r})
 """
@@ -217,14 +226,17 @@ def jobs(tmp_path):
 
 def test_native_jobs_are_independent_per_user_state_and_never_adopt_legacy(jobs):
     home = Path(jobs.environment["HOME"])
-    directory = home / "Library/LaunchAgents"
-    directory.mkdir(parents=True)
+    library = home / "Library"
+    library.mkdir(mode=0o700)
+    directory = library / "LaunchAgents"
+    directory.mkdir(mode=0o700)
     legacy = [
         directory / f"io.rss-aggregator.{kind}.plist"
         for kind in ("supervision", "backup")
     ]
     for path in legacy:
         path.write_bytes(b"legacy fixture must remain byte-exact")
+        path.chmod(0o600)
     assert _success(jobs, "supervision-status")["state"] == "disabled"
     assert _success(jobs, "backup-due")["outcome"] == "disabled"
 
@@ -404,6 +416,170 @@ def test_backup_status_keeps_evidence_when_the_runtime_layout_drifts(jobs):
     assert json.loads(check.stdout) == evidence
 
 
+@pytest.mark.parametrize("fault", ["quiescence_failure", "interruption"])
+def test_failed_shutdown_stays_unprotected_until_verified_retry(jobs, fault):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    before = _success(jobs, "backup-status", "--check")
+    archives = set(jobs.backups.glob("*.zip"))
+
+    if fault == "quiescence_failure":
+        # An unreadable forwarding record prevents withdrawal, not stopping writers.
+        serve_record = _ledger(jobs, "serve.json", {})
+        with _owned_writer(jobs):
+            _refused(jobs, "stop")
+        serve_record.unlink()
+        outcome = "failed"
+    else:
+        # A process loss immediately after the writer stop request leaves no
+        # opportunity to enter capture or run exception cleanup.
+        jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = "stop-service.json"
+        with _owned_writer(jobs):
+            assert jobs.run("stop").returncode == 71
+        del jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"]
+        outcome = "interrupted"
+
+    failed = _success(jobs, "backup-status")
+    assert failed["maintenance_required"] is True
+    assert failed["latest_attempt"] == before["latest_attempt"]
+    assert failed["latest_success"] == before["latest_success"]
+    assert failed["unresolved_shutdown"]["outcome"] == outcome
+    assert set(jobs.backups.glob("*.zip")) == archives
+    assert _success(jobs, "backup-reconcile")["resumed"] is False
+
+    _success(jobs, "backup")
+    jobs.environment["SYNTHETIC_SECONDS"] = "86400"
+    daily = _success(jobs, "backup-due")["backup"]
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["maintenance_required"] is False
+    assert report["latest_success"]["archive"] == daily["archive"]
+    assert report["latest_attempt"]["outcome"] == "success"
+    assert report["unresolved_shutdown"]["outcome"] == outcome
+    assert report["protected"] is False
+
+    retry = _success(jobs, "stop")["backup"]
+    assert retry["verified"] is True and retry["archive"] != daily["archive"]
+    report = _success(jobs, "backup-status", "--check")
+    assert report["latest_success"]["archive"] == retry["archive"]
+    assert report["unresolved_shutdown"] is None
+    assert report["protected"] is True
+
+
+def test_interrupted_shutdown_reports_archive_published_before_finalization(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    daily = _success(jobs, "backup-due")["backup"]
+    jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = "shutdown-backup-success.json"
+    assert jobs.run("stop").returncode == 71
+    del jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"]
+
+    before = _success(jobs, "backup-status")
+    assert before["latest_success"]["via"] == "stop"
+    assert before["latest_success"]["archive"] != daily["archive"]
+    assert before["archive_available"] is True
+    assert before["latest_attempt"]["outcome"] == "interrupted"
+    assert before["unresolved_shutdown"]["outcome"] == "interrupted"
+    assert _success(jobs, "backup-reconcile")["resumed"] is False
+    after = _success(jobs, "backup-status")
+    assert after["latest_success"] == before["latest_success"]
+    assert after["unresolved_shutdown"] == before["unresolved_shutdown"]
+    assert after["protected"] is False
+
+
+@pytest.mark.parametrize("ledger", ["backup-shutdown.json", "maintenance.json"])
+def test_shutdown_bookkeeping_write_failure_still_quiesces_and_is_visible(jobs, ledger):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    before = _success(jobs, "backup-due")["backup"]
+    jobs.environment["SYNTHETIC_REPLACE_FAILURE"] = ledger
+    with _owned_writer(jobs):
+        assert "synthetic record publication failure" in _refused(jobs, "stop")
+    del jobs.environment["SYNTHETIC_REPLACE_FAILURE"]
+
+    held = ledger == "backup-shutdown.json"
+    assert _success(jobs, "backup-status")["maintenance_required"] is held
+    assert _success(jobs, "backup-reconcile")["reconciled"] is held
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stdout
+    report = json.loads(check.stdout)
+    assert report["unresolved_shutdown"]["outcome"] == (
+        "interrupted" if held else "failed"
+    )
+    assert report["latest_success"]["archive"] == before["archive"]
+
+
+def test_no_data_shutdown_does_not_clear_an_earlier_failure(jobs):
+    assert _success(jobs, "stop")["backup"] == {"status": "no_data"}
+    serve_record = _ledger(jobs, "serve.json", {})
+    _refused(jobs, "stop")
+    serve_record.unlink()
+    assert _success(jobs, "backup-reconcile")["reconciled"] is True
+    assert _success(jobs, "stop")["backup"] == {"status": "no_data"}
+    report = _success(jobs, "backup-status")
+    assert report["latest_attempt"]["outcome"] == "no_data"
+    assert report["unresolved_shutdown"]["outcome"] == "failed"
+    assert report["protected"] is False
+
+
+@pytest.mark.parametrize(
+    ("record", "damage"),
+    [
+        ("backup-attempt.json", "{"),
+        ("backup-attempt.json", "null"),
+        ("backup-attempt.json", '{"outcome": "success"}'),
+        ("backup-success.json", '{"completed_at": "2026-01-02T04:00:00"}'),
+        ("backup-daily.json", "null"),
+        ("backup-defer.json", "{"),
+    ],
+)
+def test_status_returns_readable_backup_evidence_despite_damage(jobs, record, damage):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    healthy = _success(jobs, "backup-status", "--check")
+    corrupted = jobs.state / record
+    corrupted.write_text(damage)
+
+    report = _success(jobs, "backup-status")
+    assert record in report["evidence_problems"]
+    assert report["protected"] is False
+    assert report["daily_archive_available"] is (record != "backup-daily.json")
+    if record == "backup-attempt.json":
+        assert report["latest_attempt"] is None
+        assert report["latest_success"] == healthy["latest_success"]
+        assert report["archive_available"] is True
+        with _owned_writer(jobs):
+            assert "writers remain stopped" in _refused(jobs, "stop")
+        _refused(jobs, "backup")
+        report = _success(jobs, "backup-status")
+        assert report["unresolved_shutdown"]["outcome"] == "failed"
+        assert report["latest_success"] == healthy["latest_success"]
+    elif record == "backup-success.json":
+        assert report["latest_attempt"] == healthy["latest_attempt"]
+        assert report["latest_success"] is None
+        assert report["age_seconds"] is None
+        assert report["archive_available"] is False
+    else:
+        unavailable = {
+            "backup-daily.json": "daily_attempt",
+            "backup-defer.json": "latest_defer",
+        }[record]
+        assert report[unavailable] is None
+        assert report["latest_attempt"] == healthy["latest_attempt"]
+        assert report["latest_success"] == healthy["latest_success"]
+    check = jobs.run("backup-status", "--check")
+    assert check.returncode == 1, check.stderr
+    assert json.loads(check.stdout) == report
+    assert corrupted.read_text() == damage
+
+
 def test_supervision_reserves_bounded_retries_and_explicit_start_resets_budget(jobs):
     _success(jobs, "supervision-install")
     _refused(jobs, "start")
@@ -453,6 +629,34 @@ def test_reconciliation_is_read_only_until_idle_and_never_changes_intent(jobs):
     assert _success(jobs, "status")["application"] == "stopped"
 
 
+def test_reconcile_releases_only_owned_idle_hold_when_runtime_is_missing(jobs):
+    owner = json.loads((jobs.state / "native-owner.json").read_text())
+    release = jobs.state / "runtime"
+    parked = jobs.state / "runtime-retained"
+    release.rename(parked)
+    hold = {
+        "version": 1,
+        "owner": "unrecognized",
+        "operation": "backup",
+        "phase": "quiescing",
+    }
+    marker = _ledger(jobs, "maintenance.json", hold)
+    assert "Unrecognized maintenance owner" in _refused(jobs, "backup-reconcile")
+    assert json.loads(marker.read_text()) == hold
+    _ledger(jobs, "maintenance.json", {**hold, "owner": owner["token"]})
+    # Malformed capture history must not block recovery of an independently owned hold.
+    history = jobs.state / "backup-attempt.json"
+    history.write_text("{")
+    history.chmod(0o600)
+    assert "Maintenance is unresolved" in _refused(jobs, "setup")
+    assert _success(jobs, "backup-reconcile")["reconciled"] is True
+    assert not marker.exists() and not release.exists() and parked.is_dir()
+    assert not (jobs.state / "operator-intent.json").exists()
+    assert history.read_text() == "{"
+    _success(jobs, "setup")
+    assert _success(jobs, "status")["application"] == "stopped"
+
+
 def test_explicit_stop_settles_interrupted_writers_and_retains_stopped_intent(jobs):
     owner = json.loads((jobs.state / "native-owner.json").read_text())
     _success(jobs, "supervision-install")
@@ -474,7 +678,9 @@ def test_explicit_stop_settles_interrupted_writers_and_retains_stopped_intent(jo
     assert _success(jobs, "backup-reconcile")["resumed"] is False
     assert _success(jobs, "supervision-tick")["state"] == "intentionally_stopped"
     assert _success(jobs, "status")["application"] == "stopped"
-    assert _success(jobs, "backup-status")["latest_attempt"] is None
+    report = _success(jobs, "backup-status")
+    assert report["latest_attempt"] is None
+    assert report["unresolved_shutdown"]["outcome"] == "failed"
 
 
 def test_reconcile_refuses_active_owned_route_even_with_idle_writers(jobs):
@@ -526,6 +732,12 @@ def test_end_of_day_slot_is_caught_after_midnight_and_superseded_by_next_slot(jo
     assert _success(jobs, "backup-due")["outcome"] == "success"
     assert _success(jobs, "backup-status", "--check")["daily_attempt"]["slot"] == target
     assert _success(jobs, "backup-due")["outcome"] == "not_due"
+
+    for elapsed, age, overdue in [(158820, 86400, False), (169620, 97200, True)]:
+        jobs.environment["SYNTHETIC_SECONDS"] = str(elapsed)
+        freshness = _success(jobs, "backup-status")
+        assert freshness["age_seconds"] == age
+        assert freshness["overdue"] is overdue
 
     jobs.environment["SYNTHETIC_SECONDS"] = "332220"  # Jan 6, 00:17 UTC
     report = _success(jobs, "backup-status")

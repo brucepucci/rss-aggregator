@@ -323,6 +323,45 @@ def test_backup_destination_must_not_overlap_state_or_checkout(
     assert not list(target.glob("backup-*.zip"))
 
 
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "other-state",
+        "other-state/runtime/archives",
+        "alias-to-other/runtime/archives",
+        "other-state/alias-to-outside/archives",
+    ],
+)
+def test_backup_refuses_destinations_in_another_native_state(
+    installed, monkeypatch, destination
+):
+    cli, _, backups = installed
+    root = backups.parent
+    archive = legacy_archive(root / "legacy.zip")
+    run(cli, "import-legacy", str(archive), "--instance", "source")
+    run(cli, "select-instance", "source")
+    other = root / "other-state"
+    with monkeypatch.context() as env:
+        env.setenv("RSS_STATE_DIR", str(other))
+        run(cli, "setup")
+    (root / "alias-to-other").symlink_to(other, target_is_directory=True)
+    outside = root / "outside"
+    outside.mkdir(mode=0o700)
+    (other / "alias-to-outside").symlink_to(outside, target_is_directory=True)
+    target = root / destination
+    before = set(target.iterdir()) if target.exists() else None
+
+    with monkeypatch.context() as env:
+        env.setenv("RSS_BACKUP_DIR", str(target))
+        refused = cli.invoke(main, ["backup"])
+    assert refused.exit_code == 1, refused.output
+    assert "outside every native state directory" in refused.stderr
+    assert (set(target.iterdir()) if target.exists() else None) == before
+    with monkeypatch.context() as env:
+        env.setenv("RSS_STATE_DIR", str(other))
+        assert run(cli, "status")["runtime"] == "installed"
+
+
 def test_failed_backup_leaves_previous_verified_archive_unchanged(installed):
     cli, state, backups = installed
     archive = legacy_archive(backups.parent / "legacy.zip")
@@ -470,6 +509,38 @@ def controlled_writers(state, port=8080, *, private=False):
         finally:
             finished.set()
             controller.join(timeout=6)
+
+
+def test_restore_preserves_running_source_and_selection_refuses_to_switch_it(installed):
+    cli, state, backups = installed
+    source = legacy_archive(backups.parent / "legacy.zip")
+    run(cli, "import-legacy", str(source), "--instance", "source")
+    run(cli, "select-instance", "source")
+    native = run(cli, "backup")["archive"]
+
+    with controlled_writers(state) as observed_stop:
+        assert run(cli, "status")["application"] == "running"
+
+        restored = run(cli, "restore", native, "--instance", "restored")
+        assert restored["restored"] is True
+        assert restored["instance"] == "restored"
+        assert restored["selected"] is False
+        data = state / "instances/restored/data"
+        assert (data / ".hidden").read_bytes() == DATA[".hidden"]
+        status = run(cli, "status")
+        assert status["application"] == "running"
+        assert status["instance"] == "source"
+
+        refused = cli.invoke(main, ["select-instance", "restored"])
+        assert refused.exit_code == 1, refused.output
+        assert "Stop FreshRSS" in refused.stderr
+        status = run(cli, "status")
+        assert status["application"] == "running"
+        assert status["instance"] == "source"
+        assert not observed_stop.is_set()
+        assert not (state / "stop-service.json").exists()
+
+    assert run(cli, "select-instance", "restored")["selected"] is True
 
 
 def owned_forwarding(state, monkeypatch):

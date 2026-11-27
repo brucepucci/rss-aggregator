@@ -153,6 +153,7 @@ class Runtime:
                     supervision.set_intent("stopped")
                 if backups.pending() and operation not in (
                     "status",
+                    "stop",
                     "backup-status",
                     "backup-reconcile",
                     "backup-disable",
@@ -160,8 +161,6 @@ class Runtime:
                     "supervision-tick",
                     "supervision-remove",
                 ):
-                    if operation == "stop":
-                        self._quiesce()
                     raise RuntimeFailure(
                         "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
                     )
@@ -331,11 +330,12 @@ class Runtime:
             "Native writers did not confirm shutdown; no archive or further mutation is safe. Inspect the own user processes locally."
         )
 
-    def _quiesce(self) -> None:
-        """Close writers even if conditional unpublication fails; preserve foreign routes."""
-        owner, _ = self._ownership_receipt()
+    def _quiesce(self, owner: dict[str, Any] | None = None) -> bool:
+        """Close writers even on withdrawal failure; report actual owned withdrawal."""
+        if owner is None:
+            owner, _ = self._ownership_receipt()
         try:
-            PrivateAccess(self).stop(owner)
+            return PrivateAccess(self).stop(owner)
         finally:
             self._stop_writers()
 
@@ -469,8 +469,9 @@ class Runtime:
                 "Effective FreshRSS authentication, API, update or SQLite settings differ; no Serve forwarding changed."
             )
 
-    def _launch(self, port: int, origin: str, private: bool) -> dict[str, Any]:
-        """Spawn a detached lease-holding worker and require generation readiness."""
+    @staticmethod
+    def _check_port(port: int) -> None:
+        """Test whether IPv4 loopback can bind without stopping other listeners."""
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -479,9 +480,14 @@ class Runtime:
                 raise RuntimeFailure(
                     f"Loopback port {port} is occupied; no foreign listener was stopped."
                 ) from None
+
+    def _launch(self, port: int, origin: str, private: bool) -> dict[str, Any]:
+        """Spawn a detached lease-holding worker and require generation readiness."""
+        self._check_port(port)
         nonce = uuid.uuid4().hex
         plan = {
             "nonce": nonce,
+            "startup_gate": True,
             "instance": self.instance,
             "port": port,
             "url": origin,
@@ -527,15 +533,18 @@ class Runtime:
             "Owned PHP web service or scheduler did not become ready on loopback."
         )
 
-    def _check_web(self, plan: dict[str, Any], initialized: bool) -> dict[str, Any]:
-        """Check fresh effective web settings, readiness and anonymous API refusal."""
+    def _check_web(
+        self, plan: dict[str, Any], initialized: bool, *, starting: bool = False
+    ) -> dict[str, Any]:
+        """Check effective web settings and auth behind the startup gate when needed."""
         port, nonce = plan["port"], plan["nonce"]
+        diagnostic_host = "rss-" + nonce + ".invalid"
         probe = self._service_home() / "__rss_probe.php"
         source = (self.root / "config/security-probe.php").read_bytes()
         try:
             self._write_service_file(probe, source)
             code, body = service.web_check(
-                port, "/__rss_probe.php", host="rss-" + nonce + ".invalid"
+                port, "/__rss_probe.php", host=diagnostic_host
             )
             result = json.loads(body) if code == 200 else None
         finally:
@@ -556,12 +565,13 @@ class Runtime:
             raise RuntimeFailure(
                 "Effective web PHP settings or SQLite support failed verification."
             )
-        if service.web_check(port, "/i/")[0] not in (200, 302, 303):
+        host = diagnostic_host if starting else None
+        if service.web_check(port, "/i/", host=host)[0] not in (200, 302, 303):
             raise RuntimeFailure(
                 "The FreshRSS application did not pass loopback readiness."
             )
         if initialized and service.web_check(
-            port, "/api/greader.php/reader/api/0/subscription/list"
+            port, "/api/greader.php/reader/api/0/subscription/list", host=host
         )[0] not in (401, 403):
             raise RuntimeFailure(
                 "The unauthenticated Google Reader-compatible API was not refused."
@@ -628,6 +638,9 @@ class Runtime:
             raise RuntimeFailure(f"{error} Owned backend shutdown confirmed.") from None
         recovery = Recovery(self)
         recovery.check_activation()
+        if live is not None and live[0]["port"] != port:
+            # A known occupied replacement must not disrupt the current service.
+            self._check_port(port)
         if live and not recheck:
             plan, receipt = live
             status = self._status()
@@ -637,6 +650,7 @@ class Runtime:
                 and plan["url"] == origin
                 and plan["private"] == private
                 and plan["instance"] == self.instance
+                and plan.get("startup_gate") is True
                 and receipt.get("scheduler") == "running"
                 and (
                     status["forwarding"]["status"] == "running"
@@ -665,12 +679,17 @@ class Runtime:
             if installed:
                 self._configure(origin)
                 fetch = self._actualize()
-            if check_private_backend and not private:
-                # Pre-start preparation/fetch may have taken a while. Recheck
-                # before opening the listener when there is no publication gate.
+            # Preparation and the upstream fetch can take minutes. Refresh the
+            # forwarding check before binding, with ordinary requests still gated.
+            if private:
+                if access.prepare(owner, port) != origin:
+                    raise RuntimeFailure(
+                        "The Tailscale HTTPS origin changed during startup; retry after checking the tailnet locally."
+                    )
+            elif check_private_backend:
                 access.check_backend(port)
             plan = self._launch(port, origin, private)
-            security = self._check_web(plan, installed)
+            security = self._check_web(plan, installed, starting=True)
             current, receipt = self._live() or ({}, {})
             if (
                 current.get("nonce") != plan["nonce"]
@@ -681,6 +700,12 @@ class Runtime:
                 )
             self._save("security.json", {"nonce": plan["nonce"], "effective": security})
             forwarding = access.start(owner, port, origin) if private else None
+            if private or check_private_backend:
+                access.check_backend(port)
+            service.save(
+                service.approval_path(self.state_dir / "service", plan["nonce"]),
+                {"nonce": plan["nonce"]},
+            )
         except Exception:
             try:
                 self._stop_writers()
@@ -745,7 +770,7 @@ class Runtime:
 
     def _actualize(self) -> dict[str, Any]:
         """Run the upstream fetcher without bypassing TTL, backoff or cache."""
-        self._php("app/actualize_script.php", timeout_seconds=600)
+        self._php("app/actualize_script.php", timeout_seconds=service.FETCH_TIMEOUT)
         return {"status": "completed"}
 
     def _fetch(self) -> dict[str, Any]:

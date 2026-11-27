@@ -103,7 +103,7 @@ return nonzero. A successful status query alone does not establish health.
 | `start` / `verify` | Start and record running intent, or restart/recheck an already running service without changing intent. |
 | `status` / `fetch` | Inspect the selected instance, listener and scheduler, or fetch publisher feeds now subject to cache/backoff. |
 | `stop` / `backup` | Stop writers and verify a shutdown backup, or back up and attempt to resume the prior serving mode. |
-| `backup-status --check` | Check eligible daily protection, freshness, maintenance and resumption. |
+| `backup-status --check` | Check eligible daily protection, archive freshness, unresolved shutdowns, maintenance and resumption. |
 | `supervision-status` | Inspect optional recovery, intent and failures. |
 | `api-check` | Prompt locally for separate API credentials and diagnose private HTTPS/API. |
 | `restore ARCHIVE --instance NAME` / `select-instance NAME` | Restore into a fresh named target, then explicitly select while stopped. |
@@ -119,7 +119,7 @@ Export settings in the shell that runs the CLI; `.env` is not automatically read
 | Setting | Default and ordinary use |
 | --- | --- |
 | `RSS_STATE_DIR` | `<checkout>/.local/native`. Private owned directory for native runtime, instance data and records. Legacy `.local` remains separate; do not point native commands at it. Use a fresh private path for each rehearsal. |
-| `RSS_BACKUP_DIR` | **No default.** Explicit absolute private directory outside Git, required for backups and shutdown with data. Rehearsal uses a separate destination. |
+| `RSS_BACKUP_DIR` | **No default.** Explicit absolute private directory outside Git and all native state directories, required for backups and shutdown with data. Rehearsal uses a separate destination. |
 | `RSS_PORT` | `8080`; unused and unforwarded IPv4 loopback port in `1024–65535`. Follow the [port-change procedure](docs/configuration.md#changing-the-loopback-port) for an existing deployment. |
 | `RSS_TAILSCALE` | `0`. Follow the [private-HTTPS procedure](docs/tailscale-readkit.md#connect-and-verify-the-server) before setting `1`. `0` does not turn off unrelated forwarding to the same port. |
 
@@ -132,7 +132,9 @@ See the [full configuration reference](docs/configuration.md).
   intact; see [operator troubleshooting](docs/operations.md#common-troubleshooting).
 - **Backup/shutdown failure:** inspect destination, free space and status. A failed
   explicit `backup` can have resumed service; shutdown export failure after
-  quiescing leaves writers stopped. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
+  quiescing leaves writers stopped. An older verified archive does not clear a
+  failed or interrupted shutdown; inspect `backup-status` and retry `stop` after
+  correcting the problem. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
 - **Lost instance selection:** do not start or back up a substitute instance.
   Use [operator troubleshooting](docs/operations.md#common-troubleshooting) to
   confirm and reselect the intended data while stopped.
@@ -194,8 +196,8 @@ Follow [safe cleanup](docs/operations.md#safe-cleanup). Stop and back up, remove
 both owned jobs if installed, then preview and explicitly confirm `uninstall`.
 It preserves data and archives; `setup` with the same pin can reinstall the
 runtime. Permanent data deletion is a separate decision. Do **not** delete legacy
-state or its VM: [retirement](docs/operations.md#legacy-retirement-gate) has separate
-owner gates.
+state or its VM: [retirement](docs/operations.md#legacy-retirement-gate) requires
+separate owner approval and an access interruption to hand off forwarding safely.
 
 ### How do I move the aggregator to another machine?
 

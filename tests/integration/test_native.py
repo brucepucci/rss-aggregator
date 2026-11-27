@@ -19,6 +19,21 @@ pytestmark = pytest.mark.live
 ROOT = Path(__file__).resolve().parents[2]
 FEED_TTL = 1  # Seconds; used by both FreshRSS and the synthetic publisher's cache.
 FETCH_PERIOD = 20 * 60  # Seconds between UTC scheduler slots.
+OBSERVE_STARTUP_GATE = """
+from rss_aggregator import native_service
+from rss_aggregator.cli import main
+
+web_check = native_service.web_check
+
+def observe(port, path, *, host=None):
+    if path == '/__rss_probe.php':
+        assert web_check(port, '/i/')[0] == 503, 'Web traffic reached unapproved startup'
+        assert web_check(port, '/api/greader.php/reader/api/0/subscription/list')[0] == 503
+    return web_check(port, path, host=host)
+
+native_service.web_check = observe
+main()
+"""
 
 
 @pytest.fixture
@@ -80,9 +95,10 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         "RSS_TAILSCALE": "0",
     }
 
-    def invoke(state, *arguments, data=None, success=True, umask=-1):
+    def invoke(state, *arguments, data=None, success=True, umask=-1, observe=False):
+        launcher = ["-c", OBSERVE_STARTUP_GATE] if observe else ["-m", "rss_aggregator"]
         result = subprocess.run(
-            [sys.executable, "-I", "-m", "rss_aggregator", *arguments],
+            [sys.executable, "-I", *launcher, *arguments],
             text=True,
             capture_output=True,
             input=data,
@@ -165,7 +181,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert invoke(first, "setup") == initial
         # Real CLI prepare, web and startup templates must remain archivable
         # even when the operator's shell permits group writes.
-        start = invoke(first, "start", umask=0o002)
+        start = invoke(first, "start", umask=0o002, observe=True)
         assert start["fetch"]["status"] == "installer_pending"
         assert start["security"]["verified"] is True
         assert start["scheduler"]["cron"] == "*/20 * * * *"
@@ -213,7 +229,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         if until_slot <= 15:
             time.sleep(until_slot + 0.25)
         startup_slot = int(time.time()) // FETCH_PERIOD
-        serving = invoke(first, "start")
+        serving = invoke(first, "start", observe=True)
         startup_finished = time.monotonic()
         assert serving["security"]["authenticated_settings"] is True
         assert serving["fetch"]["status"] == "completed"

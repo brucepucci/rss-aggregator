@@ -870,8 +870,10 @@ def controlled_web(native, monkeypatch):
 
 
 def initialized_web(native):
-    (native.data / "config.php").write_text("synthetic config")
-    (native.data / "applied_migrations.txt").touch()
+    config = native.data / "config.php"
+    config.write_text("synthetic config")
+    config.chmod(0o600)
+    (native.data / "applied_migrations.txt").touch(mode=0o600)
 
 
 def result_json(result):
@@ -945,6 +947,79 @@ def test_start_seeds_complete_private_templates_and_retries_failed_seed(
         os.umask(previous)
 
 
+def test_occupied_replacement_port_leaves_existing_service_ready(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    result_json(native.run(["start"]))
+    changes = len(native.api.posts)
+    generation = (native.state / "service.json").read_bytes()
+    original_bind = socket.socket.bind
+
+    def occupied(listener, address):
+        if address == ("127.0.0.1", PORT + 1):
+            raise OSError("synthetic occupied port")
+        original_bind(listener, address)
+
+    monkeypatch.setattr(socket.socket, "bind", occupied)
+    monkeypatch.setenv("RSS_PORT", str(PORT + 1))
+    refused(native.run(["start"]), f"Loopback port {PORT + 1} is occupied")
+    assert result_json(native.run(["status"]))["http_ready"] is True
+    assert (native.state / "service.json").read_bytes() == generation
+    assert len(native.api.posts) == changes
+
+
+def test_private_start_rechecks_forwarding_after_preparation(
+    controlled_web, monkeypatch
+):
+    native = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(native.run(["start"]))
+    result_json(native.run(["stop"]))
+    initialized_web(native)
+    monkeypatch.setenv("RSS_TAILSCALE", "1")
+    previous_launches = native.launches
+    run = subprocess.run
+    prepare = PrivateAccess.prepare
+    check_backend = PrivateAccess.check_backend
+    prepared = False
+
+    def run_php(args, **kwargs):
+        nonlocal prepared
+        result = run(args, **kwargs)
+        if args[:3] == [
+            str(native.state / "runtime/frankenphp"),
+            "php-cli",
+            "app/actualize_script.php",
+        ]:
+            prepared = True
+        return result
+
+    def check_before_binding():
+        if prepared:
+            assert native.launches == previous_launches
+            raise RuntimeFailure("Synthetic forwarding inspection failed")
+
+    def prepare_access(access, owner, port):
+        check_before_binding()
+        return prepare(access, owner, port)
+
+    def check_access(access, port):
+        check_before_binding()
+        return check_backend(access, port)
+
+    monkeypatch.setattr(subprocess, "run", run_php)
+    monkeypatch.setattr(PrivateAccess, "prepare", prepare_access)
+    monkeypatch.setattr(PrivateAccess, "check_backend", check_access)
+    refused(native.run(["start"]), "Synthetic forwarding inspection failed")
+    assert result_json(native.run(["status"]))["application"] == "stopped"
+    assert not native.api.posts
+
+
 def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_recorded(
     controlled_web, monkeypatch
 ):
@@ -952,8 +1027,6 @@ def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_record
     monkeypatch.setenv("RSS_TAILSCALE", "0")
     result_json(native.run(["start"]))
     initialized_web(native)
-    for path in (native.data / "config.php", native.data / "applied_migrations.txt"):
-        path.chmod(0o600)
     result_json(native.run(["start"]))
     run = subprocess.run
 
@@ -1058,7 +1131,9 @@ def test_upgrade_rejects_archive_from_before_last_running_session(
     initialized_web(native)
     old_archive = Path(result_json(native.run(["stop"]))["backup"]["archive"])
     result_json(native.run(["start"]))
-    (native.data / "new-state").write_text("synthetic post-backup change")
+    changed = native.data / "new-state"
+    changed.write_text("synthetic post-backup change")
+    changed.chmod(0o600)
     monkeypatch.setenv("RSS_BACKUP_DIR", str(old_archive))
     failed = native.run(["stop"])
     assert failed.exit_code == 1, failed.output

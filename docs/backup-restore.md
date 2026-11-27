@@ -25,9 +25,10 @@ upload or encryption is performed.
 
 ## Create a backup
 
-Choose an absolute private destination outside **every Git checkout**. It must
-neither overlap nor contain the controlling checkout or `RSS_STATE_DIR`; do not
-place it under a managed path such as `runtime/`. Set `RSS_BACKUP_DIR` explicitly; there is no default.
+Choose an absolute private destination outside **every Git checkout** and
+**every native state directory** marked by an ownership receipt, including other
+installations' `runtime/` paths. It must not contain the controlling checkout
+or selected `RSS_STATE_DIR`. Set `RSS_BACKUP_DIR` explicitly; there is no default.
 Use an owned `0700` directory on a filesystem supporting hard links for
 non-overwriting publication (`0600` files). A new directory may be created; unsafe existing
 permissions are refused rather than repaired. Keep an independent durable copy.
@@ -87,12 +88,16 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   A preflight refusal can leave existing serving state untouched. A resumption
   failure can leave a verified archive with the app stopped; check both results
   before retrying.
-- Normal `stop` sets stopped intent and quiesces before reading selection or
-  backup bookkeeping. It verifies a complete archive when selected data exist.
-  An archive failure **after** quiescing leaves writers stopped. Fix the reported
-  cause and retry `stop`; for selection loss see [operations](operations.md#common-troubleshooting).
-  Preserve an unreadable backup record and prior archives for local inspection.
-  A preflight or uncertain shutdown is not proof that writers or forwarding are stopped.
+- Normal `stop` sets stopped intent and tries to persist shutdown evidence before
+  quiescence, but attempts to close owned resources even if the write or route
+  withdrawal fails. It reads selection and capture records only after quiescing
+  and verifies a complete archive when selected data exist. An archive failure
+  **after** quiescing leaves writers stopped; a failed or interrupted quiescence
+  is not proof that writers or forwarding stopped. Inspect `unresolved_shutdown`
+  and `evidence_problems` in `backup-status`, correct the cause, and retry `stop`
+  for a verified archive. A daily or manual archive and hold release do not clear
+  an unresolved shutdown. For selection loss see [operations](operations.md#common-troubleshooting).
+  Preserve unreadable records and prior archives for local inspection.
 - After failure inspect `status`, `backup-status`, stderr and private records.
   Never discard a good archive, promote `.rss-export-*`/`.rss-backup-*` remnants,
   or remove locks or maintenance records to force a retry. Hidden remnants may
@@ -115,9 +120,12 @@ uv run --locked rss backup-reconcile
 uv run --locked rss backup-status
 ```
 
-Reconciliation validates the hold and ownership, and requires proof that writers
-and owned forwarding are already stopped; it does not stop or restart anything.
-If it reports active resources, use guarded `stop` to quiesce before retrying;
+Reconciliation authenticates the hold against the ownership receipt even when
+runtime files are missing. It requires proof that writers and owned forwarding
+are already stopped; it does not stop or restart anything, repair runtime files,
+or clear outstanding shutdown evidence. Once the hold is released, use `setup`
+with the matching pin if runtime files are missing. Inspect before activating.
+If reconciliation reports active resources, use guarded `stop` to quiesce before retrying;
 `stop` records stopped intent and leaves the hold for reconciliation. A later
 supervisor tick may honor an existing running intent after release, if that intent
 was retained. Stop on a busy lease, uncertain forwarding or invalid record and
@@ -149,9 +157,11 @@ one on the preceding UTC date if the wake crosses midnight. It does not replay
 older slots or work scheduled before registration. No wake-from-sleep, pre-login
 or power setting is installed. A job captures absolute checkout/Python, private
 state and non-secret settings; it does not use `.env` or invoke uv. The owned job
-can be disabled without erasing archives or intent. A missing plist is recoverable
-if the ledger is valid and any loaded job matches it; a busy, changed or foreign
-job is not overwritten. Follow
+can be disabled without erasing archives or intent. The complete plist is staged
+privately and published without overwriting; a failed staging write leaves no
+partial definition at the final path. A missing plist is recoverable if the
+ledger is valid and any loaded job matches it; a busy, changed or foreign job is
+not overwritten. Follow
 [removal and recapture safeguards](operations.md#upgrade-installed-mac-jobs-safely)
 for changes. Recapture starts a new `registration_id`, even with identical
 settings. Wait for a successful `daily_attempt` with that ID after `registered_at`
@@ -166,9 +176,12 @@ Check registration, `scheduler_problem`, due/missed/deferred work, latest attemp
 and verified publication, archive availability, age/overdue, `resumption` and
 `maintenance_required`. A damaged runtime layout does not erase readable archive
 or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
-and protection is false. Daily protection needs successful eligible daily work for
+and protection is false. Evidence records are read independently: for example, an
+unreadable attempt appears as `latest_attempt: null` with its record named in
+`evidence_problems`; a separately readable verified archive remains visible.
+Do not hand-edit records to restore a green check. Daily protection needs successful eligible daily work for
 the current registration and selected instance, availability of **that scheduled
-archive**, and no unresolved failure/hold. `archive_available` and `latest_success`
+archive**, and no unresolved failure, shutdown, or hold. `archive_available` and `latest_success`
 can instead describe a newer manual or shutdown archive; neither can mask a
 missing scheduled copy. A recovery point more than **26 hours** old is overdue;
 the daily goal is about a day of loss under healthy operation, not a guarantee

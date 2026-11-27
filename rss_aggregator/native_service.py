@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 PERIOD = 20 * 60
+FETCH_TIMEOUT = 600
 INI = """\
 session.upload_progress.enabled = Off
 expose_php = Off
@@ -148,9 +149,15 @@ def initialized(data: Path) -> bool:
     return complete
 
 
+def approval_path(home: Path, nonce: str) -> Path:
+    """Locate the generation's ordinary HTTP approval marker, outside its web root."""
+    return home / f"approved-{nonce}.json"
+
+
 def _caddyfile(plan: dict[str, Any]) -> str:
-    """Route only the upstream public tree, plus a temporary loopback health probe."""
+    """Gate ordinary traffic until verified, allowing generation-bound diagnostics."""
     port, nonce = plan["port"], plan["nonce"]
+    approval = approval_path(Path("../../service"), nonce)
     return f"""\
 {{
     admin off
@@ -183,26 +190,71 @@ http://:{port} {{
         respond 404
     }}
     handle {{
-        root * ./p
-        php_server
+        @unapproved {{
+            not {{
+                host rss-{nonce}.invalid
+                method GET
+                path /i/ /api/greader.php/reader/api/0/subscription/list
+            }}
+            not {{
+                file {{
+                    root {approval.parent}
+                    try_files /{approval.name}
+                }}
+            }}
+        }}
+        route {{
+            respond @unapproved 503
+            root * ./p
+            php_server
+        }}
     }}
 }}
 """
 
 
-def _end(process: subprocess.Popen[bytes] | None, timeout: float) -> None:
-    """Wait for an owned direct child, never kill a PID from a state record."""
-    if process is None or process.poll() is not None:
-        return
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
+    """Force and confirm exit of an owned direct child, not a recorded PID."""
+    process.kill()
+    process.wait()
+
+
+def _drain(
+    web: subprocess.Popen[bytes] | None,
+    fetch: subprocess.Popen[bytes] | None,
+    fetch_deadline: float,
+) -> str | None:
+    """Drain both writers without pausing the fetch deadline during web shutdown."""
+    now = time.monotonic()
+    web_stop_at = now + 30
+    fetch_term_at = now + 120
+    fetch_stop_at = min(fetch_term_at + 10, fetch_deadline)
+    fetch_term_sent = False
+    last_fetch = None
+    if web is not None and web.poll() is None:
+        web.terminate()
+    while web is not None or fetch is not None:
+        now = time.monotonic()
+        if fetch is not None:
+            if (code := fetch.poll()) is not None:
+                last_fetch = "completed" if code == 0 else "failed"
+                fetch = None
+            elif now >= fetch_stop_at:
+                _kill_and_reap(fetch)
+                last_fetch = "failed"
+                fetch = None
+            elif now >= fetch_term_at and not fetch_term_sent:
+                fetch.terminate()
+                fetch_term_sent = True
+        if web is not None:
+            if web.poll() is not None:
+                web = None
+            elif now >= web_stop_at:
+                _kill_and_reap(web)
+                web = None
+        if web is not None or fetch is not None:
+            time.sleep(0.25)
+    return last_fetch
 
 
 def _fetch(
@@ -248,9 +300,10 @@ def serve(state: Path, writer_fd: int) -> None:
         "last_fetch": None,
     }
     web = fetch = None
+    fetch_deadline = 0.0
     stopping = False
     approved = False
-    deadline = time.monotonic() + 30
+    approval_deadline = time.monotonic() + 30
     try:
         with config.open("x") as stream:
             stream.write(_caddyfile(plan))
@@ -269,16 +322,23 @@ def serve(state: Path, writer_fd: int) -> None:
             if stop is not None and stop["nonce"] == nonce:
                 stopping = True
                 break
-            if fetch is not None and fetch.poll() is not None:
-                status["last_fetch"] = (
-                    "completed" if fetch.returncode == 0 else "failed"
-                )
-                save(receipt, {**status, "web": "started", "scheduler": "running"})
-                fetch = None
+            if fetch is not None:
+                outcome = None
+                if (code := fetch.poll()) is not None:
+                    outcome = "completed" if code == 0 else "failed"
+                elif time.monotonic() >= fetch_deadline:
+                    _kill_and_reap(fetch)
+                    outcome = "failed"
+                    # Do not replay a slot reached while the timed-out writer
+                    # was still being stopped (including wall-clock jumps).
+                    slot = max(slot, int(time.time()) // PERIOD)
+                if outcome is not None:
+                    status["last_fetch"] = outcome
+                    save(receipt, {**status, "web": "started", "scheduler": "running"})
+                    fetch = None
             if not approved:
-                security = read(state / "security.json")
-                approved = bool(security and security.get("nonce") == nonce)
-                if not approved and time.monotonic() >= deadline:
+                approved = approval_path(home, nonce).is_file()
+                if not approved and time.monotonic() >= approval_deadline:
                     break
             due = _scheduled(time.time(), slot)
             if due is not None:
@@ -286,15 +346,15 @@ def serve(state: Path, writer_fd: int) -> None:
                 if approved and fetch is None and initialized(data):
                     with lease(state / "fetch.lock") as fetch_fd:
                         if fetch_fd is not None:
+                            fetch_deadline = time.monotonic() + FETCH_TIMEOUT
                             fetch = _fetch(binary, source, env, writer_fd, fetch_fd)
             time.sleep(0.25)
     finally:
-        if web is not None and web.poll() is None:
-            web.terminate()
         # Stop accepting requests immediately; let active requests and fetching drain.
-        _end(web, 20)
-        _end(fetch, 120)
+        if (outcome := _drain(web, fetch, fetch_deadline)) is not None:
+            status["last_fetch"] = outcome
         config.unlink(missing_ok=True)
+        approval_path(home, nonce).unlink(missing_ok=True)
         save(
             receipt,
             {

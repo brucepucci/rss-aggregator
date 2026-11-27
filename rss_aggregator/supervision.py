@@ -8,6 +8,7 @@ import plistlib
 import re
 import shutil
 import stat
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr
@@ -282,14 +283,34 @@ class NativeJob:
         )
 
     def write(self, definition: bytes) -> None:
-        """Exclusively publish a private definition; never overwrite unknown files."""
+        """Stage a private definition before publishing it without replacement."""
         path = self.path
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(definition)
-            output.flush()
-            os.fsync(output.fileno())
+        stage = tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=".rss-native-job-", delete=False
+        )
+        temporary = Path(stage.name)
+        try:
+            with stage:
+                os.fchmod(stage.fileno(), 0o600)
+                if stage.write(definition) != len(definition):
+                    raise OSError(
+                        "Short write while staging native LaunchAgent definition."
+                    )
+                stage.flush()
+                os.fsync(stage.fileno())
+            os.link(temporary, path)
+        except FileExistsError:
+            raise ValueError(
+                "Refusing conflicting native LaunchAgent definition; registration retained. Inspect locally before retrying."
+            ) from None
+        finally:
+            temporary.unlink(missing_ok=True)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     @contextmanager
     def environment(self, record: dict[str, Any]) -> Iterator[None]:
@@ -659,7 +680,8 @@ class Supervision:
                 "Captured supervision configuration differs; remove it first, then explicitly install the reviewed configuration."
             )
         job = self.job.path
-        if not record and os.path.lexists(job):
+        had_definition = os.path.lexists(job)
+        if not record and had_definition:
             raise ValueError(
                 "Refusing unowned supervision job; preserve and resolve it locally."
             )
@@ -671,16 +693,17 @@ class Supervision:
         loaded = self.job.loaded(captured)
         if loaded and not record:
             raise ValueError("Refusing a loaded job without our registration ledger.")
-        if record:
-            self._check_job(record, missing=True)
-        if loaded and not job.exists():
+        if loaded and not had_definition:
             raise ValueError(
                 "Loaded supervision job definition is missing; use supervision-remove then supervision-install. Recreating the file cannot update launchd's loaded policy. Registration retained."
             )
+        if record and had_definition:
+            self._check_job(record)
         self.runtime._save(REGISTRATION, captured)
-        if not job.exists():
+        if not had_definition:
             self.job.write(self.job.definition(captured, 60))
         if not loaded:
+            self._check_job(captured)
             result = self.job.launch(captured, "bootstrap", self.job.domain, str(job))
             if result.returncode:
                 raise ValueError(

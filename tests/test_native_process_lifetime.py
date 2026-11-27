@@ -13,7 +13,7 @@ import pytest
 
 from rss_aggregator.archives import create_archive, write_data_tar
 from rss_aggregator.native_install import manifest_identity
-from rss_aggregator.native_service import lease
+from rss_aggregator.native_service import approval_path, lease
 from tests.test_native_install import CLI_IN_CHECKOUT, ROOT, Checkout
 from tests.test_native_jobs import LAUNCHCTL, _success, _tool
 
@@ -228,13 +228,10 @@ def test_inflight_fetch_prevents_backup_after_controller_death(process_checkout)
     checkout = process_checkout
     nonce = "a" * 32
     checkout.control.mkdir(mode=0o700)
-    for name, value in {
-        "service.json": {"nonce": nonce, "instance": "reader", "port": 18080},
-        "security.json": {"nonce": nonce},
-    }.items():
-        record = checkout.state / name
-        record.write_text(json.dumps(value))
-        record.chmod(0o600)
+    plan = checkout.state / "service.json"
+    plan.write_text(json.dumps({"nonce": nonce, "instance": "reader", "port": 18080}))
+    plan.chmod(0o600)
+    approval_path(checkout.control, nonce).touch(mode=0o600)
 
     with (
         lease(checkout.state / "writers.lock") as writer,
