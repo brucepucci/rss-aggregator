@@ -38,6 +38,10 @@ _RUNTIME_FIELDS = {
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
+class _PathMetadataLimitExceeded(ValueError):
+    """The cumulative path metadata is too large to stage safely."""
+
+
 def _temporary(directory: Path, suffix: str) -> tuple[BinaryIO, Path]:
     """Create a private temporary file in the caller-managed work directory."""
     descriptor, name = tempfile.mkstemp(
@@ -325,6 +329,21 @@ def _path(name: str) -> str:
     return normalized
 
 
+def _charge_path_metadata(used: int, components: list[str]) -> int:
+    """Charge a normalized member and all its ancestors without building prefixes.
+
+    Count four times each prefix's UTF-8 bytes plus 256 bytes of overhead.
+    Shared ancestors are charged again for every member; payload is not capped.
+    """
+    prefix_bytes = 0
+    for index, component in enumerate(components):
+        prefix_bytes += len(component.encode("utf-8")) + (index > 0)
+        used += 4 * prefix_bytes + _PATH_STRING_OVERHEAD
+    if used > _PATH_METADATA_LIMIT:
+        raise _PathMetadataLimitExceeded
+    return used
+
+
 def _number(value: str, fractional: bool = False) -> int:
     """Parse bounded numeric PAX ownership, size, or modification time."""
     if len(value) > 128:
@@ -360,11 +379,9 @@ def _repack(source: BinaryIO, target: BinaryIO, *, native_paths: bool) -> None:
 
     Header extensions are parsed with bounded allocations rather than allowing
     tarfile to load arbitrary PAX or GNU metadata. File content is streamed.
-    Normalized paths have at most 64 components. Before constructing ancestor
-    strings, charge each member name and every ancestor against an 8 MiB
-    cumulative budget: four times its UTF-8 byte length plus 256 bytes for
-    string/set overhead. Shared ancestors are conservatively charged again for
-    every member, even when already retained. Payload bytes are not capped.
+    Normalized paths have at most 64 components. Charge each member and its
+    ancestors against the cumulative path metadata budget before constructing
+    and retaining ancestor strings.
     """
     path_metadata = 0
     seen: set[str] = set()
@@ -433,12 +450,7 @@ def _repack(source: BinaryIO, target: BinaryIO, *, native_paths: bool) -> None:
             if name in seen or (name == "." and not is_directory):
                 raise ValueError
             components = name.split("/")
-            prefix_bytes = 0
-            for index, component in enumerate(components):
-                prefix_bytes += len(component.encode("utf-8")) + (index > 0)
-                path_metadata += 4 * prefix_bytes + _PATH_STRING_OVERHEAD
-            if path_metadata > _PATH_METADATA_LIMIT:
-                raise ValueError
+            path_metadata = _charge_path_metadata(path_metadata, components)
             parents = components[:-1]
             parent_paths = {"/".join(parents[:i]) for i in range(1, len(parents) + 1)}
             if parent_paths & files or (not is_directory and name in ancestors):
@@ -561,26 +573,25 @@ def validate_archive(
 def create_archive(
     payload: Path,
     directory: Path,
-    image: dict[str, Any] | None = None,
     *,
-    runtime: dict[str, Any] | None = None,
+    runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate, privately stage, verify, and atomically publish an instance backup.
+    """Validate, stage, verify, and atomically publish a native v2 instance backup.
 
     Existing archives are never overwritten. Publication uses a hard link in the
     supplied directory; the caller must ensure that directory has mode 0700.
     The result contains the absolute archive path, whole-ZIP SHA-256, verification
-    status, and manifest. Supplying ``runtime`` produces v2; positional ``image``
-    is retained for legacy fixtures. Errors omit paths and archived content.
+    status, and a manifest with the native runtime identity. Errors omit paths
+    and archived content.
     """
     temporary: Path | None = None
     sanitized: Path | None = None
     published: Path | None = None
     complete = False
     try:
-        version, key, identity = _compatibility(image, runtime)
+        version, key, identity = _compatibility(None, runtime)
         directory = directory.resolve()
-        sanitized = _sanitize(payload, directory, native_paths=version == 2)
+        sanitized = _sanitize(payload, directory, native_paths=True)
         sanitized.unlink()
         sanitized = None
         with payload.open("rb") as source:
@@ -613,9 +624,7 @@ def create_archive(
                                 _copy(source, output)
             target.flush()
             os.fsync(target.fileno())
-        verified, sanitized = validate_archive(
-            temporary, directory, image, runtime=runtime
-        )
+        verified, sanitized = validate_archive(temporary, directory, runtime=runtime)
         sanitized.unlink()
         sanitized = None
         with temporary.open("rb") as source:
@@ -645,11 +654,18 @@ def create_archive(
         _cleanup(temporary, sanitized, published if not complete else None)
 
 
-def _write_tree(directory: int, output: tarfile.TarFile, prefix: str = "") -> None:
-    """Copy regular files and directories without following data-tree links."""
+def _write_tree(
+    directory: int,
+    output: tarfile.TarFile,
+    *,
+    prefix: str = "",
+    path_metadata: int = 0,
+) -> int:
+    """Copy without following links and return the updated whole-tree budget use."""
     with os.scandir(directory) as entries:
         for entry in entries:
             name = _path(prefix + entry.name)
+            path_metadata = _charge_path_metadata(path_metadata, name.split("/"))
             before = entry.stat(follow_symlinks=False)
             is_directory = stat.S_ISDIR(before.st_mode)
             if not is_directory and (
@@ -675,7 +691,12 @@ def _write_tree(directory: int, output: tarfile.TarFile, prefix: str = "") -> No
                     member.type = tarfile.DIRTYPE
                     member.mode = 0o700
                     output.addfile(member)
-                    _write_tree(descriptor, output, name + "/")
+                    path_metadata = _write_tree(
+                        descriptor,
+                        output,
+                        prefix=name + "/",
+                        path_metadata=path_metadata,
+                    )
                 else:
                     member.size = info.st_size
                     member.mode = 0o600
@@ -683,10 +704,11 @@ def _write_tree(directory: int, output: tarfile.TarFile, prefix: str = "") -> No
                         output.addfile(member, source)
             finally:
                 os.close(descriptor)
+    return path_metadata
 
 
 def write_data_tar(data: Path, directory: Path) -> Path:
-    """Write a private tar of the quiesced owned data tree, including empty dirs."""
+    """Capture quiesced data, enforcing the path budget before staging each member."""
     target, path = _temporary(directory, ".tar")
     complete = False
     try:
@@ -703,6 +725,10 @@ def write_data_tar(data: Path, directory: Path) -> Path:
         return path
     except OSError:
         raise OSError("Could not capture the FreshRSS data directory.") from None
+    except _PathMetadataLimitExceeded:
+        raise ValueError(
+            "FreshRSS data exceeds the backup path metadata limit."
+        ) from None
     except ValueError:
         raise ValueError(
             "FreshRSS data contains an unsafe file or directory."

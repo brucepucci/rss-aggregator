@@ -794,6 +794,7 @@ def controlled_web(native, monkeypatch):
     native.web_auth = True
     native.acknowledge = True
     native.launches = 0
+    native.fetch_result = lambda: 0
 
     def run(args, **kwargs):
         nonlocal origin
@@ -807,12 +808,17 @@ def controlled_web(native, monkeypatch):
             assert args[2] in (
                 "cli/prepare.php",
                 "cli/reconfigure.php",
-                "app/actualize_script.php",
             )
             output = ""
         return subprocess.CompletedProcess(args, 0, output.encode(), b"")
 
-    def spawn(args, *, pass_fds, **_kwargs):
+    def spawn(args, *, pass_fds, **kwargs):
+        if args[1:3] == ["-I", "-B"]:
+            assert Path(args[3]).name == "native_service.py" and args[4] == "fetch"
+            assert args[5] == str(native.state) and args[6] == str(native.data)
+            assert pass_fds == (int(args[7]),)
+            assert kwargs["stdout"] == kwargs["stderr"] == subprocess.DEVNULL
+            return SimpleNamespace(wait=native.fetch_result)
         assert args[2:4] == ["-m", "rss_aggregator.native_service"]
         assert not handles
         handles.extend(os.dup(fd) for fd in pass_fds)
@@ -1252,21 +1258,14 @@ def test_private_start_rechecks_forwarding_after_preparation(
     initialized_web(native)
     monkeypatch.setenv("RSS_TAILSCALE", "1")
     previous_launches = native.launches
-    run = subprocess.run
     prepare = PrivateAccess.prepare
     check_backend = PrivateAccess.check_backend
     prepared = False
 
-    def run_php(args, **kwargs):
+    def fetch_result():
         nonlocal prepared
-        result = run(args, **kwargs)
-        if args[:3] == [
-            str(native.state / "runtime/frankenphp"),
-            "php-cli",
-            "app/actualize_script.php",
-        ]:
-            prepared = True
-        return result
+        prepared = True
+        return 0
 
     def check_before_binding():
         if prepared:
@@ -1281,7 +1280,7 @@ def test_private_start_rechecks_forwarding_after_preparation(
         check_before_binding()
         return check_backend(access, port)
 
-    monkeypatch.setattr(subprocess, "run", run_php)
+    native.fetch_result = fetch_result
     monkeypatch.setattr(PrivateAccess, "prepare", prepare_access)
     monkeypatch.setattr(PrivateAccess, "check_backend", check_access)
     refused(native.run(["start"]), "Synthetic forwarding inspection failed")
@@ -1419,7 +1418,7 @@ def test_stalled_discovery_is_reaped_without_holding_command_lock(process_checko
             )
 
 
-def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_recorded(
+def test_foreground_fetch_timeout_leaves_failure_evidence_for_resumption(
     controlled_web, monkeypatch
 ):
     native = controlled_web
@@ -1427,30 +1426,20 @@ def test_foreground_fetch_timeouts_are_sanitized_and_failed_resumption_is_record
     result_json(native.run(["start"]))
     initialized_web(native)
     result_json(native.run(["start"]))
-    run = subprocess.run
 
-    def timed_run(args, **kwargs):
-        if args[:1] == [str(native.state / "runtime/frankenphp")]:
-            assert kwargs["umask"] == 0o077
-            if args[2] == "app/actualize_script.php":
-                assert kwargs["timeout"] == 600
-                raise subprocess.TimeoutExpired(
-                    ["synthetic-secret-arg"],
-                    kwargs["timeout"],
-                    b"synthetic-secret-output",
-                )
-        return run(args, **kwargs)
+    def timed_out():
+        return native_service.FETCH_TIMED_OUT
 
-    monkeypatch.setattr(subprocess, "run", timed_run)
-    refused(native.run(["fetch"]), "timed out", "synthetic-secret")
+    native.fetch_result = timed_out
+    refused(native.run(["fetch"]), "timed out after 600 seconds")
     assert result_json(native.run(["status"]))["http_ready"] is True
-    refused(native.run(["verify"]), "timed out", "synthetic-secret")
+    refused(native.run(["verify"]), "timed out after 600 seconds")
     assert result_json(native.run(["status"]))["application"] == "stopped"
 
-    monkeypatch.setattr(subprocess, "run", run)
+    native.fetch_result = lambda: 0
     result_json(native.run(["start"]))
-    monkeypatch.setattr(subprocess, "run", timed_run)
-    refused(native.run(["backup"]), "timed out", "synthetic-secret")
+    native.fetch_result = timed_out
+    refused(native.run(["backup"]), "timed out after 600 seconds")
     status = result_json(native.run(["backup-status"]))
     assert status["latest_attempt"]["outcome"] == "failed"
     assert status["resumption"] == "failed"

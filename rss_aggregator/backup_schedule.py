@@ -188,6 +188,58 @@ class BackupSchedule:
             ]
         return ledger["pending"]
 
+    def _owned_shutdowns(self, owner: dict[str, Any]) -> list[dict[str, Any]]:
+        """Read unresolved shutdowns without trusting another owner's evidence."""
+        from rss_aggregator.runtime import RuntimeFailure
+
+        ledger = self._evidence(SHUTDOWN)
+        if ledger is not None and ledger["owner"] != owner["token"]:
+            raise RuntimeFailure(
+                "Unrecognized shutdown evidence owner; inspect locally."
+            )
+        return self._shutdown_records(ledger)
+
+    def require_upgrade_shutdown(
+        self, owner: dict[str, Any], instance: str, generation: str | None
+    ) -> dict[str, Any]:
+        """Require consistent shutdown evidence for the selected instance only."""
+        from rss_aggregator.recovery import SHUTDOWN_SUCCESS
+        from rss_aggregator.runtime import RuntimeFailure
+
+        if any(
+            entry["instance"] in (None, instance)
+            for entry in self._owned_shutdowns(owner)
+        ):
+            raise RuntimeFailure(
+                "A verified shutdown archive is required; shutdown evidence is unresolved for the selected instance or an unidentified instance. "
+                "Inspect rss backup-status and retry rss stop if the instance is identified."
+            )
+        latest = self._evidence(SUCCESS)
+        try:
+            success = self._read(SHUTDOWN_SUCCESS)
+            if (
+                isinstance(success, dict)
+                and success.get("via") == "stop"
+                and success.get("instance") == instance
+                and "writer_generation" in success
+                and success["writer_generation"] == generation
+                and self._valid_evidence(SUCCESS, success)
+                and (
+                    latest is None
+                    or latest["instance"] != instance
+                    or (
+                        "writer_generation" in latest
+                        and latest["writer_generation"] == generation
+                    )
+                )
+            ):
+                return success
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            pass
+        raise RuntimeFailure(
+            "A verified shutdown archive covering the selected instance's last writer generation is required; fix the backup and retry rss stop."
+        )
+
     def _save_shutdowns(
         self, owner: dict[str, Any], pending: list[dict[str, Any]]
     ) -> None:
@@ -236,6 +288,13 @@ class BackupSchedule:
             pass
         return record, already_stopped
 
+    def _has_intent(self, intent: str) -> bool:
+        """Require the same readable operator intent that supervision would honor."""
+        try:
+            return Supervision(self.runtime).intent() == intent
+        except (OSError, ValueError):
+            return False
+
     def _set_stopped_intent(self) -> None:
         """Attempt intent even when an earlier bookkeeping stage failed."""
         try:
@@ -277,7 +336,14 @@ class BackupSchedule:
         from rss_aggregator.runtime import RuntimeFailure
 
         runtime = self.runtime
-        owner, _installed = runtime._ownership_receipt()
+        try:
+            owner, _installed = runtime._ownership_receipt()
+        except (RuntimeFailure, OSError, ValueError):
+            # Revoke existing permission to restart, without claiming ownership
+            # or creating intent in a fresh path that has never granted it.
+            if self._has_intent("running"):
+                self._set_stopped_intent()
+            raise
         recorded = False
         settled = False
         try:
@@ -287,12 +353,7 @@ class BackupSchedule:
                     try:
                         self.begin(owner, "stop", shutdown=shutdown)
                     finally:
-                        ledger = self._evidence(SHUTDOWN)
-                        if ledger and ledger["owner"] != owner["token"]:
-                            raise RuntimeFailure(
-                                "Unrecognized shutdown evidence owner; inspect locally."
-                            )
-                        previous = self._shutdown_records(ledger)
+                        previous = self._owned_shutdowns(owner)
                         identity = shutdown["instance"]
                         others = [
                             entry for entry in previous if entry["instance"] != identity
@@ -728,6 +789,7 @@ class BackupSchedule:
         config = self._config()
         if not config or not config["active"]:
             return {"outcome": "disabled"}
+        daily = self._evidence(DAILY)
         if not self._job_matches(config) or not self._job.loaded(config):
             raise RuntimeFailure(
                 "Backup job missing, changed or not registered; inspect backup-status and the owned schedule locally."
@@ -760,7 +822,6 @@ class BackupSchedule:
                 "Backup job settings or captured dependencies changed; nothing started. Inspect rss backup-status."
             ) from None
         slot = self._slot(config)
-        daily = self._read(DAILY)
         same_target = self._same_target(daily, config, slot, selected)
         next_attempt = self._next(config, daily, selected)
         if self.now < next_attempt:
@@ -876,6 +937,10 @@ class BackupSchedule:
                 "action": "No maintenance hold exists.",
             }
         owner, marker = self._owned_maintenance()
+        if marker["operation"] == "stop" and not self._has_intent("stopped"):
+            raise RuntimeFailure(
+                "Explicit stop maintenance has no durable stopped intent; retry rss stop before rss backup-reconcile."
+            )
         if not self.runtime._idle() or PrivateAccess(self.runtime).status(owner)[
             "status"
         ] not in ("unconfigured", "stopped"):
@@ -925,10 +990,16 @@ class BackupSchedule:
         if daily and daily["outcome"] == "running":
             self.runtime._save(DAILY, {**daily, "outcome": "interrupted"})
         self.finish()
+        action = "Writers and owned forwarding confirmed idle; hold released without changing intent."
+        if marker["operation"] != "stop":
+            action += (
+                " A separately enabled supervisor may honor existing running intent."
+            )
         return {
             "reconciled": True,
             "resumed": False,
-            "action": "Writers and owned forwarding confirmed idle; hold released without changing intent. A separately enabled supervisor may honor existing running intent. Inspect backup-status and retry rss stop if shutdown evidence is unresolved.",
+            "action": action
+            + " Inspect backup-status and retry rss stop if shutdown evidence is unresolved.",
         }
 
     @staticmethod
@@ -939,11 +1010,21 @@ class BackupSchedule:
         *,
         follow_symlinks: bool,
     ) -> bool:
-        """Probe a recorded archive without confusing filesystem errors with record damage."""
+        """Check that a recorded archive can be opened for reading, not its contents."""
         if path is None:
             return False
         try:
-            return stat.S_ISREG(path.stat(follow_symlinks=follow_symlinks).st_mode)
+            if not stat.S_ISREG(path.stat(follow_symlinks=follow_symlinks).st_mode):
+                return False
+            # A raced replacement with a FIFO must not block the probe.
+            flags = os.O_RDONLY | os.O_NONBLOCK
+            if not follow_symlinks:
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                return stat.S_ISREG(os.fstat(descriptor).st_mode)
+            finally:
+                os.close(descriptor)
         except (FileNotFoundError, NotADirectoryError):
             return False
         except OSError:

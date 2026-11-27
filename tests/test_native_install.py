@@ -46,13 +46,21 @@ def test_setup_rejects_wrong_download_before_publishing_runtime(tmp_path, monkey
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI_IN_CHECKOUT = """
+# The controlled child runs with the fixture checkout as cwd; don't rely on Python
+# adding cwd implicitly (e.g. when PYTHONSAFEPATH is set).
+CHECKOUT_IMPORT = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd()))
+"""
+CLI_IN_CHECKOUT = (
+    CHECKOUT_IMPORT
+    + """
 import json
 import os
 import platform
-import sys
 import urllib.request
-from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -82,6 +90,7 @@ sys.stdout.write(result.stdout)
 sys.stderr.write(result.stderr)
 raise SystemExit(result.exit_code)
 """
+)
 
 
 class Checkout:
@@ -198,6 +207,7 @@ def checkout(tmp_path):
 
 
 def test_setup_publishes_private_pinned_runtime_idempotently(checkout):
+    checkout.environment["PYTHONSAFEPATH"] = "1"
     result = checkout.run("setup")
     assert result.returncode == 0, result.stderr
     owner = json.loads(result.stdout)
@@ -219,6 +229,25 @@ def test_setup_publishes_private_pinned_runtime_idempotently(checkout):
 
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["token"] == owner["token"]
+
+
+@pytest.mark.parametrize("command", ["status", "start"])
+def test_inspection_or_refused_start_does_not_spoil_fresh_setup(checkout, command):
+    before = checkout.run(command)
+    if command == "status":
+        assert before.returncode == 0, before.stderr
+        assert json.loads(before.stdout) == {
+            "runtime": "absent",
+            "application": "stopped",
+            "http_ready": False,
+        }
+    else:
+        assert before.returncode == 1 and "run rss setup" in before.stderr
+    assert all(p.name == "command.lock" for p in checkout.state.iterdir())
+
+    installed = checkout.run("setup")
+    assert installed.returncode == 0, installed.stderr
+    assert checkout.binary.is_file()
 
 
 def test_parent_setup_refusal_preserves_child_shutdown(checkout):

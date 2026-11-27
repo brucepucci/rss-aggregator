@@ -15,7 +15,7 @@ import pytest
 
 from rss_aggregator.archives import create_archive, write_data_tar
 from rss_aggregator.native_install import manifest_identity
-from tests.test_native_install import CLI_IN_CHECKOUT, Checkout
+from tests.test_native_install import CHECKOUT_IMPORT, CLI_IN_CHECKOUT, Checkout
 
 LAUNCHCTL = """
 import json
@@ -58,7 +58,9 @@ else:
 """
 
 
-CLOCKED_CLI = f"""
+CLOCKED_CLI = (
+    CHECKOUT_IMPORT
+    + f"""
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,6 +102,7 @@ with (
 ):
     exec({CLI_IN_CHECKOUT!r})
 """
+)
 
 
 class JobCheckout(Checkout):

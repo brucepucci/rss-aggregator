@@ -13,8 +13,10 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import TYPE_CHECKING, Any
 
+from rss_aggregator import native_service
 from rss_aggregator.private_access import PrivateAccess
 
 if TYPE_CHECKING:
@@ -25,6 +27,7 @@ MAINTENANCE = "maintenance.json"
 REGISTRATION = "supervision.json"
 RECOVERY_STATE = "supervision-recovery.json"
 JOB_VERSION = 2
+JOB_INSPECTION_TIMEOUT = 5
 
 
 class NativeJob:
@@ -189,13 +192,12 @@ class NativeJob:
                 raise ValueError(
                     "Captured executable unavailable or dependency lookup changed; no fallback is allowed."
                 )
-        probe = self.runtime._run(
+        probe = self._inspect(
             str(python),
             "-I",
             "-B",
             "-c",
             "from pathlib import Path; import rss_aggregator.runtime as r; print(Path(r.__file__).resolve().parents[1])",
-            check=False,
         )
         if probe.returncode or probe.stdout.strip() != record["root"]:
             raise ValueError(
@@ -225,12 +227,22 @@ class NativeJob:
             sort_keys=True,
         )
 
-    def launch(self, record: dict[str, Any], *args: str) -> Any:
-        """Use captured launchctl without printing its raw output."""
+    def _inspect(self, *args: str) -> CompletedProcess[str]:
+        """Bound read-only probes and keep the command lease in the parent."""
+        return self.runtime._run(
+            *args, check=False, inherit_lock=False, timeout=JOB_INSPECTION_TIMEOUT
+        )
+
+    def launch(
+        self, record: dict[str, Any], verb: str, *args: str
+    ) -> CompletedProcess[str]:
+        """Bound launchctl inspections, not mutations with uncertain outcomes."""
         executable = record["dependencies"]["launchctl"]
         if not Path(executable).is_absolute():
             raise ValueError("Refusing relative captured launchctl path.")
-        return self.runtime._run(executable, *args, check=False)
+        if verb == "print":
+            return self._inspect(executable, verb, *args)
+        return self.runtime._run(executable, verb, *args, check=False)
 
     def loaded(self, record: dict[str, Any]) -> bool:
         """Accept only a matching native loaded job, never a legacy service."""
@@ -346,7 +358,7 @@ class Supervision:
             return "unset"
         if path.is_symlink():
             raise ValueError("Refusing symlinked operator intent; inspect locally.")
-        value = json.loads(path.read_text())
+        value = native_service.read(path)
         if (
             not isinstance(value, dict)
             or value.get("version") != 1
@@ -729,6 +741,7 @@ class Supervision:
                 raise ValueError(
                     "Supervision removal failed; registration retained for inspection/retry."
                 )
+        self._check_job(record, missing=True)
         Path(record["job"]).unlink(missing_ok=True)
         (self.runtime.state_dir / REGISTRATION).unlink()
         return self.status()

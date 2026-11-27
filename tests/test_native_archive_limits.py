@@ -1,14 +1,19 @@
-"""Native restore resource limits through the public CLI."""
+"""Native capture and restore resource limits through the public CLI."""
 
 import hashlib
 import io
 import json
 import tarfile
 import zipfile
+from pathlib import Path
 
 from test_native_archives import installed as installed
 from test_native_archives import project as project
 from test_native_archives import run
+from test_private_access import controlled_web as controlled_web
+from test_private_access import installed_checkout as installed_checkout
+from test_private_access import native as native
+from test_private_access import result_json
 
 from rss_aggregator.cli import main
 from rss_aggregator.native_install import manifest_identity
@@ -59,3 +64,59 @@ def test_native_restore_refuses_cumulative_path_metadata_without_publishing(
     assert "Invalid backup archive" in result.stderr
     assert {path.name for path in (state / "instances").iterdir()} == {"source"}
     assert run(cli, "status")["instance"] == "source"
+
+
+def test_native_capture_refuses_the_over_budget_member_before_staging_it(
+    controlled_web,  # noqa: F811 - pytest injects the shared fixture.
+    monkeypatch,
+):
+    web = controlled_web
+    monkeypatch.setenv("RSS_TAILSCALE", "0")
+    result_json(web.run(["start"]))
+    assert result_json(web.run(["status"]))["http_ready"] is True
+    saved = Path(result_json(web.run(["backup"]))["archive"])
+    original = saved.read_bytes()
+
+    # Neither subtree exceeds the limit alone. Each 240-byte leaf under a
+    # 240-byte parent costs 3,396 bytes including the shared ancestor. After
+    # the two directories (and small existing files), 2,469 leaves fit in 8 MiB.
+    parents = {letter * 240 for letter in ("a", "b")}
+    for name in parents:
+        parent = web.data / name
+        parent.mkdir(mode=0o700)
+        for index in range(1250):
+            (parent / (f"{index:04d}" + "c" * 236)).touch(mode=0o600)
+
+    staged_leaves = 0
+    capture_tar = None
+    addfile = tarfile.TarFile.addfile
+
+    def count_staged_leaf(archive, member, fileobj=None):
+        nonlocal staged_leaves, capture_tar
+        if capture_tar is None:
+            capture_tar = archive
+        if (
+            archive is capture_tar
+            and member.name.partition("/")[0] in parents
+            and member.isfile()
+        ):
+            staged_leaves += 1
+        return addfile(archive, member, fileobj)
+
+    with monkeypatch.context() as export:
+        export.setattr(tarfile.TarFile, "addfile", count_staged_leaf)
+        failed = web.run(["backup"])
+
+    assert failed.exit_code == 1, failed.output
+    assert not failed.stdout
+    assert staged_leaves == 2469
+    assert "exceeds the backup path metadata limit" in failed.stderr
+    assert list(saved.parent.iterdir()) == [saved]
+    assert saved.read_bytes() == original
+    status = result_json(web.run(["status"]))
+    assert status["application"] == "running"
+    assert status["http_ready"] is True
+    report = result_json(web.run(["backup-status"]))
+    assert report["latest_attempt"]["outcome"] == "failed"
+    assert report["latest_success"]["archive"] == str(saved)
+    assert report["maintenance_required"] is False

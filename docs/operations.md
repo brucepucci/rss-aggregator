@@ -40,8 +40,10 @@ Use the owning checkout and consistent `RSS_PORT`, `RSS_TAILSCALE`, `RSS_STATE_D
 and `RSS_BACKUP_DIR`. Commands below use `uv run --locked rss`; `./scripts/rss` is
 an equivalent launcher.
 
-- `start` records running intent after the maintenance guard. Startup checks
-  ownership and exact installed pin, prepares the selected data, checks effective
+- `start` records running intent after the maintenance guard and validation of the
+  owned runtime and exact installed pin. A `status` check or a refused `start`
+  on an unused local path does not prevent first-time `setup`. Startup prepares
+  the selected data, checks effective
   **web** PHP (not only PHP CLI), readiness and scheduling, and verifies rejection
   of anonymous API access on an initialized instance. Private startup refreshes
   the forwarding check after preparation. Ordinary HTTP receives 503 until the
@@ -78,7 +80,9 @@ Startup (including a restart via `verify` or backup resumption) and manual
 `fetch` allow up to **10 minutes** for the complete foreground fetch. A timeout
 fails the operation without emitting upstream output; inspect logs and slow feeds
 locally. On a restart timeout, serving may remain stopped; check `status` and, if
-resuming a backup, `backup-status` before retrying.
+resuming a backup, `backup-status` before retrying. If the invoking CLI exits
+unexpectedly, a foreground fetch is still bounded and keeps writer exclusion
+until the child exits; `stop` or backup may wait for that drain.
 The scheduler and manual fetch serialize to avoid overlapping fetches. Scheduled
 fetches have the same 10-minute execution budget; on timeout the controller stops
 and reaps its child, reports a failed `last_fetch` in `status`, and can try again
@@ -114,9 +118,13 @@ installer and verify the intended serving mode first. Do not alter login,
 FileVault, sleep or power policy. From the selected checkout run:
 
 ```sh
-uv run --locked rss supervision-install
-uv run --locked rss supervision-status
-# To opt out independently of daily backups:
+uv run --locked rss supervision-install &&
+  uv run --locked rss supervision-status
+```
+
+To opt out later, independently of daily backups:
+
+```sh
 uv run --locked rss supervision-remove
 ```
 
@@ -124,8 +132,10 @@ Supervision and [daily backups](backup-restore.md#opt-in-daily-mac-backups) use
 separate opt-in per-state labels in the user's GUI launchd domain. The jobs capture
 absolute checkout, Python, state and approved non-secret settings; they do not
 load the interactive shell or `.env`. Neither `setup` nor `start` installs jobs.
-Only the unchanged owned registration is removable; refusal or partial activation
-requires inspection, not plist/receipt edits. Removal does not stop FreshRSS,
+Only the unchanged owned registration is removable; if the plist is replaced
+while launchd is unloading the job, removal preserves the replacement and
+registration evidence. Refusal or partial activation requires inspection, not
+plist/receipt edits. Removal does not stop FreshRSS,
 change intent or delete data/archives. An intentionally stopped or unset instance
 is not eligible for automatic start. Only `start` enables running intent; `stop`
 records stopped intent even when a later step fails, once the command lock is held.
@@ -213,8 +223,12 @@ preservation plan, then apply only the current preview with `uv run --locked rss
 upgrade --confirm TOKEN`. With instance data present, apply requires the selected
 instance's verified shutdown archive covering its last writer generation and
 revalidates it against the installed pin. An older archive does not cover writes
-from a later session. If shutdown capture failed, correct the cause and retry
-`stop` before applying. It does not rewrite old archives: each
+from a later session. A relevant unresolved shutdown or ambiguous writer generation
+blocks apply. Preserve missing or damaged generation evidence for owner review;
+its absence is not proof that the instance never started. After resolving the
+cause, obtain a verified `stop` covering the affected instance. If the evidence
+cannot be recovered or the affected instance cannot be identified, preserve the
+old state and follow the [owner-reviewed recovery guidance](backup-restore.md#consistency-and-failure-behavior). It does not rewrite old archives: each
 ZIP still needs its exact recorded pin for restore. **Before the local restart**, confirm
 writers remain stopped and no Serve, Funnel or other proxy targets the intended
 loopback port. Use the [local-only forwarding checks](tailscale-readkit.md#stop-resume-and-return-to-local-only-use);

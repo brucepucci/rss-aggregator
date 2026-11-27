@@ -14,7 +14,7 @@ import pytest
 from rss_aggregator.archives import create_archive, write_data_tar
 from rss_aggregator.native_install import manifest_identity
 from rss_aggregator.native_service import approval_path, lease
-from tests.test_native_install import CLI_IN_CHECKOUT, ROOT, Checkout
+from tests.test_native_install import CHECKOUT_IMPORT, CLI_IN_CHECKOUT, ROOT, Checkout
 from tests.test_native_jobs import LAUNCHCTL, _success, _tool
 
 # The binary boundary is disposable. The web child provides a live readiness
@@ -40,8 +40,12 @@ elif args[:2] == ['php-cli', 'cli/reconfigure.php']:
 elif args[:2] == ['php-cli', '-r']:
     print(json.dumps(['form', False, False, True, (control / 'base-url').read_text(), True, 'sqlite']))
 elif args == ['php-cli', 'app/actualize_script.php']:
-    if (control / 'next-slot').exists():
+    if (control / 'next-slot').exists() or (control / 'hold-foreground').exists():
         signal.alarm(60)
+        if (control / 'hold-foreground').exists():
+            print('synthetic-private-feed', flush=True)
+            print('synthetic-private-feed', file=sys.stderr, flush=True)
+        (control / 'fetch-pid').write_text(str(os.getpid()))
         (control / 'fetch-started').touch()
         while not (control / 'fetch-release').exists():
             time.sleep(0.02)
@@ -51,6 +55,15 @@ elif args[0] == 'run':
     signal.alarm(60)
     nonce = Path(args[2]).name.removeprefix('Caddyfile-')
     os.chdir(root)
+
+    def stop_web(_number, _frame):
+        if (control / 'hold-web').exists():
+            # An HTTP request is still draining; the test will release it.
+            (control / 'web-draining').touch()
+        else:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_web)
 
     class Ready(socketserver.BaseRequestHandler):
         def handle(self):
@@ -82,8 +95,14 @@ if sys.argv[1:4] == ['-I', '-B', '-c']:
     exec(sys.argv[4])
     raise SystemExit(0)
 if sys.argv[1:4] == ['-I', '-m', 'rss_aggregator.native_service']:
+    control = Path(sys.argv[4]) / 'service'
+    (control / 'controller-pid').write_text(str(os.getpid()))
     sys.argv = sys.argv[3:]
     runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
+    raise SystemExit(0)
+if sys.argv[1:3] == ['-I', '-B'] and Path(sys.argv[3]).name == 'native_service.py':
+    sys.argv = sys.argv[3:]
+    runpy.run_path(sys.argv[0], run_name='__main__')
     raise SystemExit(0)
 assert sys.argv[1:5] == ['-I', '-B', '-m', 'rss_aggregator']
 sys.argv = ['rss', *sys.argv[5:]]
@@ -91,6 +110,8 @@ sys.argv = ['rss', *sys.argv[5:]]
 from rss_aggregator import native_service, runtime
 
 state = Path(os.environ['RSS_STATE_DIR'])
+foreground_control = state / 'service/hold-foreground'
+foreground_timeout = int(foreground_control.read_text()) if foreground_control.exists() else native_service.FETCH_TIMEOUT
 
 class FreePort:
     def __enter__(self):
@@ -137,22 +158,23 @@ with (
         socket=FreePort, SOL_SOCKET=socket.SOL_SOCKET, SO_REUSEADDR=socket.SO_REUSEADDR,
     )),
     patch.object(native_service, 'web_check', web_check),
+    patch.object(native_service, 'FETCH_TIMEOUT', foreground_timeout),
     patch.object(sys, 'executable', __file__),
 ):
     exec({CLI_IN_CHECKOUT!r})
 """
 
-CONTROLLER = """
+CONTROLLER = (
+    CHECKOUT_IMPORT
+    + """
 import runpy
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path.cwd()))
 slot = Path(sys.argv[1]) / 'service/next-slot'
 with patch('time.time', lambda: 1200 if slot.exists() else 0):
     runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
 """
+)
 
 
 class ProcessCheckout(Checkout):
@@ -163,6 +185,17 @@ class ProcessCheckout(Checkout):
     @property
     def control(self):
         return self.state / "service"
+
+    def popen(self, *args):
+        return subprocess.Popen(
+            (self.launcher, "-I", "-B", "-m", "rss_aggregator", *args),
+            cwd=self.root,
+            env=self.environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
     def run(self, *args):
         return subprocess.run(
@@ -297,6 +330,154 @@ def test_inflight_fetch_prevents_backup_after_controller_death(process_checkout)
     saved = _success(checkout, "backup")
     assert saved["verified"] is True
     assert Path(saved["archive"]).is_file()
+
+
+def test_stop_reaps_acknowledged_web_after_controller_death(process_checkout):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    assert _success(checkout, "status")["http_ready"] is True
+    nonce = json.loads((checkout.state / "service.json").read_text())["nonce"]
+    controller = int((checkout.control / "controller-pid").read_text())
+    web = int((checkout.control / ("web-pid-" + nonce)).read_text())
+    release_web = checkout.control / ("web-release-" + nonce)
+    (checkout.control / "hold-web").touch()
+    try:
+        os.kill(controller, signal.SIGKILL)
+        _wait_for(
+            (checkout.control / "web-draining").exists,
+            "the approved writer outlived its controller without a shutdown path",
+        )
+        assert not list(checkout.control.glob("acknowledged-*.json"))
+        assert not _exited(web)
+        assert _success(checkout, "status")["application"] == "unconfirmed"
+        release_web.touch()
+        _wait_for(
+            lambda: _success(checkout, "status")["application"] == "stopped",
+            "the approved writer was not reaped",
+        )
+        assert _exited(web)
+        with checkout.popen("stop") as stop:
+            try:
+                out, err = stop.communicate(timeout=5)
+            finally:
+                if stop.poll() is None:
+                    stop.kill()
+            assert stop.returncode == 0, err
+        result = json.loads(out)
+        assert result["application"] == "stopped"
+        assert result["backup"]["verified"] is True
+        assert not list(checkout.control.glob("acknowledged-*.json"))
+        assert _success(checkout, "status")["http_ready"] is False
+    finally:
+        release_web.touch()
+        _wait_for(
+            lambda: _success(checkout, "status")["application"] == "stopped",
+            "disposable web did not exit",
+        )
+
+
+def test_stop_waits_for_foreground_fetch_deadline_after_cli_death(process_checkout):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    nonce = json.loads((checkout.state / "service.json").read_text())["nonce"]
+    gate = checkout.control / ("acknowledged-" + nonce + ".json")
+    release_web = checkout.control / ("web-release-" + nonce)
+    (checkout.control / "hold-foreground").write_text("5")
+    try:
+        with checkout.popen("fetch") as fetch:
+            try:
+                _wait_for(
+                    (checkout.control / "fetch-started").exists,
+                    "manual fetch did not start",
+                )
+                fetch_pid = int((checkout.control / "fetch-pid").read_text())
+            finally:
+                if fetch.poll() is None:
+                    fetch.kill()
+            assert fetch.wait(timeout=5) == -signal.SIGKILL
+
+        assert _success(checkout, "status")["http_ready"] is True
+        competing = checkout.run("fetch")
+        assert competing.returncode == 1 and not competing.stdout
+        assert "A feed fetch is already in progress" in competing.stderr
+
+        with checkout.popen("stop") as stop:
+            try:
+                _wait_for(lambda: not gate.exists(), "stop did not close the HTTP gate")
+                assert stop.poll() is None and not _exited(fetch_pid)
+                assert not list(checkout.backups.glob("*.zip"))
+                out, err = stop.communicate(timeout=10)
+            finally:
+                if stop.poll() is None:
+                    stop.kill()
+            assert stop.returncode == 0, err
+        assert _exited(fetch_pid), "stop published before the fetch child was reaped"
+        assert not (checkout.control / "fetch-finished").exists()
+        result = json.loads(out)
+        assert result["application"] == "stopped"
+        assert result["backup"]["verified"] is True
+    finally:
+        (checkout.control / "fetch-release").touch()
+        release_web.touch()
+        _wait_for(
+            lambda: _success(checkout, "status")["application"] == "stopped",
+            "disposable writers did not exit",
+        )
+
+
+def test_startup_fetch_blocks_backup_even_without_a_web_generation(process_checkout):
+    checkout = process_checkout
+    checkout.control.mkdir(mode=0o700)
+    (checkout.control / "hold-foreground").write_text("5")
+    try:
+        with checkout.popen("start") as start:
+            try:
+                _wait_for(
+                    (checkout.control / "fetch-started").exists,
+                    "the startup fetch did not start",
+                )
+                fetch_pid = int((checkout.control / "fetch-pid").read_text())
+            finally:
+                if start.poll() is None:
+                    start.kill()
+            assert start.wait(timeout=5) == -signal.SIGKILL
+
+        status = _success(checkout, "status")
+        assert (status["application"], status["http_ready"]) == ("unconfirmed", False)
+        result = checkout.run("backup")
+        assert result.returncode == 1 and not result.stdout
+        assert "writer state is unconfirmed" in result.stderr
+        assert not list(checkout.backups.glob("*.zip"))
+
+        # No web generation ever started, so stop cannot certify the affected
+        # writer identity. It must still wait for the fetch before publishing.
+        stopped = checkout.run("stop")
+        assert stopped.returncode == 1 and not stopped.stdout
+        assert "shutdown identity could not be confirmed" in stopped.stderr
+        assert _exited(fetch_pid), "startup fetch deadline was lost"
+        assert list(checkout.backups.glob("*.zip"))
+    finally:
+        (checkout.control / "fetch-release").touch()
+        _wait_for(
+            lambda: _success(checkout, "status")["application"] == "stopped",
+            "disposable startup fetch did not exit",
+        )
+
+
+def test_foreground_timeout_reports_safe_error_after_reaping_writer(process_checkout):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    try:
+        (checkout.control / "hold-foreground").write_text("2")
+        result = checkout.run("fetch")
+        assert result.returncode == 1 and not result.stdout
+        assert "FreshRSS PHP operation timed out after 2 seconds" in result.stderr
+        assert "synthetic-private-feed" not in result.stderr
+        assert _exited(int((checkout.control / "fetch-pid").read_text()))
+        assert _success(checkout, "status")["http_ready"] is True
+    finally:
+        (checkout.control / "fetch-release").touch()
+        assert _success(checkout, "stop")["application"] == "stopped"
 
 
 def _run_captured_job(definition):

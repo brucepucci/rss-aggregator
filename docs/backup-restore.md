@@ -91,10 +91,14 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   before retrying.
 - Normal `stop` sets stopped intent and tries to persist shutdown evidence before
   quiescence, but attempts to close owned resources even if the write or route
-  withdrawal fails. Forwarding discovery is bounded; discovery failure leaves
-  forwarding unconfirmed, not permission to alter foreign rules. If stopped
-  intent could not be saved, running intent may still be in force. Fix the write
-  failure and retry `stop` before reconciling.
+  withdrawal fails. If runtime ownership cannot be verified, `stop` still
+  replaces valid running intent with stopped intent but refuses to touch
+  unidentified writers or forwarding. Restore access to the original receipt
+  and retry `stop`.
+  Forwarding discovery is bounded; discovery failure leaves forwarding
+  unconfirmed, not permission to alter foreign rules. If stopped intent could not
+  be saved, running intent may still be in force. Fix the write failure and
+  retry `stop` before reconciling.
   Selection does not gate quiescence; capture runs afterward and verifies a
   complete archive when selected data exist. An archive failure **after**
   quiescing leaves writers stopped; a failed or interrupted quiescence is not
@@ -102,11 +106,19 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   `evidence_problems` in `backup-status`, correct the cause, and retry `stop` for
   a verified archive of the affected instance. A shutdown backup of another
   instance, a daily or manual archive, or hold release does not clear it. If the
-  affected instance is unidentified, preserve the evidence for local inspection;
-  an unrelated capture cannot automatically resolve it. For selection loss see
-  [operations](operations.md#common-troubleshooting). Preserve unreadable records
-  and prior archives.
+  affected instance is unidentified (`instance: null`), a reselect and verified
+  `stop` can recover current data but cannot retire that entry. No supported
+  in-place command attributes or clears it; protection remains false. Preserve
+  the old state, evidence and archives. Review the case with the owner; if a new
+  installation is needed, follow [isolated fresh-state recovery](#recovery-on-this-or-a-clean-host)
+  using a trusted verified archive, without adopting the old jobs or records.
+  Never edit the ledger to get a green check. For selection loss see
+  [operations](operations.md#common-troubleshooting).
 - After failure inspect `status`, `backup-status`, stderr and private records.
+  A path-metadata limit refusal is not a partial backup: native export stops
+  before staging the over-budget member and preserves previous archives. The
+  limit is cumulative path bookkeeping, not a cap on archive payload bytes.
+  Review the data layout with the owner rather than excluding instance files.
   Never discard a good archive, promote `.rss-export-*`/`.rss-backup-*` remnants,
   or remove locks or maintenance records to force a retry. Hidden remnants may
   contain complete secrets. If publishing may have succeeded but evidence was not
@@ -130,13 +142,15 @@ uv run --locked rss backup-status
 
 Reconciliation authenticates the hold against the ownership receipt even when
 runtime files are missing. It requires proof that writers and owned forwarding
-are already stopped; it does not stop or restart anything, repair runtime files,
+are already stopped. For an explicit-stop hold, stopped intent must also be
+recorded; if it is not, correct the problem and retry `stop`. Reconciliation does
+not stop or restart anything, repair runtime files,
 or clear outstanding shutdown evidence. Once the hold is released, use `setup`
 with the matching pin if runtime files are missing. Inspect before activating.
 If reconciliation reports active resources, use guarded `stop` to quiesce before retrying;
-`stop` records stopped intent and leaves the hold for reconciliation. A later
-supervisor tick may honor an existing running intent after release, if that intent
-was retained. Stop on a busy lease, uncertain forwarding or invalid record and
+`stop` records stopped intent before releasing or reconciling the hold. For a
+**backup** hold, a later supervisor tick may honor a retained running intent
+once the hold is released. Stop on a busy lease, uncertain forwarding or invalid record and
 inspect locally. Do not edit journals, kill unidentified processes or force-clear
 a hold.
 
@@ -150,10 +164,8 @@ only when it is the intended production destination; disposable checks need
 separate storage. After approval, with those selectors exported:
 
 ```sh
-uv run --locked rss backup-enable --hour 3 --minute 0
-uv run --locked rss backup-status --check
-# Opt out independently, preserving archives and evidence:
-uv run --locked rss backup-disable
+uv run --locked rss backup-enable --hour 3 --minute 0 &&
+  uv run --locked rss backup-status
 ```
 
 Default policy is **03:00 UTC daily**, adjustable with `--hour`/`--minute`.
@@ -174,7 +186,17 @@ not overwritten. Follow
 for changes. Recapture starts a new `registration_id`, even with identical
 settings. Wait for a successful `daily_attempt` with that ID after `registered_at`
 and verify `daily_archive_available`; an earlier registration's evidence is
-retained but does not count.
+retained but does not count. After eligible daily work has run, check protection:
+
+```sh
+uv run --locked rss backup-status --check
+```
+
+To opt out later, independently of supervision and without deleting archives or evidence:
+
+```sh
+uv run --locked rss backup-disable
+```
 
 ### Daily check and failure response
 
@@ -187,9 +209,12 @@ or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
 and protection is false. Evidence records are read independently: for example, an
 unreadable attempt appears as `latest_attempt: null` with its record named in
 `evidence_problems`; a separately readable verified archive remains visible.
-If the archive destination becomes inaccessible, status still reports the
-readable evidence and an `archive_problems` diagnostic; an uninspectable archive
-cannot count as available. Do not hand-edit records to restore a green check. Daily protection needs successful eligible daily work for
+If the archive or destination becomes inaccessible, status still reports readable
+records and an `archive_problems` diagnostic; a file that cannot be opened for
+reading cannot count as available. A damaged daily record stops scheduled work
+before it consumes a retry or quiesces writers; preserve it and have the owner
+review the evidence. Do not hand-edit records to restore a green check. Daily
+protection needs successful eligible daily work for
 the current registration and selected instance, availability of **that scheduled
 archive**, and no unresolved failure, shutdown, or hold. `archive_available` and `latest_success`
 can instead describe a newer manual or shutdown archive; neither can mask a

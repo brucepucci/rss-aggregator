@@ -295,10 +295,16 @@ class Recovery:
             raise self.failure("Selected instance data are absent.")
         return data
 
-    def _read_generation(self, data: Path) -> str | None:
-        """Read a private generation record next to already validated instance data."""
+    def _read_generation(
+        self, data: Path, *, require_record: bool = False
+    ) -> str | None:
+        """Read private generation evidence; never infer absence for upgrade."""
         path = data.parent / _WRITER_GENERATION
         if not os.path.lexists(path):
+            if require_record:
+                raise self.failure(
+                    "Writer generation record is missing; cannot authorize upgrade from the shutdown archive. Preserve the instance and inspect locally."
+                )
             return None
         try:
             self._private(path, directory=False)
@@ -306,7 +312,7 @@ class Recovery:
             if not isinstance(record, dict) or record.keys() != {"writer_generation"}:
                 raise ValueError
             generation = record["writer_generation"]
-            if (
+            if generation is not None and (
                 not isinstance(generation, str)
                 or uuid.UUID(generation, version=4).hex != generation
             ):
@@ -325,9 +331,11 @@ class Recovery:
             data.parent / _WRITER_GENERATION, {"writer_generation": uuid.uuid4().hex}
         )
 
-    def writer_generation(self) -> str | None:
-        """Return the selected generation, or None for complete data with no record."""
-        return self._read_generation(self._selected_data())
+    def writer_generation(self, *, require_record: bool = False) -> str | None:
+        """Return the selected generation, optionally distinguishing absence from null."""
+        return self._read_generation(
+            self._selected_data(), require_record=require_record
+        )
 
     def _publish(
         self,
@@ -369,6 +377,9 @@ class Recovery:
                 json.dump(record, output, allow_nan=False)
                 output.flush()
                 os.fsync(output.fileno())
+            # An explicit null is evidence that this instance has never begun a
+            # writer generation; a lost record cannot supply that evidence.
+            native_service.save(stage / _WRITER_GENERATION, {"writer_generation": None})
             sync_directory(stage)
             try:
                 _rename_exclusive(stage, target)

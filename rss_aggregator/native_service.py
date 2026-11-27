@@ -1,9 +1,10 @@
-"""Run the native web and fetch writers under one inherited kernel lease."""
+"""Supervise native web and feed writers with inherited kernel leases."""
 
 import fcntl
 import json
 import os
 import re
+import select
 import stat
 import subprocess
 import sys
@@ -18,6 +19,9 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 PERIOD = 20 * 60
 FETCH_TIMEOUT = 600
+FETCH_TIMED_OUT = 2
+_FETCH_DRAIN_GRACE = 120
+_FETCH_TERM_GRACE = 10
 INI = """\
 session.upload_progress.enabled = Off
 expose_php = Off
@@ -224,20 +228,83 @@ def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+def _caretaker(
+    mode: str, *args: str, fds: tuple[int, ...]
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start a detached writer parent and return the caller's sole pipe write end."""
+    listening, owner = os.pipe()
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-I", "-B", str(Path(__file__).resolve()), mode, *args],
+            stdin=listening,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=fds,
+            start_new_session=True,
+        ), owner
+    except BaseException:
+        os.close(owner)
+        raise
+    finally:
+        os.close(listening)
+
+
+def _owner_gone(timeout: float) -> bool:
+    """Wait for EOF on the private stdin pipe, on which the caller never writes."""
+    return bool(select.select([0], [], [], timeout)[0])
+
+
+def _watch_web(state: Path, nonce: str, instance: str, writer_fd: int) -> None:
+    """Close this generation's gate and reap its web writer when the controller exits."""
+    home = state / "service"
+    config = home / ("Caddyfile-" + nonce)
+    web = None
+    try:
+        if _owner_gone(0):
+            return
+        web = subprocess.Popen(
+            [
+                str(state / "runtime/frankenphp"),
+                "run",
+                "--config",
+                str(config),
+                "--adapter",
+                "caddyfile",
+            ],
+            cwd=state / "runtime/FreshRSS",
+            env=environment(state, state / "instances" / instance / "data"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(writer_fd,),
+        )
+        while web.poll() is None and not _owner_gone(0.25):
+            pass
+    finally:
+        try:
+            acknowledgement_path(home, nonce).unlink(missing_ok=True)
+        finally:
+            if web is not None and web.poll() is None:
+                try:
+                    web.terminate()
+                    web.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    _kill_and_reap(web)
+        config.unlink(missing_ok=True)
+        approval_path(home, nonce).unlink(missing_ok=True)
+
+
 def _drain(
     web: subprocess.Popen[bytes] | None,
     fetch: subprocess.Popen[bytes] | None,
     fetch_deadline: float,
 ) -> str | None:
-    """Drain both writers without pausing the fetch deadline during web shutdown."""
+    """Await the web caretaker and drain fetching without pausing its deadline."""
     now = time.monotonic()
-    web_stop_at = now + 30
-    fetch_term_at = now + 120
-    fetch_stop_at = min(fetch_term_at + 10, fetch_deadline)
+    fetch_term_at = now + _FETCH_DRAIN_GRACE
+    fetch_stop_at = min(fetch_term_at + _FETCH_TERM_GRACE, fetch_deadline)
     fetch_term_sent = False
     last_fetch = None
-    if web is not None and web.poll() is None:
-        web.terminate()
     while web is not None or fetch is not None:
         now = time.monotonic()
         if fetch is not None:
@@ -251,12 +318,8 @@ def _drain(
             elif now >= fetch_term_at and not fetch_term_sent:
                 fetch.terminate()
                 fetch_term_sent = True
-        if web is not None:
-            if web.poll() is not None:
-                web = None
-            elif now >= web_stop_at:
-                _kill_and_reap(web)
-                web = None
+        if web is not None and web.poll() is not None:
+            web = None
         if web is not None or fetch is not None:
             time.sleep(0.25)
     return last_fetch
@@ -277,6 +340,52 @@ def _fetch(
     )
 
 
+def foreground_fetch(state: Path, data: Path, fetch_fd: int, timeout: int) -> int:
+    """Await a detached fetch caretaker without giving it the caller's command lock."""
+    deadline = time.monotonic() + timeout
+    fetch, owner = _caretaker(
+        "fetch", str(state), str(data), str(fetch_fd), str(deadline), fds=(fetch_fd,)
+    )
+    try:
+        return fetch.wait()
+    finally:
+        os.close(owner)
+
+
+def _watch_fetch(state: Path, data: Path, fetch_fd: int, deadline: float) -> int:
+    """Enforce the original deadline, also bounding the drain after caller loss."""
+    if time.monotonic() >= deadline:
+        return FETCH_TIMED_OUT
+    if _owner_gone(0):
+        return 1
+    fetch = _fetch(
+        state / "runtime/frankenphp",
+        state / "runtime/FreshRSS",
+        environment(state, data),
+        fetch_fd,
+    )
+    orphan_term_at = None
+    terminated = False
+    try:
+        while (code := fetch.poll()) is None:
+            now = time.monotonic()
+            if now >= deadline:
+                return FETCH_TIMED_OUT
+            if orphan_term_at is None:
+                if _owner_gone(min(0.25, deadline - now)):
+                    orphan_term_at = time.monotonic() + _FETCH_DRAIN_GRACE
+                    deadline = min(deadline, orphan_term_at + _FETCH_TERM_GRACE)
+            else:
+                if now >= orphan_term_at and not terminated:
+                    fetch.terminate()
+                    terminated = True
+                time.sleep(min(0.25, deadline - now))
+        return int(code != 0)
+    finally:
+        if fetch.poll() is None:
+            _kill_and_reap(fetch)
+
+
 def _scheduled(now: float, last_slot: int) -> int | None:
     """Return a newly due UTC slot, skipping missed slots rather than replaying."""
     slot = int(now) // PERIOD
@@ -284,7 +393,7 @@ def _scheduled(now: float, last_slot: int) -> int | None:
 
 
 def serve(state: Path, writer_fd: int) -> None:
-    """Run and monitor child writers; the inherited lease survives either parent."""
+    """Control the web generation and run its scheduled feed fetch children."""
     plan = read(state / "service.json")
     if not plan or not re.fullmatch(r"[a-f0-9]{32}", plan["nonce"]):
         raise ValueError("Native service generation changed before startup.")
@@ -305,6 +414,7 @@ def serve(state: Path, writer_fd: int) -> None:
         "last_fetch": None,
     }
     web = fetch = None
+    web_owner = None
     fetch_deadline = 0.0
     stopping = False
     approved = False
@@ -313,14 +423,8 @@ def serve(state: Path, writer_fd: int) -> None:
     try:
         with config.open("x") as stream:
             stream.write(_caddyfile(plan))
-        web = subprocess.Popen(
-            [str(binary), "run", "--config", str(config), "--adapter", "caddyfile"],
-            cwd=source,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            pass_fds=(writer_fd,),
+        web, web_owner = _caretaker(
+            "web", str(state), nonce, plan["instance"], str(writer_fd), fds=(writer_fd,)
         )
         save(receipt, {**status, "web": "started", "scheduler": "running"})
         while web.poll() is None:
@@ -362,6 +466,8 @@ def serve(state: Path, writer_fd: int) -> None:
         try:
             acknowledgement.unlink(missing_ok=True)
         finally:
+            if web_owner is not None:
+                os.close(web_owner)
             if (outcome := _drain(web, fetch, fetch_deadline)) is not None:
                 status["last_fetch"] = outcome
         config.unlink(missing_ok=True)
@@ -378,8 +484,20 @@ def serve(state: Path, writer_fd: int) -> None:
 
 if __name__ == "__main__":
     os.umask(0o077)
-    try:
-        serve(Path(sys.argv[1]), int(sys.argv[2]))
-    finally:
-        # Controller-only lease; never inherited by children.
-        os.close(int(sys.argv[3]))
+    if sys.argv[1] == "web":
+        _watch_web(Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]))
+    elif sys.argv[1] == "fetch":
+        sys.exit(
+            _watch_fetch(
+                Path(sys.argv[2]),
+                Path(sys.argv[3]),
+                int(sys.argv[4]),
+                float(sys.argv[5]),
+            )
+        )
+    else:
+        try:
+            serve(Path(sys.argv[1]), int(sys.argv[2]))
+        finally:
+            # Controller-only lease; never inherited by children.
+            os.close(int(sys.argv[3]))

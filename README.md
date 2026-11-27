@@ -110,7 +110,7 @@ return nonzero. A successful status query alone does not establish health.
 | `start` / `verify` | Start and record running intent, or restart/recheck an already running service without changing intent. |
 | `status` / `fetch` | Inspect the selected instance, listener and scheduler, or fetch publisher feeds now subject to cache/backoff. |
 | `stop` / `backup` | Stop writers and verify a shutdown backup, or back up and attempt to resume the prior serving mode. |
-| `backup-status --check` | Check eligible daily protection, archive freshness, unresolved shutdowns, maintenance and resumption. |
+| `backup-status --check` | Check eligible daily protection, archive readability and freshness, unresolved shutdowns, maintenance and resumption. |
 | `supervision-status` | Inspect optional recovery, intent and failures. |
 | `api-check` | Prompt locally for separate API credentials and diagnose private HTTPS/API. |
 | `restore ARCHIVE --instance NAME` / `select-instance NAME` | Restore into a fresh named target, then explicitly select while stopped. |
@@ -141,7 +141,8 @@ See the [full configuration reference](docs/configuration.md).
   explicit `backup` can have resumed service; shutdown export failure after
   quiescing leaves writers stopped. An older verified archive does not clear a
   failed or interrupted shutdown; inspect `backup-status` and retry `stop` after
-  correcting the problem. [Failure behavior](docs/backup-restore.md#consistency-and-failure-behavior).
+  correcting the problem. If the affected instance is unknown, preserve the
+  evidence and follow the [recovery guidance](docs/backup-restore.md#consistency-and-failure-behavior).
 - **Lost instance selection:** do not start or back up a substitute instance.
   Use [operator troubleshooting](docs/operations.md#common-troubleshooting) to
   confirm and reselect the intended data while stopped.

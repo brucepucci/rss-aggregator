@@ -18,12 +18,7 @@ from typing import Any, Literal
 from rss_aggregator import native_service as service
 from rss_aggregator.backup_schedule import BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
-from rss_aggregator.recovery import (
-    SHUTDOWN_SUCCESS,
-    Recovery,
-    same_data_identity,
-    selected_instance,
-)
+from rss_aggregator.recovery import Recovery, same_data_identity, selected_instance
 from rss_aggregator.supervision import Supervision
 
 Operation = Literal[
@@ -131,7 +126,7 @@ class Runtime:
             "api-check": lambda: self._api_check(
                 username, api_password, loopback=loopback
             ),
-            "start": self._start,
+            "start": lambda: self._start(explicit=True),
             "status": self._status,
             "fetch": self._fetch,
             "verify": self._verify,
@@ -170,8 +165,6 @@ class Runtime:
                     raise RuntimeFailure(
                         "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
                     )
-                if operation == "start":
-                    supervision.set_intent("running")
                 return handlers[operation]()
             finally:
                 self._command_lock_fd = None
@@ -233,7 +226,7 @@ class Runtime:
         inherit_lock: bool = True,
         timeout: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run host tooling, opting read-only Tailscale helpers out of command locking."""
+        """Run host tooling with optional deadlines and command-lease inheritance."""
         try:
             result = subprocess.run(
                 args,
@@ -302,14 +295,18 @@ class Runtime:
         return port
 
     def _idle(self) -> bool:
-        """Prove the service controller and all inherited writer children are gone."""
+        """Prove neither a web generation nor a separately supervised fetch can write."""
         with service.lease(self.state_dir / "writers.lock") as writer:
-            return writer is not None
+            if writer is None:
+                return False
+            with service.lease(self.state_dir / "fetch.lock") as fetch:
+                return fetch is not None
 
     def _live(self) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """Read the current generation only with a held writer lease and matching evidence."""
-        if self._idle():
-            return None
+        with service.lease(self.state_dir / "writers.lock") as writer:
+            if writer is not None:
+                return None
         with service.lease(self.state_dir / "controller.lock") as controller:
             if controller is not None:
                 return None
@@ -325,15 +322,19 @@ class Runtime:
         return None
 
     def _stop_writers(self) -> None:
-        """Request stop for this generation; success requires the kernel lease to release."""
+        """Request web generation stop and prove that all writer leases release."""
         if self._idle():
             return
-        plan = service.read(self.state_dir / "service.json")
-        if not plan:
-            raise RuntimeFailure(
-                "Unidentified native writer lease; inspect the instance locally."
-            )
-        self._save("stop-service.json", {"nonce": plan["nonce"]})
+        with service.lease(self.state_dir / "writers.lock") as writer:
+            if writer is None:
+                plan = service.read(self.state_dir / "service.json")
+                if not plan:
+                    raise RuntimeFailure(
+                        "Unidentified native writer lease; inspect the instance locally."
+                    )
+                self._save("stop-service.json", {"nonce": plan["nonce"]})
+        # Orphaned foreground fetches drain independently; a startup fetch may
+        # have acquired only fetch.lock, before any web generation exists.
         deadline = time.monotonic() + 165
         while time.monotonic() < deadline:
             if self._idle():
@@ -693,9 +694,12 @@ class Runtime:
         port_override: int | None = None,
         recheck: bool = False,
         check_private_backend: bool = False,
+        explicit: bool = False,
     ) -> dict[str, Any]:
-        """Start or recheck owned serving, failing closed before enabling private forwarding."""
+        """Start owned serving, changing intent only for a validated explicit start."""
         owner, _ = self._owned()
+        if explicit:
+            Supervision(self).set_intent("running")
         port = self._port() if port_override is None else port_override
         access = PrivateAccess(self)
         private = access.enabled() if private_https is None else private_https
@@ -840,9 +844,15 @@ class Runtime:
     def _status(self) -> dict[str, Any]:
         """Report installed pin, selected data, writer readiness and private forwarding."""
         if not os.path.lexists(self.state_dir / "runtime"):
+            # Inspection of an unused root must not manufacture writer evidence.
+            leases_present = any(
+                os.path.lexists(self.state_dir / name)
+                for name in ("writers.lock", "fetch.lock")
+            )
+            idle = not leases_present or self._idle()
             return {
                 "runtime": "absent",
-                "application": "stopped" if self._idle() else "unconfirmed",
+                "application": "stopped" if idle else "unconfirmed",
                 "http_ready": False,
             }
         owner, _ = self._owned(require_current=False, verify=False)
@@ -873,7 +883,26 @@ class Runtime:
 
     def _actualize(self) -> dict[str, Any]:
         """Run the upstream fetcher without bypassing TTL, backoff or cache."""
-        self._php("app/actualize_script.php", timeout_seconds=service.FETCH_TIMEOUT)
+        timeout = service.FETCH_TIMEOUT
+        with service.lease(self.state_dir / "fetch.lock") as fetch:
+            if fetch is None:
+                raise RuntimeFailure(
+                    "A feed fetch is already in progress; retry after it completes."
+                )
+            try:
+                code = service.foreground_fetch(
+                    self.state_dir, self.data_dir, fetch, timeout
+                )
+            except OSError:
+                code = 1
+        if code == service.FETCH_TIMED_OUT:
+            raise RuntimeFailure(
+                f"FreshRSS PHP operation timed out after {timeout} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
+            )
+        if code:
+            raise RuntimeFailure(
+                "FreshRSS PHP operation failed; inspect the instance locally (logs may contain secrets)."
+            )
         return {"status": "completed"}
 
     def _fetch(self) -> dict[str, Any]:
@@ -970,11 +999,13 @@ class Runtime:
         if operation == "uninstall":
             install.uninstall()
             return {"status": "uninstalled", "preserves_data_and_archives": True}
-        self._require_upgrade_backup(installed)
+        self._require_upgrade_backup(owner, installed)
         result = install.upgrade(expected_manifest=plan["reviewed_manifest"])
         return {"status": "installed", "manifest": result["manifest"]}
 
-    def _require_upgrade_backup(self, installed: dict[str, Any]) -> None:
+    def _require_upgrade_backup(
+        self, owner: dict[str, Any], installed: dict[str, Any]
+    ) -> None:
         """Limit upgrades to runtime-only and independently revalidate the last backup."""
         import tempfile
 
@@ -988,17 +1019,9 @@ class Runtime:
         recovery = Recovery(self)
         if recovery.pristine():
             return
-        generation = recovery.writer_generation()
-        success = service.read(self.state_dir / SHUTDOWN_SUCCESS)
-        if (
-            not isinstance(success, dict)
-            or success.get("instance") != self.instance
-            or "writer_generation" not in success
-            or success["writer_generation"] != generation
-        ):
-            raise RuntimeFailure(
-                "A verified shutdown archive covering the selected instance's last writer generation is required; fix the backup and retry rss stop."
-            )
+        success = BackupSchedule(self).require_upgrade_shutdown(
+            owner, self.instance, recovery.writer_generation(require_record=True)
+        )
         archive = Path(success["archive"])
         digest = hashlib.sha256()
         with archive.open("rb") as candidate:

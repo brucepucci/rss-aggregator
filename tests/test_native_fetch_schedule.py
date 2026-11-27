@@ -2,7 +2,9 @@
 
 import fcntl
 import json
+import os
 import runpy
+import select
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -13,21 +15,21 @@ import pytest
 
 from rss_aggregator.native_install import manifest_identity
 from rss_aggregator.native_service import lease
+from tests.test_native_install import CHECKOUT_IMPORT
 from tests.test_native_process_lifetime import _exited, _wait_for, process_checkout
 
 scheduled_checkout = process_checkout
 NONCE = "a" * 32
 
-TIMEOUT_CONTROLLER = """
+TIMEOUT_CONTROLLER = (
+    CHECKOUT_IMPORT
+    + """
 import json
 import runpy
 import subprocess
-import sys
 import time
-from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path.cwd()))
 control = Path(sys.argv[1]) / 'service'
 clock = (0, 0)
 ack = None
@@ -39,13 +41,6 @@ class Process(subprocess.Popen):
         if args[1] == 'php-cli':
             with (control / 'scheduled-pids').open('a') as history:
                 print(self.pid, file=history)
-
-    def terminate(self):
-        if self.args[1] == 'run' and (control / 'hold-web').exists():
-            # Model a web child draining requests and not yet ready to exit.
-            (control / 'web-draining').touch()
-        else:
-            super().terminate()
 
 
 def sleep(_):
@@ -67,6 +62,7 @@ with (
 ):
     runpy.run_module('rss_aggregator.native_service', run_name='__main__', alter_sys=True)
 """
+)
 
 
 def test_native_controller_fetches_once_in_an_eligible_utc_slot(tmp_path):
@@ -134,11 +130,13 @@ def drive_controller(state):
             # The entrypoint also uses Popen in its runtime type annotations.
             return cls
 
-        def __init__(self, args, **_):
-            assert Path(args[0]) == state / "runtime/frankenphp"
-            if args[1] == "run":
+        def __init__(self, args, *, stdin, **_):
+            if args[1:3] == ["-I", "-B"]:
+                assert args[4] == "web"
+                self.parent = os.dup(stdin)
                 self.returncode = None
             else:
+                assert Path(args[0]) == state / "runtime/frankenphp"
                 assert args[1:] == ["php-cli", "app/actualize_script.php"]
                 print(
                     datetime.fromtimestamp(
@@ -148,10 +146,10 @@ def drive_controller(state):
                 self.returncode = 0
 
         def poll(self):
+            if self.returncode is None and select.select([self.parent], [], [], 0)[0]:
+                os.close(self.parent)
+                self.returncode = 0
             return self.returncode
-
-        def terminate(self):
-            self.returncode = -15
 
     with (
         patch("time.time", lambda: first_poll + elapsed),
