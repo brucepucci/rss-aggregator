@@ -1,9 +1,11 @@
 """Guarded Apple Silicon FreshRSS lifecycle, independent of Click."""
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -11,15 +13,19 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from rss_aggregator import native_service as service
-from rss_aggregator.backup_schedule import BackupSchedule
+from rss_aggregator.backup_schedule import SCHEDULE, BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
 from rss_aggregator.recovery import Recovery, same_data_identity, selected_instance
-from rss_aggregator.supervision import Supervision
+from rss_aggregator.supervision import JOB_INSPECTION_TIMEOUT, REGISTRATION, Supervision
+
+BACKEND_CHECKS = "private-backends.json"
 
 Operation = Literal[
     "setup",
@@ -139,14 +145,12 @@ class Runtime:
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
         self._state_guard()
-        if operation == "setup":
-            install.preflight_setup()
-        with service.lease(self.state_dir / "command.lock") as lock:
+        with self._command_lease() as lock:
             if lock is None:
                 if operation == "backup-status":
                     return backups.status(busy=True)
                 if operation == "backup-due":
-                    backups.deferred()
+                    self._record_backup_contention(backups)
                 raise RuntimeFailure(
                     "Another project command is running; wait for it to finish."
                 )
@@ -168,6 +172,64 @@ class Runtime:
                 return handlers[operation]()
             finally:
                 self._command_lock_fd = None
+
+    @contextmanager
+    def _command_lease(self) -> Iterator[int | None]:
+        """Serialize the entire command on the stable private state directory inode."""
+        fd = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                locked = False
+            info = os.fstat(fd)
+            if (
+                info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+                or not os.path.samestat(info, self.state_dir.lstat())
+            ):
+                raise RuntimeFailure(
+                    "Private state directory changed; inspect locally."
+                )
+            if not locked:
+                yield None
+                return
+
+            # Honor file contention when present, but don't rely on this
+            # replaceable pathname. Mixing checkouts that use different lock
+            # protocols for one state directory is unsupported.
+            path = self.state_dir / "command.lock"
+            try:
+                legacy = path.lstat()
+            except FileNotFoundError:
+                if any(self.state_dir.iterdir()):
+                    yield fd  # Never recreate a missing lock file in established state.
+                    return
+                expected = None
+            else:
+                expected = (legacy.st_dev, legacy.st_ino)
+            with service.lease(path, expected=expected) as compatibility:
+                yield fd if compatibility is not None else None
+        finally:
+            os.close(fd)  # Descendants may still own the inherited flock.
+
+    def _record_backup_contention(self, backups: BackupSchedule) -> None:
+        """Record contention only for an independently enabled and owned job."""
+        try:
+            config = backups._config()
+            if (
+                config
+                and config.get("registration_id")
+                and backups._job_matches(config)
+                and backups._job.loaded(config)
+                and backups._config() == config
+            ):
+                backups.deferred()
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # Contention remains the failure; uncertain registration is not authority
+            # to write or repair evidence outside the command lock.
+            pass
 
     def _state_guard(self) -> None:
         """Refuse legacy, public, foreign, synced-default or network state."""
@@ -345,15 +407,8 @@ class Runtime:
             return plan, receipt
         return None
 
-    def _draining_writer_plan(self) -> dict[str, Any] | None:
-        """Observe generation evidence from a held web lease without proving readiness."""
-        try:
-            leases = service.WriterLeases(self.state_dir)
-            with leases.hold("writers.lock") as writer:
-                if writer is not None:
-                    return None
-        except (OSError, ValueError):
-            return None
+    def _web_writer_plan(self) -> dict[str, Any] | None:
+        """Read matching web-controller records after observing its writer lease."""
         plan = service.read(self.state_dir / "service.json")
         receipt = service.read(self.state_dir / "service-status.json")
         if (
@@ -367,9 +422,67 @@ class Runtime:
             return plan
         return None
 
+    def _draining_writer_plan(self) -> dict[str, Any] | None:
+        """Observe a held web or startup PHP attribution without proving readiness."""
+        try:
+            leases = service.WriterLeases(self.state_dir, names=("writers.lock",))
+            with leases.hold("writers.lock") as writer:
+                if writer is None:
+                    return self._web_writer_plan()
+                leases = service.WriterLeases(self.state_dir)
+                with (
+                    leases.hold("controller.lock") as controller,
+                    leases.hold("fetch.lock") as fetch,
+                ):
+                    if controller is not None and fetch is None:
+                        return service.draining_startup_writer(self.state_dir)
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _stop_independent_web(self) -> None:
+        """Close an identified controller without trusting the standalone PHP lease."""
+        try:
+            leases = service.WriterLeases(
+                self.state_dir, names=("writers.lock", "controller.lock")
+            )
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is not None or controller is not None:
+                    return
+            plan = self._web_writer_plan()
+            owner, installed = self._ownership_receipt()
+            if plan is None or plan.get("owner") != owner["token"]:
+                return
+            generation = Recovery(self).shutdown_generation(
+                plan["instance"], owner, installed, require_record=True
+            )
+            if generation is None or generation != plan.get("writer_generation"):
+                return
+            self._save("stop-service.json", {"nonce": plan["nonce"]})
+            deadline = time.monotonic() + 165
+            while time.monotonic() < deadline:
+                with (
+                    leases.hold("writers.lock") as writer,
+                    leases.hold("controller.lock") as controller,
+                ):
+                    if writer is not None and controller is not None:
+                        return
+                time.sleep(0.2)
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # Independent shutdown is best-effort; the failed writer-state
+            # check still prevents snapshot, restart or other writer mutation.
+            pass
+
     def _stop_writers(self) -> None:
         """Request web generation stop and prove that all writer leases release."""
-        lease_state = self._writer_lease_state()
+        try:
+            lease_state = self._writer_lease_state()
+        except RuntimeFailure:
+            self._stop_independent_web()
+            raise
         if lease_state == "idle":
             return
         if lease_state == "web":
@@ -485,6 +598,26 @@ class Runtime:
                 return
             sync_directory(path.parent)
 
+    def _startup_writer(self) -> tuple[dict[str, str], Path]:
+        """Bind startup mutation to owned data and its already recorded generation."""
+        owner, installed = self._ownership_receipt()
+        instance = self.instance
+        generation = Recovery(self).shutdown_generation(
+            instance, owner, installed, require_record=True
+        )
+        if generation is None:
+            raise RuntimeFailure(
+                "Cannot run startup PHP without a recorded writer generation."
+            )
+        return (
+            {
+                "owner": owner["token"],
+                "instance": instance,
+                "writer_generation": generation,
+            },
+            self.state_dir / "instances" / instance / "data",
+        )
+
     def _php(
         self, *args: str, timeout_seconds: int = 120, capture_output: bool = False
     ) -> bytes:
@@ -494,29 +627,28 @@ class Runtime:
                 raise RuntimeFailure(
                     "A feed fetch is already in progress; retry after it completes."
                 )
+            identity, data = self._startup_writer()
             try:
-                if capture_output:
-                    # An unnamed file avoids blocking the caretaker if the caller exits.
-                    with tempfile.TemporaryFile() as output:
-                        code = service.foreground_php(
-                            self.state_dir,
-                            self.data_dir,
-                            operation_lock,
-                            timeout_seconds,
-                            args,
-                            output=output,
-                        )
-                        output.seek(0)
-                        payload = output.read(128 * 1024)
-                else:
+                # An unnamed file avoids blocking the caretaker on caller exit.
+                with (
+                    service.startup_writer_claim(self.state_dir, identity) as claim,
+                    (
+                        tempfile.TemporaryFile() if capture_output else nullcontext()
+                    ) as output,
+                ):
                     code = service.foreground_php(
                         self.state_dir,
-                        self.data_dir,
+                        data,
                         operation_lock,
                         timeout_seconds,
                         args,
+                        claim_fd=claim,
+                        output=output if output is not None else subprocess.DEVNULL,
                     )
                     payload = b""
+                    if output is not None:
+                        output.seek(0)
+                        payload = output.read(128 * 1024)
             except OSError:
                 code = 1
         if code == service.FETCH_TIMED_OUT:
@@ -756,6 +888,49 @@ class Runtime:
             # The guarded restart withdraws owned forwarding before opening writers.
             return None
 
+    def _recorded_backend_checks(self, owner: dict[str, Any]) -> set[int]:
+        """Read owned per-port inspection obligations, never publication authority."""
+        path = self.state_dir / BACKEND_CHECKS
+        record = service.read(path)
+        if record is None and not os.path.lexists(path):
+            return set()
+        if (
+            not isinstance(record, dict)
+            or type(record.get("version")) is not int
+            or record["version"] != 1
+            or record.get("owner") != owner["token"]
+            or not isinstance(record.get("ports"), list)
+            or any(
+                type(port) is not int or not 1024 <= port <= 65535
+                for port in record["ports"]
+            )
+        ):
+            raise RuntimeFailure(
+                "Private backend inspection record has invalid ownership or format; preserve it and inspect locally."
+            )
+        return set(record["ports"])
+
+    def _planned_private_backend(self, owner: dict[str, Any]) -> set[int]:
+        """Recognize the last owned guarded plan, including one without a live worker."""
+        plan = service.read(self.state_dir / "service.json")
+        if (
+            isinstance(plan, dict)
+            and plan.get("owner") == owner["token"]
+            and (
+                plan.get("private") is True or plan.get("check_private_backend") is True
+            )
+            and type(plan.get("port")) is int
+            and 1024 <= plan["port"] <= 65535
+        ):
+            return {plan["port"]}
+        return set()
+
+    def _requires_backend_check(self, owner: dict[str, Any], port: int) -> bool:
+        """Tell job capture whether a local backend needs its read-only dependency."""
+        return port in (
+            self._recorded_backend_checks(owner) | self._planned_private_backend(owner)
+        )
+
     def _start(
         self,
         *,
@@ -775,13 +950,11 @@ class Runtime:
         live = self._live()
         if live and not explicit:
             self._require_live_selection(live[0].get("instance"), self.instance)
-        # A live plan's obligation belongs to its backend, not to Serve authority.
-        if live and live[0].get("port") == port:
-            check_private_backend = (
-                check_private_backend
-                or live[0].get("private") is True
-                or live[0].get("check_private_backend") is True
-            )
+        # The obligation belongs to the owned loopback endpoint, whether or not
+        # its previous controller is still running. It does not opt into Serve.
+        recorded_checks = self._recorded_backend_checks(owner)
+        backend_checks = recorded_checks | self._planned_private_backend(owner)
+        check_private_backend = check_private_backend or port in backend_checks
         try:
             if private:
                 origin = access.prepare(owner, port)
@@ -805,6 +978,17 @@ class Runtime:
         if live is not None and live[0]["port"] != port:
             # A known occupied replacement must not disrupt the current service.
             self._check_port(port)
+        if private or check_private_backend:
+            backend_checks.add(port)
+        if backend_checks != recorded_checks:
+            self._save(
+                BACKEND_CHECKS,
+                {
+                    "version": 1,
+                    "owner": owner["token"],
+                    "ports": sorted(backend_checks),
+                },
+            )
         if live and not recheck:
             plan, receipt = live
             status = self._status()
@@ -852,7 +1036,7 @@ class Runtime:
             fetch = {"status": "installer_pending"}
             if installed:
                 self._configure(origin)
-                fetch = self._actualize()
+                fetch = self._actualize(startup=True)
             # Preparation and the upstream fetch can take minutes. Refresh the
             # forwarding check before binding, with ordinary requests still gated.
             if private:
@@ -975,18 +1159,25 @@ class Runtime:
                 "The live FreshRSS instance differs from the selected instance; run rss stop or explicitly start the intended instance."
             )
 
-    def _actualize(self) -> dict[str, Any]:
-        """Run the upstream fetcher without bypassing TTL, backoff or cache."""
+    def _actualize(self, *, startup: bool = False) -> dict[str, Any]:
+        """Run the upstream fetcher, attributing a fetch before web launch."""
         timeout = service.FETCH_TIMEOUT
         with service.WriterLeases(self.state_dir).hold("fetch.lock") as fetch:
             if fetch is None:
                 raise RuntimeFailure(
                     "A feed fetch is already in progress; retry after it completes."
                 )
+            if startup:
+                identity, data = self._startup_writer()
+                claim_context = service.startup_writer_claim(self.state_dir, identity)
+            else:
+                data = self.data_dir
+                claim_context = nullcontext()
             try:
-                code = service.foreground_fetch(
-                    self.state_dir, self.data_dir, fetch, timeout
-                )
+                with claim_context as claim:
+                    code = service.foreground_fetch(
+                        self.state_dir, data, fetch, timeout, claim_fd=claim
+                    )
             except OSError:
                 code = 1
         if code == service.FETCH_TIMED_OUT:
@@ -1063,13 +1254,7 @@ class Runtime:
             raise RuntimeFailure(
                 "Run rss stop first; runtime changes require stopped intent and idle writers."
             )
-        if any(
-            os.path.lexists(self.state_dir / name)
-            for name in ("supervision.json", "backup-schedule.json")
-        ):
-            raise RuntimeFailure(
-                "Remove owned supervision and disable daily backup before changing the runtime."
-            )
+        self._require_no_jobs()
         if PrivateAccess(self).status(owner)["status"] not in (
             "stopped",
             "unconfigured",
@@ -1101,6 +1286,35 @@ class Runtime:
         self._require_upgrade_backup(owner, installed)
         result = install.upgrade(expected_manifest=plan["reviewed_manifest"])
         return {"status": "installed", "manifest": result["manifest"]}
+
+    def _require_no_jobs(self) -> None:
+        """Prove both role-specific definitions and registrations are absent."""
+        jobs = (Supervision(self).job, BackupSchedule(self)._job)
+        if any(
+            os.path.lexists(self.state_dir / name) for name in (REGISTRATION, SCHEDULE)
+        ) or any(os.path.lexists(job.path) for job in jobs):
+            raise RuntimeFailure(
+                "Native job evidence remains; remove owned supervision and disable daily backup before changing the runtime. Inspect ambiguous jobs locally."
+            )
+        launchctl = shutil.which("launchctl")
+        if not launchctl or not Path(launchctl).is_absolute():
+            raise RuntimeFailure(
+                "Cannot prove native jobs are absent; launchctl is unavailable."
+            )
+        for probe in (jobs[0].domain, *(f"{job.domain}/{job.label}" for job in jobs)):
+            result = self._run(
+                launchctl,
+                "print",
+                probe,
+                check=False,
+                inherit_lock=False,
+                timeout=JOB_INSPECTION_TIMEOUT,
+            )
+            expected = (0,) if probe == jobs[0].domain else (3, 113)
+            if result.returncode not in expected:
+                raise RuntimeFailure(
+                    "Cannot prove native jobs are absent; inspect both job labels in the normal user session before changing the runtime."
+                )
 
     def _require_upgrade_backup(
         self, owner: dict[str, Any], installed: dict[str, Any]

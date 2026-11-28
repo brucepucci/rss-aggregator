@@ -37,7 +37,13 @@ permissions are refused rather than repaired. Keep an independent durable copy.
 # Example only; choose and approve your destination separately.
 export RSS_BACKUP_DIR="$HOME/FreshRSS-Backups"
 uv run --locked rss backup
-# Or take a verified backup and leave the instance stopped:
+```
+
+**Alternative: back up and stay stopped.** With the approved `RSS_BACKUP_DIR`
+set as above, run this **instead** if you intend to stop serving. It records
+stopped intent and withdraws owned forwarding.
+
+```sh
 uv run --locked rss stop
 ```
 
@@ -74,16 +80,17 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
 
 ## Consistency and failure behavior
 
-- Commands serialize; backup maintenance is durable across interruption. Owned
-  forwarding and all managed writers, including active web requests and in-flight
+- Commands serialize on the private state directory, not just the legacy
+  `command.lock` path; backup maintenance is durable across interruption. Never
+  move or replace the state directory while commands are active. Owned forwarding and all managed writers, including active web requests and in-flight
   feed fetching, must be quiesced before copying. Do not point external writers at
   managed SQLite data: the project's leases cannot control them.
 - Explicit `backup` preserves persisted intent and attempts to resume a previously
   running backend after a snapshot, including a failed snapshot when safe. It
   only republishes forwarding that it confirmed withdrawing; if the route already
   disappeared, it can resume on loopback only after rechecking that no Funnel
-  reaches the port of the previously private service. Subsequent automatic
-  backup resumptions retain this read-only check, not authority to publish.
+  reaches the port of the previously private service. Later startup and backup
+  resumptions on that port retain this read-only check, not authority to publish.
   If safety cannot be confirmed, writers stay stopped and the foreign route is
   preserved. Backup never resumes intentional stop. If selection and serving
   instance disagree, backup refuses before quiescence: it does not switch
@@ -95,15 +102,21 @@ The old v1 Podman image identity is not a native runtime pin; ordinary native
   quiescence, but attempts to close owned resources even if the write or route
   withdrawal fails. If runtime ownership cannot be verified, `stop` still
   replaces valid running intent with stopped intent but refuses to touch
-  unidentified writers or forwarding. Established state keeps a shutdown
-  failure even after the receipt returns. Restore the original receipt and
-  retry `stop`; simply restoring the receipt does not prove shutdown or capture.
+  unidentified writers or forwarding. In established state, the first durable
+  receipt-loss shutdown record revokes the prior automatic restart authorization
+  even if the separate stopped-intent write is interrupted. Restore the original
+  receipt and retry `stop`; its return alone does not prove shutdown or capture
+  or restore that authorization. A deliberate new `start` can supersede the veto
+  when normal startup guards allow it; it does not erase the shutdown failure.
   Forwarding discovery is bounded; discovery failure leaves forwarding
   unconfirmed, not permission to alter foreign rules. If stopped intent could not
-  be saved, running intent may still be in force. Fix the write failure and
-  retry `stop` before reconciling.
+  be saved, status can still show recorded running intent. Do not assume either
+  shutdown or a durable veto succeeded; inspect the evidence, fix the write
+  failure and retry `stop` before reconciling.
   Selection does not gate quiescence. A matching owned generation and instance
-  can identify the affected data while a former controller's web child drains.
+  can identify the affected data while a writer drains. If the standalone fetch
+  lease is damaged, `stop` can still ask an independently identified web controller
+  to close, but full writer state stays unconfirmed and capture is refused.
   Capture only runs after writer exit is proved; an already idle stop can create
   another full ZIP. An archive failure **after** quiescing leaves writers stopped;
   a failed or interrupted quiescence is not
@@ -148,7 +161,8 @@ uv run --locked rss backup-status
 Reconciliation authenticates the hold against the ownership receipt even when
 runtime files are missing. It requires proof that writers and owned forwarding
 are already stopped. Stopped intent must also be recorded for an explicit-stop
-hold or when a later stop request superseded the backup's intent. If that intent
+hold or when a later stop request superseded the backup's intent, including a
+receipt-loss stop that revoked the active restart authorization. If that intent
 is not durable, correct the problem and retry `stop`. Reconciliation does
 not stop or restart anything, repair runtime files,
 or clear outstanding shutdown evidence. Once the hold is released, use `setup`
@@ -177,8 +191,8 @@ uv run --locked rss backup-enable --hour 3 --minute 0 &&
 Default policy is **03:00 UTC daily**, adjustable with `--hour`/`--minute`.
 Launchd requests checks at load and every 15 minutes while the session and host
 are available. Eligible failures retry after at least 15 minutes, at most three
-attempts for a UTC slot per instance and registration; contention is a defer,
-not success or a spent attempt. Wakeup considers only the most recent elapsed
+attempts for a UTC slot per instance and registration. Contention on an
+established owned schedule is a defer, not success or a spent attempt. Wakeup considers only the most recent elapsed
 slot since registration, including one on the preceding UTC date if the wake
 crosses midnight. Selecting another instance and returning does not reset a
 completed slot or retry budget. Clock rollback does not replay earlier slots. No wake-from-sleep, pre-login
@@ -205,6 +219,11 @@ To opt out later, independently of supervision and without deleting archives or 
 uv run --locked rss backup-disable
 ```
 
+Even an unchanged owned job stays registered if valid daily evidence conflicts
+with the current registration's policy. `backup-disable` exits nonzero; preserve
+both the registration and daily records, inspect `backup-status` with the owner,
+and do not proceed with changes that require the job to be retired.
+
 ### Daily check and failure response
 
 `backup-status --check` emits status and returns nonzero unless `protected` is
@@ -212,9 +231,12 @@ true. Ordinary `backup-status` is inspection, not an assurance of protection.
 Check registration, `scheduler_problem`, due/missed/deferred work, latest attempt
 and verified publication, archive availability, age/overdue, `resumption` and
 `maintenance_required`. Treat `resumption` as an attempt's outcome, not proof
-of a current hold or restart. A damaged runtime layout does not erase readable
-archive or attempt evidence; `scheduler_problem` identifies the unhealthy configuration
-and protection is false. Evidence records are read independently: for example, an
+of a current hold or restart. An unfinished daily reservation is reported as
+`interrupted` when no command is active; this does not edit the record or refund
+an attempt. Missing or changed writer leases or a damaged runtime layout do not
+erase readable archive or attempt evidence; `scheduler_problem` identifies the
+unhealthy prerequisite and protection is false. A writer lease held by ordinary
+serving is not a fault. Evidence records are read independently: for example, an
 unreadable attempt appears as `latest_attempt: null` with its record named in
 `evidence_problems`; a separately readable verified archive remains visible.
 If the archive or destination becomes inaccessible, status still reports readable

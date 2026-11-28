@@ -251,7 +251,13 @@ class ProcessCheckout(Checkout):
 @pytest.fixture
 def process_checkout(tmp_path):
     checkout = ProcessCheckout(tmp_path.resolve())
-    checkout.environment.pop("PYTHONHOME", None)
+    # The shebang interpreter runs before the shim sees the CLI's -I/-B
+    # arguments. Isolate the disposable launcher and its fake tools alike.
+    checkout.environment = {
+        key: value
+        for key, value in checkout.environment.items()
+        if not key.startswith("PYTHON")
+    }
     checkout.environment.update(RSS_PORT="18080", PYTHONDONTWRITEBYTECODE="1")
     checkout.prepare_source()
     (checkout.root / "config/security-probe.php").write_bytes(
@@ -278,6 +284,17 @@ def process_checkout(tmp_path):
     _success(checkout, "select-instance", "reader")
     Path(archive["archive"]).unlink()
     return checkout
+
+
+def test_process_launcher_ignores_ambient_python_options(monkeypatch, request):
+    monkeypatch.setenv("PYTHONWARNDEFAULTENCODING", "1")
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    # Create the fixture only after setting the options inherited by its shim.
+    checkout = request.getfixturevalue("process_checkout")
+    observed = checkout.run("status")
+    assert observed.returncode == 0, observed.stderr
+    assert json.loads(observed.stdout)["runtime"] == "installed"
+    assert not observed.stderr
 
 
 def _wait_for(predicate, description):
@@ -616,11 +633,12 @@ def test_configuration_remains_excluded_and_bounded_after_start_dies(
                 if stop.poll() is None:
                     stop.kill()
             assert _exited(pid), f"{operation} deadline was lost"
-            # Until a web generation exists, shutdown cannot identify the PHP
-            # writer. Nevertheless, the verified archive must follow actual exit.
-            assert stop.returncode == 1 and not out
-            assert "shutdown identity could not be confirmed" in err
-            assert list(checkout.backups.glob("*.zip"))
+            assert stop.returncode == 0, err
+            stopped = json.loads(out)
+            assert stopped["backup"]["verified"] is True
+            report = _success(checkout, "backup-status")
+            assert report["latest_success"]["instance"] == "reader"
+            assert report["unresolved_shutdowns"] == []
     finally:
         (checkout.control / f"{operation}-release").touch()
 
@@ -649,13 +667,12 @@ def test_startup_fetch_blocks_backup_even_without_a_web_generation(process_check
         assert "writer state is unconfirmed" in result.stderr
         assert not list(checkout.backups.glob("*.zip"))
 
-        # No web generation ever started, so stop cannot certify the affected
-        # writer identity. It must still wait for the fetch before publishing.
-        stopped = checkout.run("stop")
-        assert stopped.returncode == 1 and not stopped.stdout
-        assert "shutdown identity could not be confirmed" in stopped.stderr
+        stopped = _success(checkout, "stop")
         assert _exited(fetch_pid), "startup fetch deadline was lost"
-        assert list(checkout.backups.glob("*.zip"))
+        assert stopped["backup"]["verified"] is True
+        report = _success(checkout, "backup-status")
+        assert report["latest_success"]["instance"] == "reader"
+        assert report["unresolved_shutdowns"] == []
     finally:
         (checkout.control / "fetch-release").touch()
         _wait_for(

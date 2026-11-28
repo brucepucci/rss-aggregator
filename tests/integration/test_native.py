@@ -90,21 +90,32 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
     if sys.platform != "darwin" or platform.machine() != "arm64" or os.getuid() == 0:
         pytest.fail("Native integration requires a normal Apple Silicon macOS account.")
     feed_url, publish_third = synthetic_feed
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-        assert port != 8080, "The disposable test must not use the default/live port."
     first = tmp_path / "first"
     second = tmp_path / "second"
+    # Hold both allocations simultaneously so the OS cannot return the same port.
+    # The documented forwarding preflight must cover the whole ephemeral range.
+    with socket.socket() as source_listener, socket.socket() as recovery_listener:
+        source_listener.bind(("127.0.0.1", 0))
+        recovery_listener.bind(("127.0.0.1", 0))
+        ports = {
+            first: source_listener.getsockname()[1],
+            second: recovery_listener.getsockname()[1],
+        }
+    assert len(set(ports.values())) == 2
+    assert 8080 not in ports.values(), (
+        "The disposable test must not use the default port."
+    )
     backups = tmp_path / "archives"
     backups.mkdir(mode=0o700)
     base = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(tmp_path),
         "RSS_BACKUP_DIR": str(backups),
-        "RSS_PORT": str(port),
         "RSS_TAILSCALE": "0",
     }
+
+    def origin(state):
+        return f"http://127.0.0.1:{ports[state]}"
 
     def invoke(state, *arguments, data=None, success=True, umask=-1, observe=False):
         launcher = ["-c", OBSERVE_STARTUP_GATE] if observe else ["-m", "rss_aggregator"]
@@ -114,7 +125,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             capture_output=True,
             input=data,
             cwd=ROOT,
-            env={**base, "RSS_STATE_DIR": str(state)},
+            env={**base, "RSS_STATE_DIR": str(state), "RSS_PORT": str(ports[state])},
             timeout=210,
             umask=umask,
             check=False,
@@ -152,18 +163,20 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert result["https_verified"] is False
         assert API_PASSWORD not in json.dumps(result)
 
-    def reader(path, *, token=None, form=None):
+    def reader(state, path, *, token=None, form=None):
         headers = {"Authorization": f"GoogleLogin auth={token}"} if token else {}
         request = Request(
-            f"http://127.0.0.1:{port}/api/greader.php/{path}",
+            f"{origin(state)}/api/greader.php/{path}",
             data=urlencode(form).encode() if form else None,
             headers=headers,
         )
         with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+            assert response.url.startswith(f"{origin(state)}/")
             return response.read()
 
-    def api_login():
+    def api_login(state):
         answer = reader(
+            state,
             "accounts/ClientLogin",
             form={"Email": FIXTURE_USER, "Passwd": API_PASSWORD},
         )
@@ -178,9 +191,8 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
 
         def web(path, fields=None):
             data = urlencode(fields).encode() if fields is not None else None
-            with browser.open(
-                f"http://127.0.0.1:{port}{path}", data, timeout=5
-            ) as reply:
+            with browser.open(f"{origin(state)}{path}", data, timeout=5) as reply:
+                assert reply.url.startswith(f"{origin(state)}/")
                 return reply.read().decode()
 
         login_form = web("/i/")
@@ -216,15 +228,24 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         assert 'id="passwordPlain"' not in subscriptions
         assert "Synthetic publisher" in subscriptions
 
-    def assert_fixture_subscription(auth):
+        archiving = web("/i/?c=configure&a=archiving")
+        for name in ("enable_keep_period", "enable_keep_max"):
+            control = re.search(rf'<input\b[^>]*\sname="{name}"[^>]*>', archiving)
+            assert control is not None, f"Missing archiving checkbox: {name}"
+            assert not re.search(r"\schecked(?=[\s=>/])", control[0]), (
+                f"Retention purge is enabled by default: {name}"
+            )
+
+    def assert_fixture_subscription(state, auth):
         result = json.loads(
-            reader("reader/api/0/subscription/list?output=json", token=auth)
+            reader(state, "reader/api/0/subscription/list?output=json", token=auth)
         )
         assert [sub["url"] for sub in result["subscriptions"]] == [feed_url]
 
-    def items(auth):
+    def items(state, auth):
         result = json.loads(
             reader(
+                state,
                 "reader/api/0/stream/contents/user/-/state/com.google/reading-list?n=20&output=json",
                 token=auth,
             )
@@ -265,7 +286,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             "--db-type",
             "sqlite",
             "--base-url",
-            f"http://127.0.0.1:{port}",
+            origin(first),
             "--auth-type",
             "form",
             "--api-enabled=true",
@@ -290,30 +311,32 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         startup_slot = int(time.time()) // FETCH_PERIOD
         serving = invoke(first, "start", observe=True)
         startup_finished = time.monotonic()
+        assert serving["url"] == origin(first)
         assert serving["security"]["authenticated_settings"] is True
         assert serving["fetch"]["status"] == "completed"
         assert invoke(first, "start")["fetch"]["status"] == "already_running"
         api(first)
-        auth = api_login()
-        assert_fixture_subscription(auth)
-        assert items(auth).keys() == {"Fixture 1", "Fixture 2"}
+        auth = api_login(first)
+        assert_fixture_subscription(first, auth)
+        assert items(first, auth).keys() == {"Fixture 1", "Fixture 2"}
 
         # Let the real TTL and HTTP cache expire without modifying their state.
         # Upstream compares integer Unix seconds with a strict expiry boundary.
         time.sleep(max(0, startup_finished + FEED_TTL + 1 - time.monotonic()))
         publish_third()
-        assert "Fixture 3" not in items(auth)
+        assert "Fixture 3" not in items(first, auth)
         assert invoke(first, "fetch")["status"] == "completed"
-        fetched = items(auth)
+        fetched = items(first, auth)
         assert fetched.keys() == {"Fixture 1", "Fixture 2", "Fixture 3"}
         assert "Content 3" in fetched["Fixture 3"]["summary"]["content"]
         assert int(time.time()) // FETCH_PERIOD == startup_slot, (
             "A periodic fetch slot overlapped startup and manual fetching."
         )
 
-        write_token = reader("reader/api/0/token", token=auth).decode()
+        write_token = reader(first, "reader/api/0/token", token=auth).decode()
         assert (
             reader(
+                first,
                 "reader/api/0/edit-tag",
                 token=auth,
                 form={
@@ -326,6 +349,7 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
         )
         assert (
             reader(
+                first,
                 "reader/api/0/edit-tag",
                 token=auth,
                 form={
@@ -369,12 +393,14 @@ def test_native_pin_http_api_and_source_absent_restore(tmp_path, synthetic_feed)
             success=False,
         ).returncode
         assert invoke(second, "select-instance", "recovered")["instance"] == "recovered"
-        assert invoke(second, "start")["instance"] == "recovered"
+        recovered = invoke(second, "start")
+        assert recovered["instance"] == "recovered"
+        assert recovered["url"] == origin(second)
         assert_restored_web_login(second)
         api(second)
-        restored_auth = api_login()
-        assert_fixture_subscription(restored_auth)
-        restored = items(restored_auth)
+        restored_auth = api_login(second)
+        assert_fixture_subscription(second, restored_auth)
+        restored = items(second, restored_auth)
         for n in (1, 2, 3):
             title = f"Fixture {n}"
             assert restored[title]["id"] == fetched[title]["id"]

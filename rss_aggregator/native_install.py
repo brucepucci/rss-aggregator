@@ -17,7 +17,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.error import URLError
 
-from rss_aggregator.native_service import WriterLeases, install_writer_leases
+from rss_aggregator.archives import sync_directory
+from rss_aggregator.native_service import (
+    WRITER_LEASE_RECORD,
+    WRITER_LEASES,
+    WriterLeases,
+    save,
+    stage_writer_leases,
+)
+from rss_aggregator.recovery import _rename_exclusive
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
@@ -35,6 +43,9 @@ DIGEST = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40}")
 TOKEN = re.compile(r"[0-9a-f]{32}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+FIRST_STAGE = ".native-first-setup"
+FIRST_PUBLICATION = "publication.json"
+FIRST_FILES = (*WRITER_LEASES, WRITER_LEASE_RECORD, "native-owner.json")
 
 
 class NativeInstallError(ValueError):
@@ -137,6 +148,7 @@ def _private(
     mode: int,
     device: int,
     directory: bool = False,
+    links: int = 1,
 ) -> None:
     """Refuse changed types, ownership, permissions, mounts and hard links."""
     valid_type = (
@@ -147,7 +159,7 @@ def _private(
         or metadata.st_uid != os.geteuid()
         or stat.S_IMODE(metadata.st_mode) != mode
         or metadata.st_dev != device
-        or (not directory and metadata.st_nlink != 1)
+        or (not directory and metadata.st_nlink != links)
     ):
         raise NativeInstallError(
             f"Refusing non-private or unexpected native path: {path}"
@@ -411,11 +423,15 @@ class NativeInstall:
         return metadata.st_dev
 
     def _require_initial_state(
-        self, device: int, *, staging: Path | None = None
+        self,
+        device: int,
+        *,
+        staging: Path | None = None,
+        published: frozenset[Path] = frozenset(),
     ) -> None:
-        """Allow only the command lease and this attempt's staging in an unowned root."""
+        """Refuse entries not proved to belong to this first setup."""
         for entry in self.state.iterdir():
-            if entry == staging:
+            if entry == staging or entry in published:
                 continue
             if entry.name == "command.lock":
                 metadata = entry.lstat()
@@ -429,12 +445,6 @@ class NativeInstall:
             raise NativeInstallError(
                 "Unowned RSS_STATE_DIR is not empty; use a separate private directory."
             )
-
-    def preflight_setup(self) -> None:
-        """Check a first-time root before the command lease can change it."""
-        device = self._state_device()
-        if _optional_stat(self.owner_path) is None:
-            self._require_initial_state(device)
 
     def _read_owner(self, device: int) -> dict[str, Any] | None:
         """Validate a persistent receipt without adopting foreign files."""
@@ -552,11 +562,126 @@ class NativeInstall:
             os.fsync(stream.fileno())
         return owner
 
+    def _checkpoint_first_setup(self, staging: Path) -> Path:
+        """Publish the verified stage before adding any individual lease path."""
+        stage_writer_leases(staging)
+        save(
+            staging / FIRST_PUBLICATION,
+            {
+                "state": self.state.lstat().st_ino,
+                "paths": {
+                    name: (staging / name).lstat().st_ino
+                    for name in (*FIRST_FILES, self.root.name)
+                },
+            },
+        )
+        checkpoint = self.state / FIRST_STAGE
+        _rename_exclusive(staging, checkpoint)
+        sync_directory(self.state)
+        return checkpoint
+
+    def _first_setup_paths(self, staging: Path, device: int) -> frozenset[Path]:
+        """Identify only the names published by the same first-setup transaction."""
+        _private(staging, staging.lstat(), mode=0o700, device=device, directory=True)
+        with _private_file(staging / FIRST_PUBLICATION, device, 0o600) as marker:
+            record = json.loads(marker.read(4096), object_pairs_hook=_unique_keys)
+        paths = record.get("paths") if isinstance(record, dict) else None
+        if (
+            not isinstance(paths, dict)
+            or paths.keys() != {*FIRST_FILES, self.root.name}
+            or record.get("state") != self.state.lstat().st_ino
+        ):
+            raise NativeInstallError("Invalid first setup checkpoint; inspect locally.")
+        published = set()
+        for name, inode in paths.items():
+            source, target = staging / name, self.state / name
+            existing = {
+                p: info for p in (source, target) if (info := _optional_stat(p))
+            }
+            directory = target == self.root
+            if (
+                not existing
+                or (directory and len(existing) != 1)
+                or type(inode) is not int
+                or inode <= 0
+            ):
+                raise NativeInstallError(
+                    "First setup evidence is incomplete; inspect locally."
+                )
+            for path, info in existing.items():
+                _private(
+                    path,
+                    info,
+                    mode=0o700 if directory else 0o600,
+                    device=device,
+                    directory=directory,
+                    links=len(existing),
+                )
+                if info.st_ino != inode:
+                    raise NativeInstallError(
+                        "First setup pathname changed; inspect locally."
+                    )
+            if target in existing:
+                published.add(target)
+        return frozenset(published)
+
+    def _finish_first_setup(
+        self, staging: Path, device: int, manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Complete interrupted publication without adopting unrelated state."""
+        published = self._first_setup_paths(staging, device)
+        if self.root not in published:
+            self._require_initial_state(device, staging=staging, published=published)
+        elif any(self.state / name not in published for name in FIRST_FILES):
+            raise NativeInstallError(
+                "First setup evidence is incomplete; inspect locally."
+            )
+        linked = []
+        try:
+            for name in FIRST_FILES:
+                source, target = staging / name, self.state / name
+                if target not in published:
+                    os.link(source, target, follow_symlinks=False)
+                    linked.append((source, target))
+            sync_directory(self.state)
+        except OSError:
+            # Keep the staged inode allocated while removing only links this call
+            # added; a substituted or unrelated path is never rolled back.
+            for source, target in reversed(linked):
+                info = _optional_stat(target)
+                if info is not None and os.path.samestat(source.lstat(), info):
+                    target.unlink()
+            if not any(os.path.lexists(self.state / name) for name in FIRST_FILES):
+                shutil.rmtree(staging)
+                sync_directory(self.state)
+            raise
+
+        for name in FIRST_FILES:
+            (staging / name).unlink(missing_ok=True)
+        sync_directory(staging)
+        owner = self._require_owner(device)
+        if owner["manifest"] != manifest:
+            raise NativeInstallError(
+                "Native pin changed; setup will not upgrade it implicitly."
+            )
+        WriterLeases(self.state)
+        release = self.root if self.root in published else staging / self.root.name
+        self._verify_release(release, owner, device)
+        if release != self.root:
+            _rename_exclusive(release, self.root)
+            sync_directory(self.state)
+        (staging / FIRST_PUBLICATION).unlink()
+        shutil.rmtree(staging)
+        return owner
+
     def install(self) -> dict[str, Any]:
         """Install the reviewed assets or verify an existing installation unchanged."""
         _require_platform()
         device = self._state_device()
         manifest = _validate_manifest(self.runtime._manifest())
+        checkpoint = self.state / FIRST_STAGE
+        if _optional_stat(checkpoint / FIRST_PUBLICATION) is not None:
+            return self._finish_first_setup(checkpoint, device, manifest)
         owner = self._read_owner(device)
         if owner is not None and owner["manifest"] != manifest:
             raise NativeInstallError(
@@ -596,8 +721,8 @@ class NativeInstall:
                         "A native ownership receipt appeared during setup; refusing replacement."
                     )
                 self._require_initial_state(device, staging=staging)
-                install_writer_leases(staging, self.state)
-                (staging / self.owner_path.name).rename(self.owner_path)
+                checkpoint = self._checkpoint_first_setup(staging)
+                return self._finish_first_setup(checkpoint, device, manifest)
             (staging / "runtime").rename(self.root)
         return new_owner
 

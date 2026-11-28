@@ -155,7 +155,7 @@ def test_daily_retry_budget_survives_interruption_reselection_and_rollback(jobs)
         }
         report = _success(jobs, "backup-status")
         assert report["daily_target_attempt"]["count"] == 1
-        assert report["daily_target_attempt"]["outcome"] == "running"
+        assert report["daily_target_attempt"]["outcome"] == "interrupted"
         assert report["daily_attempt"]["instance"] == "standby"
 
     jobs.backups.chmod(0o750)  # Refuse capture, not the captured launchd job.
@@ -175,6 +175,38 @@ def test_daily_retry_budget_survives_interruption_reselection_and_rollback(jobs)
             "outcome": "not_due",
             "next_expected_attempt": "2026-01-04T04:00:00+00:00",
         }
+    assert set(jobs.backups.glob("*.zip")) == archives
+
+
+def test_abandoned_daily_reservations_show_interruption_without_refunding_retries(jobs):
+    _restore_fixture(jobs, "reader")
+    _success(jobs, "select-instance", "reader")
+    _success(jobs, "backup-enable", "--hour", "4")
+    _success(jobs, "backup-due")
+    baseline = _success(jobs, "backup-status", "--check")
+    archives = set(jobs.backups.glob("*.zip"))
+    daily = jobs.state / "backup-daily.json"
+    for attempt, elapsed in enumerate((86400, 87300, 88200), start=1):
+        jobs.environment["SYNTHETIC_SECONDS"] = str(elapsed)
+        jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"] = daily.name
+        assert jobs.run("backup-due").returncode == 71
+        del jobs.environment["SYNTHETIC_EXIT_AFTER_REPLACE"]
+        reserved = daily.read_bytes()
+
+        report = _success(jobs, "backup-status")
+        assert report["busy"] is False and report["maintenance_required"] is False
+        assert report["protected"] is False
+        assert report["latest_success"] == baseline["latest_success"]
+        assert report["daily_attempt"] == report["daily_target_attempt"]
+        assert report["daily_attempt"]["outcome"] == "interrupted"
+        assert report["daily_attempt"]["count"] == attempt
+        assert daily.read_bytes() == reserved  # The report is a projection only.
+
+    jobs.environment["SYNTHETIC_SECONDS"] = "90000"
+    assert _success(jobs, "backup-due") == {
+        "outcome": "not_due",
+        "next_expected_attempt": "2026-01-04T04:00:00+00:00",
+    }
     assert set(jobs.backups.glob("*.zip")) == archives
 
 

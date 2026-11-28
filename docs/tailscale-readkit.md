@@ -123,14 +123,17 @@ route and verify a shutdown archive. Do not continue on a failed shutdown.
 **Before reopening**, inspect `tailscale serve status`, `tailscale funnel status`
 and any other proxy or forwarding configuration locally. Confirm that none
 targets the intended loopback port. Stop if a route is present or the check is
-uncertain; do not change someone else's rule. Explicit `RSS_TAILSCALE=0` does not
-check or disable external forwarding.
+uncertain; do not change someone else's rule. `RSS_TAILSCALE=0` suppresses
+publication; it does not disable external forwarding or replace that manual
+inspection. A previously private port retains a read-only Funnel check for later
+startup, including cold supervision recovery.
 
 Set `RSS_TAILSCALE=0`, then run `start`, `verify` and `status`. Require the intended
 HTTP loopback URL, readiness and owned forwarding stopped (or unconfigured if never
 managed). Verify local sign-in and loopback links. Retained API passwords/ownership
-receipts are not erased. Retain Tailscale availability when checking existing
-forwarding records; never delete receipts to avoid those checks. Only recapture
+receipts are not erased. Keep Tailscale available for its read-only check of a
+previously private backend, including in a recaptured local-mode job. Never
+delete records to avoid those checks. Only recapture
 wanted jobs with the new settings after verification.
 
 ## Troubleshooting

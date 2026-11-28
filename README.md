@@ -141,8 +141,10 @@ See the [full configuration reference](docs/configuration.md).
   explicit `backup` can have resumed service; shutdown export failure after
   quiescing leaves writers stopped. An older verified archive does not clear a
   failed or interrupted shutdown; inspect `backup-status` and retry `stop` after
-  correcting the problem. If the affected instance is unknown, preserve the
-  evidence and follow the [recovery guidance](docs/backup-restore.md#consistency-and-failure-behavior).
+  correcting the problem. A recorded stop can veto automatic recovery even when
+  supervision still shows recorded running intent. If the affected instance is
+  unknown, preserve the evidence and follow the
+  [recovery guidance](docs/backup-restore.md#consistency-and-failure-behavior).
 - **Lost or conflicting instance selection:** do not start or back up a substitute instance.
   Use [operator troubleshooting](docs/operations.md#common-troubleshooting) to
   confirm and reselect the intended data while stopped.
@@ -175,8 +177,8 @@ Feedbin migration is not covered.
 
 ### How do I back up and restore the complete FreshRSS instance?
 
-Export `RSS_BACKUP_DIR` and run `backup`; `stop` also backs up. For restore, use a
-trusted native ZIP and the exact recorded pin, then explicitly select the fresh
+Export `RSS_BACKUP_DIR` and run `backup`. Use `stop` instead if you want to back
+up and stay stopped. For restore, use a trusted native ZIP and the exact recorded pin, then explicitly select the fresh
 target and start. See [backup and recovery](docs/backup-restore.md), including
 [opt-in daily backups](docs/backup-restore.md#opt-in-daily-mac-backups) and the
 [Time Machine copy recovery drill](docs/backup-restore.md#time-machine-copy-recovery-drill).

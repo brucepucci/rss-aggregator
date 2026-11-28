@@ -15,6 +15,7 @@ from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from rss_aggregator import native_service
 from rss_aggregator.private_access import PrivateAccess
@@ -76,7 +77,11 @@ class NativeJob:
         access = PrivateAccess(self.runtime)
         private = access.enabled()
         names = ["launchctl"]
-        if private or os.path.lexists(access.path):
+        if (
+            private
+            or os.path.lexists(access.path)
+            or self.runtime._requires_backend_check(owner, self.runtime._port())
+        ):
             names.append("tailscale")
         dependencies = {}
         for name in names:
@@ -178,10 +183,14 @@ class NativeJob:
                 "Captured launcher or native manifest changed; restore it or explicitly reconfigure the owned job."
             )
         dependencies = record["dependencies"]
-        if (
-            record["environment"]["RSS_TAILSCALE"] == "1"
+        environment = record["environment"]
+        if "tailscale" not in dependencies and (
+            environment["RSS_TAILSCALE"] == "1"
             or os.path.lexists(PrivateAccess(self.runtime).path)
-        ) and "tailscale" not in dependencies:
+            or self.runtime._requires_backend_check(
+                {"token": record["owner"]}, int(environment["RSS_PORT"])
+            )
+        ):
             raise ValueError(
                 "Tailscale is now required; explicitly reconfigure the owned job."
             )
@@ -355,11 +364,11 @@ class Supervision:
         self.runtime = runtime
         self.job = NativeJob(runtime, "supervision", "supervision-tick")
 
-    def intent(self) -> str:
+    def _intent_record(self) -> dict[str, Any]:
         """Read fail-closed operator intent; absence never authorizes recovery."""
         path = self.runtime.state_dir / INTENT
         if not os.path.lexists(path):
-            return "unset"
+            return {"intent": "unset"}
         if path.is_symlink():
             raise ValueError("Refusing symlinked operator intent; inspect locally.")
         value = native_service.read(path)
@@ -371,20 +380,45 @@ class Supervision:
                 "running",
                 "stopped",
             )
+            or (
+                "authorization" in value
+                and (
+                    value["intent"] != "running"
+                    or not isinstance(value["authorization"], str)
+                    or re.fullmatch(r"[0-9a-f]{32}", value["authorization"]) is None
+                )
+            )
         ):
             raise ValueError(
                 "Invalid operator-intent.json; inspect locally before starting."
             )
-        return value["intent"]
+        return value
+
+    def intent(self) -> str:
+        """Report the separately persisted operator intent, not a pending stop veto."""
+        return self._intent_record()["intent"]
+
+    def running_authorization(self) -> str | None:
+        """Identify the current explicit start, including legacy intent without an ID."""
+        value = self._intent_record()
+        return (
+            value.get("authorization", "legacy")
+            if value["intent"] == "running"
+            else None
+        )
 
     def set_intent(self, intent: str) -> None:
         """Record an explicit operator decision, never temporary backup quiescing."""
-        self.runtime._save(INTENT, {"version": 1, "intent": intent})
+        value = {"version": 1, "intent": intent}
+        if intent == "running":
+            value["authorization"] = uuid4().hex
+        self.runtime._save(INTENT, value)
         if intent == "running":
             self._reset_attempts()
 
     def status(self) -> dict[str, Any]:
         """Report registration, session, intent, observed health and sanitized history."""
+        from rss_aggregator.backup_schedule import BackupSchedule
         from rss_aggregator.runtime import RuntimeFailure
 
         record = self._record()
@@ -409,6 +443,12 @@ class Supervision:
                 "action": "Inspect interrupted maintenance; use backup-reconcile when available. To remain stopped, use rss stop before reconciling: retained running intent allows later supervision recovery. Never delete the marker to bypass it.",
             }
         try:
+            if BackupSchedule(self.runtime).restart_vetoed():
+                return {
+                    **result,
+                    "state": "stop_requested",
+                    "action": "An interrupted stop revoked automatic restart. Retry rss stop to confirm stopped intent or use explicit rss start to supersede it. Inspect unresolved shutdown evidence with rss backup-status.",
+                }
             self._check_job(record)
             self.runtime._owned(require_current=False, verify=False)
             if result["intent"] == "running":
@@ -444,7 +484,7 @@ class Supervision:
             return {
                 **result,
                 "state": "configuration_unavailable",
-                "action": "Restore the captured checkout, dependencies and unchanged owned job, or remove/reinstall supervision explicitly.",
+                "action": "Inspect backup-status for damaged shutdown evidence and check the captured checkout, dependencies and unchanged owned job. Reconfigure supervision explicitly if needed.",
             }
         with self.job.environment(record):
             result["observed"] = self._observe()

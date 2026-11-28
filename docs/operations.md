@@ -23,7 +23,11 @@ It holds the managed runtime, `instances/NAME/data`, service settings, locks and
 ownership/recovery records. For first-time setup, choose a fresh path or an
 empty private directory, never an ancestor of another installation. `setup`
 refuses unrelated contents in an unowned state root; leave them intact and
-choose a separate path. The parent legacy `.local` still belongs to the old
+choose a separate path. If first setup was interrupted during publication, retry
+`setup` with the same pin and state so it can validate and finish its own
+checkpoint. If it refuses the checkpoint or finds unrelated paths, preserve the
+evidence for inspection rather than manually deleting leases or receipts. The
+parent legacy `.local` still belongs to the old
 deployment; do not repurpose it or remove it recursively. A private directory is
 not a sandbox. Keep one stable controlling checkout. If you must use another
 checkout to operate the **same** instance, use the exact matching reviewed pin and
@@ -46,7 +50,10 @@ an equivalent launcher.
   the selected data, checks effective
   **web** PHP (not only PHP CLI), readiness and scheduling, and verifies rejection
   of anonymous API access on an initialized instance. Private startup refreshes
-  the forwarding check after preparation. Ordinary HTTP receives 503 until the
+  the forwarding check after preparation. A previously private port retains a
+  read-only Funnel check for later startup even if it is now local-only. Follow
+  the [local-only forwarding checks](tailscale-readkit.md#stop-resume-and-return-to-local-only-use)
+  rather than bypassing a failed check. Ordinary HTTP receives 503 until the
   controller acknowledges approval. Before reporting success, startup checks the
   same live generation, scheduler and ordinary HTTP. It removes the temporary
   PHP probe after each check.
@@ -100,9 +107,11 @@ known; unavailable selection or capture records do not prevent quiescence. Missi
 failure, not an empty install. The command preserves the runtime, data and
 archives. A failed shutdown export after quiescing leaves writers stopped;
 correct the cause and retry `stop` for that instance. If `stop` could not persist
-stopped intent, it still attempts to quiesce, but a previously recorded running
-intent may remain. Fix the intent-write failure and retry `stop` before releasing
-any hold. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
+stopped intent, it still attempts to quiesce, but status can retain the old
+`running` value. In established state, a durable receipt-loss shutdown record
+vetoes automatic restart even if the separate intent write was interrupted.
+Restore the original receipt if unavailable, fix any write failure, and retry
+`stop` before releasing a hold. Use the [backup procedure](backup-restore.md#consistency-and-failure-behavior)
 for resumption, daily checks and interrupted maintenance; a failed explicit
 `backup` has different resumption behavior. A local archive alone does not prove
 host-loss recovery. `application: unconfirmed` is not proof of idle writers.
@@ -141,8 +150,12 @@ registration evidence. Refusal or partial activation requires inspection, not
 plist/receipt edits. Removal does not stop FreshRSS,
 change intent or delete data/archives. An intentionally stopped or unset instance
 is not eligible for automatic start. Only `start` enables running intent; `stop`
-records stopped intent even when a later step fails, once the command lock is held.
-Temporary maintenance/verification does not change it. Installation refuses a
+attempts to save stopped intent even when later steps cannot complete. A
+`stop_requested` supervision state means automatic recovery is vetoed while
+recorded intent may still say `running`. Retry `stop` to finish shutdown rather
+than treating a returned receipt as permission to restart. A deliberate `start`
+can supersede that veto without clearing the shutdown failure.
+Temporary maintenance/verification does not change intent. Installation refuses a
 captured port or access mode different from a running service. If those settings
 later disagree, `supervision-status` reports `configuration_conflict` for running
 intent; a tick does not restart the listener or spend a retry. Follow the
@@ -154,8 +167,9 @@ Checkout/dependency updates do not update an installed definition. With owner
 approval, record which jobs are installed and their captured selectors, destination
 and UTC backup schedule. Obtain a verified backup with safe resumption, then remove
 both owned jobs using matching code/settings (`supervision-remove`, `backup-disable`).
-Stop on a busy, partial or uncertain result; never overwrite a changed or foreign
-job. Only then apply the separately approved checkout, port, forwarding or runtime
+Stop on a busy, partial or uncertain result, including a
+[conflict between the daily evidence and registration policy](backup-restore.md#opt-in-daily-mac-backups).
+Never overwrite a changed or foreign job. Only then apply the separately approved checkout, port, forwarding or runtime
 change. Verify service/security and intended access; explicitly recapture only the
 jobs still wanted with the preserved schedule and intended selectors. A newly
 captured backup policy needs fresh daily evidence. Manual-only use stays disabled.
@@ -197,7 +211,10 @@ owner approval for an installed service:
 
 1. Verify a current private instance backup and preserve an independent copy.
    Remove supervision and disable daily backup, if installed, before changing the
-   runtime. Review both statuses; stop on any refusal or uncertainty.
+   runtime. Review both statuses; stop on any refusal or uncertainty. Preview
+   and apply also check both roles' plist paths and registrations in the normal
+   user session. A missing ledger is not evidence of retirement; preserve any
+   ambiguous job or missing-ledger situation for owner review.
 2. Run `uv run --locked rss stop`. Confirm stopped intent, idle writers, verified
    shutdown archive when data exist, no unresolved maintenance and no active
    project forwarding. Do not move past an unverified shutdown.

@@ -89,6 +89,11 @@ class BackupSchedule:
             record.get("outcome") in ("running", "failed", "interrupted")
             and self._dated(record, "started_at")
             and (
+                "revoked_authorization" not in record
+                or re.fullmatch(r"legacy|[0-9a-f]{32}", record["revoked_authorization"])
+                is not None
+            )
+            and (
                 "supersedes_hold" not in record
                 or re.fullmatch(r"[0-9a-f]{64}", record["supersedes_hold"]) is not None
             )
@@ -359,12 +364,21 @@ class BackupSchedule:
             self._unlink_durable(self.runtime.state_dir / SHUTDOWN)
 
     def _unidentified_shutdown(self) -> dict[str, Any]:
-        """Prepare an unresolved stop without inferring its affected instance."""
-        return {
+        """Prepare stop evidence without inferring data ownership or restart authority."""
+        record = {
             "instance": None,
             "started_at": self.now.isoformat(),
             "outcome": "running",
         }
+        try:
+            authorization = Supervision(self.runtime).running_authorization()
+        except (OSError, ValueError):
+            pass  # Unreadable intent cannot authorize automatic recovery.
+        else:
+            if authorization is not None:
+                # Embed the veto before the separate stopped intent write.
+                record["revoked_authorization"] = authorization
+        return record
 
     def _identify_shutdown(
         self,
@@ -1152,9 +1166,20 @@ class BackupSchedule:
             "Backup maintenance remains unresolved; run rss backup-status and rss backup-reconcile. Archive success and resumption are separate."
         )
 
+    def restart_vetoed(self) -> bool:
+        """Exclude a start grant revoked by a durable shutdown record."""
+        authorization = Supervision(self.runtime).running_authorization()
+        return authorization is not None and any(
+            record.get("revoked_authorization") == authorization
+            for record in self._shutdown_records(self._evidence(SHUTDOWN))
+        )
+
     def may_resume(self) -> bool:
-        """Honor stopped intent; absence preserves observed state without enabling intent."""
-        return Supervision(self.runtime).intent() != "stopped"
+        """Honor explicit stop even between the shutdown and stopped intent writes."""
+        return (
+            Supervision(self.runtime).intent() != "stopped"
+            and not self.restart_vetoed()
+        )
 
     def _owned_maintenance(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Authenticate a maintenance hold against the receipt, not released files."""
@@ -1199,6 +1224,7 @@ class BackupSchedule:
         requires_stopped = (
             marker["operation"] == "stop"
             or not owned_ledger
+            or self.restart_vetoed()
             or any(entry.get("supersedes_hold") == hold for entry in pending)
         )
         if requires_stopped and not self._has_intent("stopped"):
@@ -1362,6 +1388,16 @@ class BackupSchedule:
         daily_target = (
             self._target_attempt(daily, schedule, selected) if schedule else None
         )
+        # A reported reservation is not proof of an active capture. Only the
+        # latest reservation could still be executing under a busy command lease.
+        if (
+            daily_target
+            and daily_target["outcome"] == "running"
+            and (not busy or daily_target != latest_daily)
+        ):
+            daily_target = {**daily_target, "outcome": "interrupted"}
+        if latest_daily and latest_daily["outcome"] == "running" and not busy:
+            latest_daily = {**latest_daily, "outcome": "interrupted"}
         defer = self._reported_evidence(DEFER, evidence_problems)
         slot = (
             self._slot(schedule)
@@ -1418,6 +1454,13 @@ class BackupSchedule:
                 self.runtime._owned(require_current=False, verify=False)
             except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
                 problem = "Backup scheduler unavailable/conflicting; inspect runtime, job, launcher, native manifest and captured dependencies locally."
+            else:
+                try:
+                    self.runtime._writer_lease_state()
+                except RuntimeFailure:
+                    problem = problem or (
+                        "Backup scheduler cannot confirm native writer lease evidence; inspect the original lease files locally."
+                    )
         return {
             "enabled": bool(schedule and schedule["active"]),
             "registered": registered,

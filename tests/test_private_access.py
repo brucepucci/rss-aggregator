@@ -6,6 +6,7 @@ import io
 import json
 import os
 import platform
+import plistlib
 import shutil
 import signal
 import socket
@@ -813,13 +814,15 @@ def controlled_web(native, monkeypatch):
         if args[1:3] == ["-I", "-B"]:
             assert Path(args[3]).name == "native_service.py"
             assert args[5] == str(native.state) and args[6] == str(native.data)
-            assert pass_fds == (int(args[7]),)
+            assert pass_fds[0] == int(args[7])
             assert kwargs["stderr"] == subprocess.DEVNULL
             if args[4] == "fetch":
+                assert pass_fds[1:] == tuple(map(int, args[9:]))
                 assert kwargs["stdout"] == subprocess.DEVNULL
                 return SimpleNamespace(wait=native.fetch_result)
             assert args[4] == "php"
-            operation = args[9]
+            assert pass_fds[1:] == (int(args[9]),)
+            operation = args[10]
             if operation == "-r":
                 result = ["form", False, False, True, origin, True, "sqlite"]
                 kwargs["stdout"].write(json.dumps(result).encode())
@@ -1346,6 +1349,98 @@ def test_successive_backup_resumptions_keep_forwarding_check_without_republishin
     assert native.api.config == route(funnel=True)
 
 
+@pytest.mark.parametrize("unsafe_backend", [False, True])
+def test_cold_local_supervision_rechecks_previous_private_backend(
+    controlled_web, monkeypatch, tmp_path, unsafe_backend
+):
+    native = controlled_web
+    root = native.access.runtime.root
+    launcher = root / ".venv/bin/python"
+    launcher.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    launcher.symlink_to(sys.executable)
+    for name in ("launchctl", "tailscale"):
+        (tmp_path / name).touch(mode=0o700)
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    run_cli = subprocess.run
+
+    def external(args, **kwargs):
+        command, *rest = args
+        if command == str(launcher):
+            assert rest[:3] == ["-I", "-B", "-c"]
+            return subprocess.CompletedProcess(args, 0, str(root) + "\n", "")
+        if command == str(tmp_path / "tailscale"):
+            return run_cli(["tailscale", *rest], **kwargs)
+        if command != str(tmp_path / "launchctl"):
+            return run_cli(args, **kwargs)
+        verb, domain, *extra = rest
+        if verb == "bootstrap":
+            job = Path(extra[0])
+            loaded[job.stem] = job
+            return subprocess.CompletedProcess(args, 0, "", "")
+        assert verb == "print"
+        if domain.count("/") == 1:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        job = loaded.get(domain.rsplit("/", 1)[1])
+        if job is None:
+            return subprocess.CompletedProcess(args, 113, "", "")
+        definition = plistlib.loads(job.read_bytes())
+        arguments = "\n".join(definition["ProgramArguments"])
+        selectors = "\n".join(
+            f"{key} => {value}"
+            for key, value in definition["EnvironmentVariables"].items()
+        )
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            f"path = {job}\nprogram = {launcher}\n"
+            f"arguments = {{\n{arguments}\n}}\nenvironment = {{\n{selectors}\n}}\n",
+            "",
+        )
+
+    loaded = {}
+    monkeypatch.setattr(subprocess, "run", external)
+    try:
+        monkeypatch.setenv("RSS_TAILSCALE", "0")
+        result_json(native.run(["start"]))
+        initialized_web(native)
+        monkeypatch.setenv("RSS_TAILSCALE", "1")
+        original = copy.deepcopy(native.api.config)
+        assert result_json(native.run(["start"]))["url"] == ORIGIN
+        native.api.config = original
+        result_json(native.run(["backup"]))
+        assert result_json(native.run(["status"]))["url"] == BACKEND
+
+        monkeypatch.setenv("RSS_TAILSCALE", "0")
+        # The route is gone, so neither its authority record nor an extant
+        # controller should be necessary to recognize the local obligation.
+        native.record.rename(tmp_path / "retired-serve.json")
+        assert result_json(native.run(["supervision-install"]))["state"] == "healthy"
+        native.lose_generation()
+        (native.state / "service.json").rename(tmp_path / "retired-service.json")
+        assert result_json(native.run(["status"]))["application"] == "stopped"
+        if unsafe_backend:
+            native.api.config = route(funnel=True)
+        before = copy.deepcopy(native.api.config)
+        reads, launches = len(native.api.gets), native.launches
+        tick = native.run(["supervision-tick"])
+        if unsafe_backend:
+            refused(tick, "Guarded recovery failed")
+            assert native.launches == launches
+            # Inspect the simulated forwarding without binding or changing it.
+            assert len(native.api.gets) > reads
+            state = result_json(native.run(["supervision-status"]))
+            assert (
+                state["recovery"]["history"][-1]["reason"] == "private_access_refused"
+            )
+        else:
+            assert result_json(tick)["state"] == "recovered"
+            assert result_json(native.run(["status"]))["url"] == BACKEND
+        assert native.api.config == before
+        assert len(native.api.posts) == 1
+    finally:
+        launcher.unlink()
+
+
 def test_stalled_discovery_is_reaped_without_holding_command_lock(process_checkout):
     checkout = process_checkout
     result = checkout.run("start")
@@ -1374,14 +1469,14 @@ def test_stalled_discovery_is_reaped_without_holding_command_lock(process_checko
         "assert sys.argv[1:] == ['debug', 'local-creds']\n"
         "signal.alarm(45)\n"
         "state = Path(os.environ['RSS_STATE_DIR'])\n"
-        "lock = (state / 'command.lock').stat()\n"
+        "locks = [state.stat(), (state / 'command.lock').stat()]\n"
         "inherited = False\n"
-        "for fd in range(3, 256):\n"
+        "for fd in os.listdir('/dev/fd'):\n"
         "    try:\n"
-        "        info = os.fstat(fd)\n"
+        "        info = os.fstat(int(fd))\n"
         "    except OSError:\n"
         "        continue\n"
-        "    inherited |= (info.st_dev, info.st_ino) == (lock.st_dev, lock.st_ino)\n"
+        "    inherited |= any(os.path.samestat(lock, info) for lock in locks)\n"
         "progress = state / 'child.tmp'\n"
         "progress.write_text(json.dumps([os.getpid(), inherited]))\n"
         "progress.replace(state / 'discovery-child')\n"
@@ -1541,10 +1636,22 @@ def test_verify_stops_owned_backend_on_confirmed_public_exposure(
 
 
 def test_upgrade_rejects_archive_from_before_last_running_session(
-    controlled_web, monkeypatch
+    controlled_web, monkeypatch, tmp_path
 ):
     native = controlled_web
     destination = Path(os.environ["RSS_BACKUP_DIR"])
+    launchctl = tmp_path / "launchctl"
+    launchctl.touch(mode=0o700)
+    run_cli = subprocess.run
+
+    def empty_session(args, **kwargs):
+        if args[0] != str(launchctl):
+            return run_cli(args, **kwargs)
+        command, domain = args[1:]
+        assert command == "print" and domain.startswith("gui/")
+        return subprocess.CompletedProcess(args, 0 if domain.count("/") == 1 else 113)
+
+    monkeypatch.setattr(subprocess, "run", empty_session)
     monkeypatch.setenv("RSS_TAILSCALE", "0")
     # The disposable setup child already uses this platform; upgrade runs here.
     monkeypatch.setattr(platform, "system", lambda: "Darwin")

@@ -9,6 +9,7 @@ import pytest
 from tests import test_native_jobs
 from tests.test_native_jobs import (
     LAUNCHCTL,
+    _owned_writer,
     _refused,
     _restore_fixture,
     _success,
@@ -27,11 +28,13 @@ from pathlib import Path
 def stall(probe):
     if os.environ.get('SYNTHETIC_STALLED_PROBE') != probe:
         return
-    lock = (Path(os.environ['RSS_STATE_DIR']) / 'command.lock').stat()
+    state = Path(os.environ['RSS_STATE_DIR'])
+    locks = [state.stat(), (state / 'command.lock').stat()]
     inherited = False
     for fd in os.listdir('/dev/fd'):
         try:
-            inherited |= os.path.samestat(lock, os.fstat(int(fd)))
+            details = os.fstat(int(fd))
+            inherited |= any(os.path.samestat(lock, details) for lock in locks)
         except OSError:
             pass  # The fd that listed the directory is already closed.
     Path.home().joinpath('probe-entry').write_text(json.dumps({
@@ -69,6 +72,42 @@ def test_unreadable_scheduled_archive_is_not_protection_but_keeps_evidence(jobs)
     assert set(report["archive_problems"]) == {"daily_attempt", "latest_success"}
     assert report["evidence_problems"] == {}
     assert report["protected"] is False
+    assert _success(jobs, "backup-status", "--check") == before
+
+
+def test_held_serving_leases_are_not_a_backup_scheduler_fault(jobs):
+    before = _daily_success(jobs)
+    with _owned_writer(jobs):
+        try:
+            assert _success(jobs, "status")["application"] == "running"
+            assert _success(jobs, "backup-status", "--check") == before
+        finally:
+            _success(jobs, "stop")
+
+
+@pytest.mark.parametrize("damage", ["missing", "replacement"])
+def test_damaged_writer_lease_blocks_protection_but_keeps_archive_evidence(
+    jobs, damage
+):
+    before = _daily_success(jobs)
+    lease = jobs.state / "fetch.lock"
+    parked = lease.rename(jobs.state.parent / "parked-fetch.lock")
+    if damage == "replacement":
+        lease.touch(mode=0o600)
+    try:
+        assert _success(jobs, "status")["application"] == "unconfirmed"
+        check = jobs.run("backup-status", "--check")
+        assert check.returncode == 1, (check.stdout, check.stderr)
+        report = json.loads(check.stdout)
+        assert report["protected"] is False
+        assert "writer lease" in report["scheduler_problem"]
+        assert report["registered"] is True
+        assert report["daily_attempt"] == before["daily_attempt"]
+        assert report["latest_success"] == before["latest_success"]
+        assert report["daily_archive_available"] is True
+        assert report["archive_available"] is True
+    finally:
+        parked.replace(lease)
     assert _success(jobs, "backup-status", "--check") == before
 
 

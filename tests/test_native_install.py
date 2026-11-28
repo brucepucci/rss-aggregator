@@ -67,6 +67,33 @@ from click.testing import CliRunner
 from rss_aggregator.cli import main
 
 
+link = os.link
+fsync = os.fsync
+state = Path(os.environ['RSS_STATE_DIR'])
+
+
+def link_lease(source, target, *args, **kwargs):
+    fault = os.environ.get('SYNTHETIC_FIRST_LEASE_FAULT')
+    if Path(target) == state / 'controller.lock':
+        if fault == 'lease-interrupted':
+            os._exit(71)
+        if fault == 'lease-error':
+            raise OSError('synthetic first lease publication failure')
+    link(source, target, *args, **kwargs)
+    if Path(target) == state / 'native-owner.json' and fault == 'owner-published':
+        os._exit(71)
+
+
+def sync_stage(fd):
+    if (
+        os.environ.get('SYNTHETIC_FIRST_LEASE_FAULT') == 'runtime-published'
+        and (state / 'runtime').is_dir()
+        and os.path.samestat(os.fstat(fd), state.stat())
+    ):
+        os._exit(71)
+    fsync(fd)
+
+
 def download(url, **kwargs):
     manifest = json.loads(Path('config/native.json').read_text())
     for key in ('freshrss', 'runtime'):
@@ -83,6 +110,8 @@ with (
     patch.object(platform, 'machine', return_value='arm64'),
     patch.object(platform, 'mac_ver', return_value=('14.0.0', ('', '', ''), 'arm64')),
     patch.object(urllib.request, 'urlopen', download),
+    patch.object(os, 'link', link_lease),
+    patch.object(os, 'fsync', sync_stage),
 ):
     result = CliRunner().invoke(main, sys.argv[1:], catch_exceptions=False)
 
@@ -109,7 +138,20 @@ class Checkout:
             "RSS_TAILSCALE": "0",
         }
         self.environment.pop("PYTHONPATH", None)
+        # Uninstall/upgrade can prove both job labels absent without real launchd.
+        launchctl = tmp_path / "launchctl"
+        launchctl.write_text(
+            "#!/bin/sh\n"
+            'test "$1" = print || exit 1\n'
+            'case "$2" in\n'
+            "  gui/*/io.rss-aggregator.native.*) exit 113 ;;\n"
+            "  gui/*) exit 0 ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        launchctl.chmod(0o700)
         self.environment.pop("SYNTHETIC_LATE_SETUP_ENTRY", None)
+        self.environment.pop("SYNTHETIC_FIRST_LEASE_FAULT", None)
         # Use an unmodified CLI in a disposable checkout with its own reviewed pins.
         shutil.copytree(
             ROOT / "rss_aggregator",
@@ -311,6 +353,48 @@ def test_parent_setup_refusal_preserves_child_shutdown(checkout):
     result = json.loads(stopped.stdout)
     assert result["application"] == "stopped"
     assert result["already_stopped"] is False
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["lease-error", "lease-interrupted", "owner-published", "runtime-published"],
+)
+def test_first_setup_retries_after_partial_publication(checkout, fault):
+    checkout.environment["SYNTHETIC_FIRST_LEASE_FAULT"] = fault
+    first = checkout.run("setup")
+    assert first.returncode == (1 if fault == "lease-error" else 71), first.stderr
+    assert checkout.binary.exists() is (fault == "runtime-published")
+    assert (checkout.state / "native-owner.json").exists() is fault.endswith(
+        "published"
+    )
+    if fault == "lease-error":
+        assert {p.name for p in checkout.state.iterdir()} == {"command.lock"}
+    else:
+        # Resumption uses the already verified install, not a new download.
+        (checkout.root / "runtime.download").unlink()
+        (checkout.root / "freshrss.download").unlink()
+
+    del checkout.environment["SYNTHETIC_FIRST_LEASE_FAULT"]
+    second = checkout.run("setup")
+    assert second.returncode == 0, second.stderr
+    assert checkout.binary.is_file()
+    assert json.loads(checkout.run("status").stdout)["application"] == "stopped"
+
+
+def test_first_setup_does_not_adopt_substituted_lease_after_interruption(checkout):
+    checkout.environment["SYNTHETIC_FIRST_LEASE_FAULT"] = "lease-interrupted"
+    assert checkout.run("setup").returncode == 71
+    del checkout.environment["SYNTHETIC_FIRST_LEASE_FAULT"]
+    lease = checkout.state / "writers.lock"
+    lease.unlink()
+    lease.write_bytes(b"unrelated file")
+    lease.chmod(0o600)
+
+    result = checkout.run("setup")
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert lease.read_bytes() == b"unrelated file"
+    assert not (checkout.state / "native-owner.json").exists()
+    assert not checkout.binary.exists()
 
 
 def test_setup_refuses_new_state_entries_before_claiming_the_root(checkout):

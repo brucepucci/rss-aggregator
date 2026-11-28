@@ -10,9 +10,71 @@ import pytest
 
 from tests import test_native_install, test_native_jobs
 from tests.test_native_jobs import _ledger, _refused, _restore_fixture, _success
+from tests.test_native_process_lifetime import _wait_for
+from tests.test_native_process_lifetime import (
+    process_checkout as shared_process_checkout,
+)
 
 checkout = test_native_install.checkout
 jobs = test_native_jobs.jobs
+process_checkout = shared_process_checkout
+
+
+@pytest.mark.parametrize("mismatched_generation", [False, True])
+def test_lost_fetch_lease_only_blocks_capture_and_unidentified_shutdown(
+    process_checkout, mismatched_generation
+):
+    checkout = process_checkout
+    assert _success(checkout, "start")["application"] == "running"
+    lease = checkout.state / "fetch.lock"
+    parked = lease.rename(checkout.control / "parked-fetch")
+    generation = checkout.state / "instances/reader/writer-generation.json"
+    original = generation.read_bytes()
+    if mismatched_generation:
+        generation.write_text(json.dumps({"writer_generation": uuid4().hex}))
+    try:
+        assert "writer state is unconfirmed" in _refused(checkout, "stop")
+        assert not lease.exists()
+        assert _success(checkout, "status")["application"] == "unconfirmed"
+        assert not list(checkout.backups.glob("*.zip"))
+    finally:
+        parked.rename(lease)
+        generation.write_bytes(original)
+        try:
+            status = _success(checkout, "status")
+            assert (status["application"], status["http_ready"]) == (
+                ("running", True) if mismatched_generation else ("stopped", False)
+            )
+        finally:
+            # Release only the disposable generation, including on regression.
+            nonce = json.loads((checkout.state / "service.json").read_text())["nonce"]
+            (checkout.control / f"web-release-{nonce}").touch()
+
+
+def test_idle_startup_claim_does_not_attribute_an_unidentified_fetch(process_checkout):
+    checkout = process_checkout
+    _success(checkout, "start")
+    first = _success(checkout, "stop")
+    assert first["backup"]["verified"] is True
+    with (checkout.state / "fetch.lock").open("rb") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with checkout.popen("stop") as stop:
+            try:
+                shutdown = checkout.state / "backup-shutdown.json"
+                _wait_for(
+                    lambda: shutdown.exists() or stop.poll() is not None,
+                    "stop did not observe the independent fetch lease",
+                )
+                assert stop.poll() is None
+                pending = _success(checkout, "backup-status")["unresolved_shutdown"]
+                assert pending["instance"] is None
+                fcntl.flock(writer, fcntl.LOCK_UN)
+                out, err = stop.communicate(timeout=5)
+                assert stop.returncode == 1 and not out
+                assert "shutdown identity could not be confirmed" in err
+            finally:
+                if stop.poll() is None:
+                    stop.kill()
 
 
 @pytest.mark.parametrize(
@@ -133,10 +195,7 @@ def test_stop_does_not_adopt_an_unrelated_runtime_without_a_receipt(checkout):
     marker = unrelated / "existing-data"
     marker.write_text("unrelated state")
     _refused(checkout, "stop")
-    assert {path.name for path in checkout.state.iterdir()} == {
-        "command.lock",
-        "runtime",
-    }
+    assert {path.name for path in checkout.state.iterdir()} == {"runtime"}
     assert marker.read_text() == "unrelated state"
     assert "Refusing to adopt" in _refused(checkout, "setup")
 

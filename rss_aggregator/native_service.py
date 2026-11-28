@@ -8,6 +8,7 @@ import select
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -70,8 +71,6 @@ def web_check(port: int, path: str, *, host: str | None = None) -> tuple[int, by
 
 def save(target: Path, value: Any) -> None:
     """Persist a private complete record across crashes and readers."""
-    import tempfile
-
     fd, name = tempfile.mkstemp(dir=target.parent, prefix=".write-")
     try:
         with os.fdopen(fd, "w") as output:
@@ -151,8 +150,8 @@ def lease(
         os.close(fd)
 
 
-def install_writer_leases(staging: Path, state: Path) -> None:
-    """Publish stable lease paths only during initial, command-serialized setup."""
+def stage_writer_leases(staging: Path) -> None:
+    """Prepare stable lease files and their identities for first setup publication."""
     identities = {}
     for name in WRITER_LEASES:
         fd = os.open(staging / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -163,25 +162,24 @@ def install_writer_leases(staging: Path, state: Path) -> None:
         finally:
             os.close(fd)
     save(staging / WRITER_LEASE_RECORD, identities)
-    for name in (*WRITER_LEASES, WRITER_LEASE_RECORD):
-        # Publish on the same filesystem without replacing a race-appeared path.
-        os.link(staging / name, state / name, follow_symlinks=False)
-        (staging / name).unlink()
-    fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 class WriterLeases:
     """Inspect installed writer leases independently of generation/PID metadata."""
 
-    def __init__(self, state: Path) -> None:
-        """Require a complete identity record and extant private paths."""
+    def __init__(self, state: Path, *, names: tuple[str, ...] = WRITER_LEASES) -> None:
+        """Require a complete record and validate the requested private paths.
+
+        Capture uses the default complete set. A restricted set only proves the
+        named leases, for example when requesting an identified controller to stop.
+        """
         self.state = state
         record = read(state / WRITER_LEASE_RECORD)
-        if not isinstance(record, dict) or record.keys() != set(WRITER_LEASES):
+        if (
+            not isinstance(record, dict)
+            or record.keys() != set(WRITER_LEASES)
+            or not set(names) <= record.keys()
+        ):
             raise ValueError(
                 "Native writer lease identity record is missing or invalid."
             )
@@ -189,7 +187,8 @@ class WriterLeases:
         # on the *current* state device while requiring the installed inode.
         device = state.stat().st_dev
         self.identities: dict[str, tuple[int, int]] = {}
-        for name, inode in record.items():
+        for name in names:
+            inode = record[name]
             if type(inode) is not int or inode <= 0:
                 raise ValueError("Invalid native writer lease identity.")
             expected = (device, inode)
@@ -228,6 +227,57 @@ def initialized(data: Path) -> bool:
             "FreshRSS configuration is incomplete; inspect the selected data locally."
         )
     return complete
+
+
+@contextmanager
+def startup_writer_claim(state: Path, identity: dict[str, Any]) -> Iterator[int]:
+    """Publish attribution on the same locked file inherited by a startup writer."""
+    fd, temporary = tempfile.mkstemp(dir=state, prefix=".startup-writer-")
+    with os.fdopen(fd, "w") as claim:
+        try:
+            os.fchmod(fd, 0o600)
+            json.dump(identity, claim)
+            claim.flush()
+            os.fsync(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.replace(temporary, state / "startup-writer.json")
+            # Never unlink the published claim on parent exit. A detached child
+            # may still be draining. After unlock the record is inert.
+            yield fd
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def draining_startup_writer(state: Path) -> dict[str, Any] | None:
+    """Read startup attribution only from the actively locked published file."""
+    path = state / "startup-writer.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd) as stream:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            current = path.lstat()
+            if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                identity = json.load(stream)
+                if (
+                    isinstance(identity, dict)
+                    and identity.keys() == {"instance", "owner", "writer_generation"}
+                    and all(isinstance(value, str) for value in identity.values())
+                    and re.fullmatch(r"[0-9a-f]{32}", identity["writer_generation"])
+                ):
+                    return identity
+        return None
 
 
 def approval_path(home: Path, nonce: str) -> Path:
@@ -400,9 +450,14 @@ def _start_fetch(
     )
 
 
-def foreground_fetch(state: Path, data: Path, fetch_fd: int, timeout: int) -> int:
-    """Await a detached fetch caretaker without giving it the caller's command lock."""
-    fetch, owner = _start_fetch(state, data, fetch_fd, time.monotonic() + timeout)
+def foreground_fetch(
+    state: Path, data: Path, fetch_fd: int, timeout: int, *, claim_fd: int | None = None
+) -> int:
+    """Await a detached fetch, carrying attribution only for standalone startup."""
+    claims = () if claim_fd is None else (claim_fd,)
+    fetch, owner = _start_fetch(
+        state, data, fetch_fd, time.monotonic() + timeout, *claims
+    )
     try:
         return fetch.wait()
     finally:
@@ -416,17 +471,19 @@ def foreground_php(
     timeout: int,
     args: tuple[str, ...],
     *,
+    claim_fd: int,
     output: int | BinaryIO = subprocess.DEVNULL,
 ) -> int:
-    """Wait for independent preparation or configuration under its writer lease."""
+    """Wait for independent preparation or configuration under its writer leases."""
     operation, owner = _caretaker(
         "php",
         str(state),
         str(data),
         str(writer_fd),
         str(time.monotonic() + timeout),
+        str(claim_fd),
         *args,
-        fds=(writer_fd,),
+        fds=(writer_fd, claim_fd),
         stdout=output,
     )
     try:
@@ -585,8 +642,8 @@ if __name__ == "__main__":
                 Path(sys.argv[2]),
                 Path(sys.argv[3]),
                 float(sys.argv[5]),
-                (int(sys.argv[4]), *(map(int, sys.argv[6:]) if fetch else ())),
-                ("app/actualize_script.php",) if fetch else tuple(sys.argv[6:]),
+                (int(sys.argv[4]), *map(int, sys.argv[6:] if fetch else sys.argv[6:7])),
+                ("app/actualize_script.php",) if fetch else tuple(sys.argv[7:]),
                 stdout=subprocess.DEVNULL if fetch else 1,
             )
         )
