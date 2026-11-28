@@ -1,4 +1,4 @@
-"""Private, verified instance-backup archives without filesystem extraction."""
+"""Verify portable instance archives and copy complete native data trees."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import stat
 import struct
 import tarfile
 import tempfile
+import unicodedata
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -25,6 +26,20 @@ _PATH_METADATA_LIMIT = 8 * 1024 * 1024
 _PATH_STRING_OVERHEAD = 256
 _CHUNK = 1024 * 1024
 _PAX_FIELDS = {"path", "size", "uid", "gid", "mtime"}
+_RUNTIME_FIELDS = {
+    "freshrss_version",
+    "freshrss_sha256",
+    "runtime_version",
+    "runtime_sha256",
+    "php",
+    "caddy",
+    "platform",
+}
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+class _PathMetadataLimitExceeded(ValueError):
+    """The cumulative path metadata is too large to stage safely."""
 
 
 def _temporary(directory: Path, suffix: str) -> tuple[BinaryIO, Path]:
@@ -67,7 +82,7 @@ def _copy(source: BinaryIO, target: BinaryIO | None = None) -> tuple[str, int]:
 
 
 def _json(value: Any) -> bytes:
-    """Encode finite JSON deterministically, including caller image metadata."""
+    """Encode finite JSON deterministically, including compatibility metadata."""
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -83,14 +98,34 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _manifest(data: bytes, image: dict[str, Any]) -> dict[str, Any]:
-    """Check the complete manifest schema and exact configured image identity."""
+def _compatibility(
+    image: dict[str, Any] | None, runtime: dict[str, Any] | None
+) -> tuple[int, str, dict[str, Any]]:
+    """Require an explicit, mutually exclusive legacy or native identity."""
+    if runtime is None and isinstance(image, dict):
+        return 1, "image", image
+    if (
+        image is not None
+        or not isinstance(runtime, dict)
+        or set(runtime) != _RUNTIME_FIELDS
+        or not all(isinstance(value, str) and value for value in runtime.values())
+        or _DIGEST.fullmatch(runtime["freshrss_sha256"]) is None
+        or _DIGEST.fullmatch(runtime["runtime_sha256"]) is None
+    ):
+        raise ValueError
+    return 2, "runtime", runtime
+
+
+def _manifest(
+    data: bytes, version: int, key: str, identity: dict[str, Any]
+) -> dict[str, Any]:
+    """Check the selected format's complete schema and exact identity."""
     value = json.loads(data.decode("utf-8"), object_pairs_hook=_object)
     if not isinstance(value, dict) or set(value) != {
         "format",
         "format_version",
         "created_at",
-        "image",
+        key,
         "includes",
         "payload",
     }:
@@ -98,10 +133,10 @@ def _manifest(data: bytes, image: dict[str, Any]) -> dict[str, Any]:
     if (
         value["format"] != _FORMAT
         or type(value["format_version"]) is not int
-        or value["format_version"] != 1
+        or value["format_version"] != version
         or value["includes"] != _INCLUDES
-        or not isinstance(value["image"], dict)
-        or _json(value["image"]) != _json(image)
+        or not isinstance(value[key], dict)
+        or _json(value[key]) != _json(identity)
         or not isinstance(value["created_at"], str)
     ):
         raise ValueError
@@ -113,7 +148,7 @@ def _manifest(data: bytes, image: dict[str, Any]) -> dict[str, Any]:
         not isinstance(payload, dict)
         or set(payload) != {"sha256", "size"}
         or not isinstance(payload["sha256"], str)
-        or re.fullmatch(r"[0-9a-f]{64}", payload["sha256"]) is None
+        or _DIGEST.fullmatch(payload["sha256"]) is None
         or type(payload["size"]) is not int
         or payload["size"] < 0
     ):
@@ -294,6 +329,21 @@ def _path(name: str) -> str:
     return normalized
 
 
+def _charge_path_metadata(used: int, components: list[str]) -> int:
+    """Charge a normalized member and all its ancestors without building prefixes.
+
+    Count four times each prefix's UTF-8 bytes plus 256 bytes of overhead.
+    Shared ancestors are charged again for every member; payload is not capped.
+    """
+    prefix_bytes = 0
+    for index, component in enumerate(components):
+        prefix_bytes += len(component.encode("utf-8")) + (index > 0)
+        used += 4 * prefix_bytes + _PATH_STRING_OVERHEAD
+    if used > _PATH_METADATA_LIMIT:
+        raise _PathMetadataLimitExceeded
+    return used
+
+
 def _number(value: str, fractional: bool = False) -> int:
     """Parse bounded numeric PAX ownership, size, or modification time."""
     if len(value) > 128:
@@ -317,21 +367,27 @@ def _padding(source: BinaryIO, size: int) -> None:
         raise ValueError
 
 
-def _repack(source: BinaryIO, target: BinaryIO) -> None:
+def _native_name(path: str, paths: dict[str, str]) -> None:
+    """Reject different spellings that alias on a default macOS filesystem."""
+    folded = unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+    if paths.setdefault(folded, path) != path:
+        raise ValueError
+
+
+def _repack(source: BinaryIO, target: BinaryIO, *, native_paths: bool) -> None:
     """Validate the entire raw tar and emit only normalized files/directories.
 
     Header extensions are parsed with bounded allocations rather than allowing
     tarfile to load arbitrary PAX or GNU metadata. File content is streamed.
-    Normalized paths have at most 64 components. Before constructing ancestor
-    strings, charge each member name and every ancestor against an 8 MiB
-    cumulative budget: four times its UTF-8 byte length plus 256 bytes for
-    string/set overhead. Shared ancestors are conservatively charged again for
-    every member, even when already retained. Payload bytes are not capped.
+    Normalized paths have at most 64 components. Charge each member and its
+    ancestors against the cumulative path metadata budget before constructing
+    and retaining ancestor strings.
     """
     path_metadata = 0
     seen: set[str] = set()
     files: set[str] = set()
     ancestors: set[str] = set()
+    native_names: dict[str, str] = {}
     global_pax: dict[str, str] = {}
     local: dict[str, str] = {}
     pending = 0
@@ -394,16 +450,15 @@ def _repack(source: BinaryIO, target: BinaryIO) -> None:
             if name in seen or (name == "." and not is_directory):
                 raise ValueError
             components = name.split("/")
-            prefix_bytes = 0
-            for index, component in enumerate(components):
-                prefix_bytes += len(component.encode("utf-8")) + (index > 0)
-                path_metadata += 4 * prefix_bytes + _PATH_STRING_OVERHEAD
-            if path_metadata > _PATH_METADATA_LIMIT:
-                raise ValueError
+            path_metadata = _charge_path_metadata(path_metadata, components)
             parents = components[:-1]
             parent_paths = {"/".join(parents[:i]) for i in range(1, len(parents) + 1)}
             if parent_paths & files or (not is_directory and name in ancestors):
                 raise ValueError
+            if native_paths:
+                _native_name(name, native_names)
+                for parent in parent_paths:
+                    _native_name(parent, native_names)
             if is_directory and size:
                 raise ValueError
             clean = tarfile.TarInfo(name)
@@ -429,12 +484,12 @@ def _repack(source: BinaryIO, target: BinaryIO) -> None:
             pending = 0
 
 
-def _sanitize(payload: Path, directory: Path) -> Path:
+def _sanitize(payload: Path, directory: Path, *, native_paths: bool) -> Path:
     """Return a private canonical tar, removing partial output on any failure."""
     target, path = _temporary(directory, ".tar")
     try:
         with target, payload.open("rb") as source:
-            _repack(source, target)
+            _repack(source, target, native_paths=native_paths)
             target.flush()
             os.fsync(target.fileno())
         return path
@@ -444,17 +499,24 @@ def _sanitize(payload: Path, directory: Path) -> Path:
 
 
 def validate_archive(
-    archive: Path, directory: Path, image: dict[str, Any]
+    archive: Path,
+    directory: Path,
+    image: dict[str, Any] | None = None,
+    *,
+    runtime: dict[str, Any] | None = None,
+    native_paths: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     """Verify an instance backup and return its manifest and sanitized data tar.
 
     The caller owns the returned private tar and must remove it after use. No
     archive paths are extracted. The work directory must already be private.
+    Supplying ``runtime`` accepts only v2; supplying ``image`` accepts only v1.
+    Set ``native_paths`` for v1 migration to additionally reject macOS aliases.
 
     Raises
     ------
     ValueError
-        The archive, manifest, image identity, or tar content is invalid.
+        The archive, manifest, compatibility identity, or tar content is invalid.
     OSError
         Private temporary storage or archive I/O failed.
     """
@@ -462,6 +524,7 @@ def validate_archive(
     sanitized: Path | None = None
     complete = False
     try:
+        version, key, identity = _compatibility(image, runtime)
         _zip_metadata(archive)
         with zipfile.ZipFile(archive) as source:
             entries = source.infolist()
@@ -483,7 +546,7 @@ def validate_archive(
             _local_headers(archive, entries)
             if source.getinfo("manifest.json").file_size > _METADATA_LIMIT:
                 raise ValueError
-            manifest = _manifest(source.read("manifest.json"), image)
+            manifest = _manifest(source.read("manifest.json"), version, key, identity)
             if source.getinfo("data.tar").file_size != manifest["payload"]["size"]:
                 raise ValueError
             target, raw = _temporary(directory, ".raw.tar")
@@ -494,7 +557,7 @@ def validate_archive(
                 or size != manifest["payload"]["size"]
             ):
                 raise ValueError
-        sanitized = _sanitize(raw, directory)
+        sanitized = _sanitize(raw, directory, native_paths=native_paths or version == 2)
         _cleanup(raw)
         raw = None
         complete = True
@@ -508,22 +571,27 @@ def validate_archive(
 
 
 def create_archive(
-    payload: Path, directory: Path, image: dict[str, Any]
+    payload: Path,
+    directory: Path,
+    *,
+    runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate, privately stage, verify, and atomically publish an instance backup.
+    """Validate, stage, verify, and atomically publish a native v2 instance backup.
 
     Existing archives are never overwritten. Publication uses a hard link in the
     supplied directory; the caller must ensure that directory has mode 0700.
     The result contains the absolute archive path, whole-ZIP SHA-256, verification
-    status, and manifest. Errors deliberately omit paths and archived content.
+    status, and a manifest with the native runtime identity. Errors omit paths
+    and archived content.
     """
     temporary: Path | None = None
     sanitized: Path | None = None
     published: Path | None = None
     complete = False
     try:
+        version, key, identity = _compatibility(None, runtime)
         directory = directory.resolve()
-        sanitized = _sanitize(payload, directory)
+        sanitized = _sanitize(payload, directory, native_paths=True)
         sanitized.unlink()
         sanitized = None
         with payload.open("rb") as source:
@@ -531,9 +599,9 @@ def create_archive(
         now = datetime.now(timezone.utc)
         manifest = {
             "format": _FORMAT,
-            "format_version": 1,
+            "format_version": version,
             "created_at": now.isoformat(timespec="seconds"),
-            "image": image,
+            key: identity,
             "includes": _INCLUDES,
             "payload": {"sha256": digest, "size": size},
         }
@@ -556,7 +624,7 @@ def create_archive(
                                 _copy(source, output)
             target.flush()
             os.fsync(target.fileno())
-        verified, sanitized = validate_archive(temporary, directory, image)
+        verified, sanitized = validate_archive(temporary, directory, runtime=runtime)
         sanitized.unlink()
         sanitized = None
         with temporary.open("rb") as source:
@@ -584,3 +652,152 @@ def create_archive(
         raise ValueError("Invalid backup archive.") from None
     finally:
         _cleanup(temporary, sanitized, published if not complete else None)
+
+
+def _write_tree(
+    directory: int,
+    output: tarfile.TarFile,
+    *,
+    prefix: str = "",
+    path_metadata: int = 0,
+) -> int:
+    """Copy without following links and return the updated whole-tree budget use."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            name = _path(prefix + entry.name)
+            path_metadata = _charge_path_metadata(path_metadata, name.split("/"))
+            before = entry.stat(follow_symlinks=False)
+            is_directory = stat.S_ISDIR(before.st_mode)
+            if not is_directory and (
+                not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            ):
+                raise ValueError
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if is_directory:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(entry.name, flags, dir_fd=directory)
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022
+                    or (not is_directory and info.st_nlink != 1)
+                ):
+                    raise ValueError
+                member = tarfile.TarInfo(name)
+                member.mtime = int(info.st_mtime)
+                if is_directory:
+                    member.type = tarfile.DIRTYPE
+                    member.mode = 0o700
+                    output.addfile(member)
+                    path_metadata = _write_tree(
+                        descriptor,
+                        output,
+                        prefix=name + "/",
+                        path_metadata=path_metadata,
+                    )
+                else:
+                    member.size = info.st_size
+                    member.mode = 0o600
+                    with os.fdopen(descriptor, "rb", closefd=False) as source:
+                        output.addfile(member, source)
+            finally:
+                os.close(descriptor)
+    return path_metadata
+
+
+def write_data_tar(data: Path, directory: Path) -> Path:
+    """Capture quiesced data, enforcing the path budget before staging each member."""
+    target, path = _temporary(directory, ".tar")
+    complete = False
+    try:
+        with (
+            target,
+            tarfile.open(fileobj=target, mode="w", format=tarfile.GNU_FORMAT) as output,
+        ):
+            descriptor = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                _write_tree(descriptor, output)
+            finally:
+                os.close(descriptor)
+        complete = True
+        return path
+    except OSError:
+        raise OSError("Could not capture the FreshRSS data directory.") from None
+    except _PathMetadataLimitExceeded:
+        raise ValueError(
+            "FreshRSS data exceeds the backup path metadata limit."
+        ) from None
+    except ValueError:
+        raise ValueError(
+            "FreshRSS data contains an unsafe file or directory."
+        ) from None
+    finally:
+        if not complete:
+            _cleanup(path)
+
+
+def sync_directory(directory: Path) -> None:
+    """Persist changes to a real directory without following a final symlink."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _private_parents(directory: Path, created: set[Path]) -> None:
+    """Create only exact, previously unseen directories with private modes."""
+    if directory not in created:
+        _private_parents(directory.parent, created)
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        created.add(directory)
+
+
+def unpack_data(payload: Path, directory: Path) -> None:
+    """Copy a validated canonical tar into a new private data directory.
+
+    Never apply archived owners, permissions, link types or other metadata.
+    The caller owns and discards the unpublished staging tree on failure.
+    """
+    try:
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        created = {directory}
+        with tarfile.open(payload, mode="r:") as archive:
+            for member in archive:
+                if _path(member.name) != member.name:
+                    raise ValueError
+                if member.name == "." and member.isdir():
+                    continue
+                target = directory / member.name
+                if member.isdir():
+                    _private_parents(target, created)
+                    continue
+                if not member.isreg():
+                    raise ValueError
+                _private_parents(target.parent, created)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ValueError
+                with source:
+                    descriptor = os.open(
+                        target,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    with os.fdopen(descriptor, "wb") as output:
+                        os.fchmod(output.fileno(), 0o600)
+                        _digest, size = _copy(source, output)
+                        if size != member.size:
+                            raise ValueError
+                        output.flush()
+                        os.fsync(output.fileno())
+        for path in created:
+            sync_directory(path)
+    except OSError:
+        raise OSError("Could not stage the FreshRSS data directory.") from None
+    except (ValueError, tarfile.TarError):
+        raise ValueError("Invalid backup data directory.") from None

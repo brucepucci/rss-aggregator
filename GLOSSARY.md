@@ -10,6 +10,10 @@ The language for a self-hosted reading service that collects public and paid fee
 The self-hosted reading service that holds users, subscriptions, collected articles, and reading state.
 _Avoid_: Feed reader, subscription
 
+**Selected instance**:
+The FreshRSS instance designated for service at the next startup; a recovered instance is not selected merely because its data are present.
+_Avoid_: Restored instance (when current service selection is meant), running instance (when it may be stopped)
+
 **FreshRSS user**:
 An identity within a FreshRSS instance that owns subscriptions and reading state; distinct from a publication membership or a device's reader configuration.
 _Avoid_: Account (without specifying which service)

@@ -1,448 +1,656 @@
-"""Quiesced instance backups and non-overwriting recovery on the owned engine."""
+"""Quiesced backups and explicit, non-overwriting native instance recovery."""
 
+from __future__ import annotations
+
+import ctypes
+import errno
 import json
 import os
 import re
 import stat
+import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from rss_aggregator.archives import create_archive, validate_archive
+from rss_aggregator import native_service
+from rss_aggregator.archives import (
+    create_archive,
+    sync_directory,
+    unpack_data,
+    validate_archive,
+    write_data_tar,
+)
 from rss_aggregator.backup_schedule import SUCCESS, BackupSchedule
-from rss_aggregator.private_access import PrivateAccess
 
 if TYPE_CHECKING:
     from rss_aggregator.runtime import Runtime
 
-RECOVERY_RECORD = "recovery-volumes.json"
 BACKUP_RECORD = "last-backup.json"
+SHUTDOWN_SUCCESS = "shutdown-backup-success.json"
+SELECTION = "selected-instance.json"
+INITIAL_INSTANCE = "default"
+INSTANCE_RECORD = "instance.json"
+_INITIAL_PROVISIONED = "default-provisioned.json"
+_SELECTION_REQUIRED = "selection-required.json"
+_WRITER_GENERATION = "writer-generation.json"
 
 
-def volume_name(value: str) -> str:
-    """Validate a single explicit Podman volume name, never an option or path."""
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value):
-        raise ValueError("Volume must be a 1–128 character Podman name, not a path.")
+def same_data_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Match activation compatibility without requiring the same PHP/web pin."""
+    return all(
+        key in left and key in right and left[key] == right[key]
+        for key in ("freshrss_version", "freshrss_sha256", "platform")
+    )
+
+
+def instance_name(value: str) -> str:
+    """Validate one explicit instance name rather than a path or option."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9-]{0,47}", value
+    ):
+        raise ValueError(
+            "Instance must be 1–48 lowercase letters, digits or hyphens, starting with a letter or digit."
+        )
     return value
 
 
-class Recovery:
-    """Keep recovery operations behind the runtime's ownership checks and lock."""
+def selected_instance(state: Path) -> str:
+    """Read explicit selection, failing closed once a selection was attempted."""
+    from rss_aggregator.runtime import RuntimeFailure
 
-    def __init__(self, runtime: "Runtime") -> None:
-        """Bind the active runtime and its resource names, including test fixtures."""
-        from rss_aggregator.runtime import APP, CHECK, LABEL, MACHINE, RuntimeFailure
+    path = state / SELECTION
+    try:
+        selection = native_service.read(path)
+        if selection is not None or os.path.lexists(path):
+            return instance_name(selection["instance"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise RuntimeFailure(
+            "Invalid native instance selection; inspect locally and explicitly select the intended instance."
+        ) from None
+    if os.path.lexists(state / _SELECTION_REQUIRED):
+        raise RuntimeFailure(
+            "Instance selection is missing; inspect locally and explicitly select the intended instance."
+        )
+    return INITIAL_INSTANCE
+
+
+def _contains(directory: Path, location: Path) -> bool:
+    """Check ancestry even when the filesystem accepts case or Unicode aliases."""
+    exists = directory.exists()
+    return any(
+        candidate == directory
+        or (exists and candidate.exists() and candidate.samefile(directory))
+        for candidate in (location, *location.parents)
+    )
+
+
+def _rename_exclusive(source: Path, target: Path) -> None:
+    """Publish a directory atomically, refusing even an empty existing target."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        result = rename(os.fsencode(source), os.fsencode(target), 0x4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        # Support synthetic recovery checks off macOS, not production deployment.
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        result = rename(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+    else:
+        raise OSError("Exclusive instance publication is unavailable on this platform.")
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+class Recovery:
+    """Keep native instance recovery within the runtime's ownership and lock."""
+
+    def __init__(self, runtime: Runtime) -> None:
+        """Bind the runtime for one CLI operation."""
+        from rss_aggregator.runtime import RuntimeFailure
 
         self.runtime = runtime
-        self.app, self.check, self.label, self.machine = APP, CHECK, LABEL, MACHINE
         self.failure = RuntimeFailure
 
+    def _require_lock(self) -> None:
+        """Never mutate or copy data outside the serialized command boundary."""
+        if self.runtime._command_lock_fd is None:
+            raise self.failure("Native recovery requires the project command lock.")
+
+    def _private(self, path: Path, *, directory: bool) -> None:
+        """Reject links, unsupported types, foreign owners and public modes."""
+        info = path.lstat()
+        right_type = (
+            stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        )
+        if (
+            not right_type
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or (not directory and info.st_nlink != 1)
+        ):
+            raise self.failure(
+                "Managed recovery paths must be private, owned files and directories; links are refused."
+            )
+
     def _directory(self) -> Path:
-        """Require an explicitly chosen private backup directory outside Git."""
+        """Require a private destination outside Git and receipt-marked state."""
         setting = os.environ.get("RSS_BACKUP_DIR")
         if not setting or not Path(setting).expanduser().is_absolute():
             raise self.failure(
                 "Set RSS_BACKUP_DIR to an absolute private directory outside the checkout."
             )
-        path = Path(setting).expanduser().resolve()
-        if path == self.runtime.root or self.runtime.root in path.parents:
-            raise self.failure("RSS_BACKUP_DIR must be outside the checkout.")
-        if any((parent / ".git").exists() for parent in (path, *path.parents)):
-            raise self.failure("RSS_BACKUP_DIR must be outside every Git checkout.")
+        raw = Path(setting).expanduser()
+        if raw.is_symlink():
+            raise self.failure("RSS_BACKUP_DIR must not be a symlink.")
+        path = raw.resolve()
+        checkout, state = self.runtime.root, self.runtime.state_dir
+        for candidate in dict.fromkeys((Path(os.path.abspath(raw)), path)):
+            if _contains(state, candidate) or _contains(candidate, state):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside and not contain RSS_STATE_DIR."
+                )
+            if _contains(checkout, candidate) or _contains(candidate, checkout):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside and not contain the checkout."
+                )
+            ancestry = (candidate, *candidate.parents)
+            if any(os.path.lexists(parent / ".git") for parent in ancestry):
+                raise self.failure("RSS_BACKUP_DIR must be outside every Git checkout.")
+            # Like the state selector, treat receipt presence as a boundary
+            # even if the receipt is damaged or the runtime has been removed.
+            if any(
+                os.path.lexists(parent / "native-owner.json") for parent in ancestry
+            ):
+                raise self.failure(
+                    "RSS_BACKUP_DIR must be outside every native state directory."
+                )
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = path.stat()
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        try:
+            self._private(path, directory=True)
+        except self.failure:
             raise self.failure(
                 "RSS_BACKUP_DIR must be owned by you with private permissions (0700)."
-            )
+            ) from None
         return path
 
-    def _ensure_vm(self) -> tuple[dict[str, Any], bool]:
-        """Start only an owned stopped VM when no other machine is running."""
-        runtime = self.runtime
-        owner, machine = runtime._owned()
-        was_stopped = machine["State"] == "stopped"
-        if machine["State"] not in ("running", "stopped"):
-            raise self.failure(
-                "Wait for the project VM transition to finish before recovery."
-            )
-        if was_stopped:
-            if any(
-                m["Name"] != self.machine and m.get("Running")
-                for m in runtime._inventory()["machines"]
-            ):
-                raise self.failure(
-                    "Another machine is running; it has not been changed."
-                )
-            runtime._run(
-                "podman",
-                "machine",
-                "start",
-                "--update-connection=false",
-                self.machine,
-                inherit_lock=False,
-            )
-            runtime._owned()
-        return owner, was_stopped
+    def _instances(self, *, create: bool = False) -> Path:
+        """Locate the real private instance namespace without following links."""
+        state = self.runtime.state_dir
+        self._private(state, directory=True)
+        directory = state / "instances"
+        if create and not os.path.lexists(directory):
+            directory.mkdir(mode=0o700)
+            sync_directory(state)
+        if os.path.lexists(directory):
+            self._private(directory, directory=True)
+        return directory
 
-    def _engines_idle(self, owner: dict[str, Any], *, stop: bool) -> None:
-        """Refuse foreign workloads before stopping any owned application writers."""
-        runtime = self.runtime
-        rootful = runtime._json_run(
-            "podman",
-            "machine",
-            "ssh",
-            self.machine,
-            "sudo",
-            "podman",
-            "ps",
-            "--format",
-            "json",
-        )
-        containers = json.loads(runtime._podman("ps", "--format", "json").stdout)
-        if not isinstance(rootful, list) or not isinstance(containers, list):
+    def _provenance(self, instance: str) -> tuple[Path, dict[str, Any]] | None:
+        """Read the existing private instance and its independent provenance."""
+        base = self._instances() / instance_name(instance)
+        if not os.path.lexists(base):
+            return None
+        # Case-insensitive filesystems must not silently select a differently
+        # spelled directory, even when its data have the same owner and pin.
+        self._private(base, directory=True)
+        record_path = base / INSTANCE_RECORD
+        try:
+            self._private(record_path, directory=False)
+            record = json.loads(record_path.read_text())
+            self._private(base / "data", directory=True)
+        except (OSError, ValueError):
             raise self.failure(
-                "Cannot inspect both container engines; VM left running."
-            )
-        if rootful:
-            raise self.failure(
-                "Unrelated running rootful containers; project VM left running."
-            )
-        for item in containers:
-            name = (
-                item["Names"][0] if isinstance(item["Names"], list) else item["Names"]
-            )
-            if name not in (self.app, self.check):
-                raise self.failure(
-                    "Unrelated running container; project VM left running."
-                )
-            runtime._check_label("container", name, owner)
-        if not stop and containers:
-            raise self.failure("Writers are still running; snapshot refused.")
-        if stop:
-            PrivateAccess(runtime).stop(owner)
-            for name in (self.app, self.check):
-                if runtime._exists("container", name):
-                    item = runtime._check_label("container", name, owner)
-                    if item["State"]["Running"]:
-                        runtime._podman("stop", "--time", "60", name)
-                        if runtime._check_label("container", name, owner)["State"][
-                            "Running"
-                        ]:
-                            raise self.failure(
-                                "Application did not stop; VM left running."
-                            )
-
-    def _source_image(self, owner: dict[str, Any]) -> dict[str, Any]:
-        """Record only the pinned identity actually attached to the source app."""
-        runtime = self.runtime
-        self.check_activation()
-        image = runtime._image()
-        info = runtime._json_run(
-            "podman", "--connection", self.machine, "image", "inspect", image["image"]
-        )[0]
+                "Instance is incomplete or unreadable; preserve it and inspect recovery state locally."
+            ) from None
         if (
-            image["image"] not in info["RepoDigests"]
-            or image["image"].split("@")[0] + "@" + image["platform_manifest"]
-            not in info["RepoDigests"]
-            or info["Os"] + "/" + info["Architecture"] != image["platform"]
-            or info.get("Labels", {}).get("org.opencontainers.image.version")
-            != image["version"]
-            or info.get("Labels", {}).get("org.opencontainers.image.revision")
-            != image["revision"]
+            not isinstance(record, dict)
+            or type(record.get("version")) is not int
+            or record["version"] != 1
+            or record.get("instance") != instance
+            or not isinstance(record.get("owner"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["owner"]) is None
+        ):
+            raise self.failure("Instance record does not establish managed ownership.")
+        return base / "data", record
+
+    def _data(
+        self, instance: str, owner: dict[str, Any], identity: dict[str, Any]
+    ) -> Path | None:
+        """Find complete data only when its private record matches owner and pin."""
+        provenance = self._provenance(instance)
+        if provenance is None:
+            return None
+        data, record = provenance
+        if record["owner"] != owner["token"]:
+            raise self.failure("Instance record does not establish managed ownership.")
+        stored = record.get("identity")
+        if (
+            not isinstance(stored, dict)
+            or stored.keys() != identity.keys()
+            or not same_data_identity(stored, identity)
         ):
             raise self.failure(
-                "Source image differs from the pinned recovery image; reconcile configuration first."
+                "Instance requires its recorded FreshRSS release, source SHA-256 and platform before activation."
             )
-        if runtime._exists("container", self.app):
-            app = runtime._check_label("container", self.app, owner)
-            if any(
-                m.get("Name") == runtime.volume
-                and m.get("Destination") == "/var/www/FreshRSS/data"
-                for m in app["Mounts"]
-            ):
-                if app["Image"].removeprefix("sha256:") != info["Id"].removeprefix(
-                    "sha256:"
-                ):
-                    raise self.failure(
-                        "Source container differs from the pinned image; do not mislabel a backup."
-                    )
-                return image
-            if app["State"]["Running"]:
-                raise self.failure(
-                    "Source container does not mount the selected data volume."
-                )
-        record_path = runtime.state_dir / RECOVERY_RECORD
-        records = json.loads(record_path.read_text()) if record_path.exists() else {}
-        record = records.get(runtime.volume, {})
-        if record.get("status") != "ready" or record.get("image") != image:
-            raise self.failure(
-                "Cannot establish the unattached volume's image. Start it with the reviewed matching pin before backup."
-            )
-        return image
+        return data
+
+    def receipt_loss_identity(
+        self, instance: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read candidate backup evidence; never authorize writer control from it."""
+        provenance = self._provenance(instance)
+        if provenance is None:
+            return None
+        _data, record = provenance
+        installed = record.get("identity")
+        if not isinstance(installed, dict):
+            return None
+        return {"token": record["owner"]}, installed
+
+    def _initial_absent(self, instance: str) -> bool:
+        """Distinguish pristine state from a lost or interrupted instance."""
+        state = self.runtime.state_dir
+        return instance == INITIAL_INSTANCE and not any(
+            os.path.lexists(state / name) for name in (SELECTION, _INITIAL_PROVISIONED)
+        )
+
+    def pristine(self) -> bool:
+        """Return whether no default was attempted and no instance state exists."""
+        self._require_lock()
+        instances = self._instances()
+        return self._initial_absent(self.runtime.instance) and (
+            not instances.exists() or not any(instances.iterdir())
+        )
+
+    def _remember_default(self, instance: str) -> None:
+        """Keep durable default provenance outside the instance tree."""
+        if instance == INITIAL_INSTANCE and not os.path.lexists(
+            self.runtime.state_dir / _INITIAL_PROVISIONED
+        ):
+            self.runtime._save(_INITIAL_PROVISIONED, {"version": 1})
 
     def check_activation(self) -> None:
-        """Require the recorded image until a volume completes its first start.
-
-        Older records without an activation marker are treated conservatively:
-        start once with their recorded pin before attempting an image update.
-        This guard never changes provenance, including on refusal.
-        """
+        """Require selected data to be complete, private, owned and compatible."""
         runtime = self.runtime
-        path = runtime.state_dir / RECOVERY_RECORD
-        records = json.loads(path.read_text()) if path.exists() else {}
-        record = records.get(runtime.volume)
-        if record is None:
-            return
-        if record.get("status") != "ready":
-            raise self.failure("Restore target is incomplete and cannot be activated.")
-        if record.get("activated") is not True and record["image"] != runtime._image():
+        owner, _installed = runtime._owned()
+        instance = runtime.instance
+        if self._data(
+            instance, owner, runtime._identity()
+        ) is None and not self._initial_absent(instance):
             raise self.failure(
-                "First activation requires the recorded image; restore the matching pin and complete start or replace before an intentional image update."
+                "Selected instance data are absent; refusing activation."
             )
 
-    def record_image(self, *, activated: bool = False) -> None:
-        """Retain provenance; only a completed start marks first activation.
-
-        Taking a snapshot must not discharge a pending recovery activation.
-        Once activated, deliberate reviewed pin updates remain supported.
-        """
-        self.check_activation()
+    def ensure_data(self) -> Path:
+        """Return selected data, creating only the pristine initial instance."""
+        self._require_lock()
         runtime = self.runtime
-        path = runtime.state_dir / RECOVERY_RECORD
-        records = json.loads(path.read_text()) if path.exists() else {}
-        records[runtime.volume] = {
-            "status": "ready",
-            "image": runtime._image(),
-            "activated": activated
-            or records.get(runtime.volume, {}).get("activated") is True,
+        owner, _installed = runtime._owned()
+        identity = runtime._identity()
+        instance = runtime.instance
+        data = self._data(instance, owner, identity)
+        if data is not None:
+            self._remember_default(instance)
+            return data
+        if not self._initial_absent(instance):
+            raise self.failure(
+                "Selected instance data are absent; refusing activation."
+            )
+        self._publish(instance, owner, identity)
+        return runtime.data_dir
+
+    def _selected_data(self) -> Path:
+        """Require an owned selected instance compatible with the installed pin."""
+        self._require_lock()
+        owner, installed = self.runtime._owned(require_current=False, verify=False)
+        data = self._data(self.runtime.instance, owner, installed)
+        if data is None:
+            raise self.failure("Selected instance data are absent.")
+        return data
+
+    def _read_generation(
+        self, data: Path, *, require_record: bool = False
+    ) -> str | None:
+        """Read private generation evidence; never infer absence for upgrade."""
+        path = data.parent / _WRITER_GENERATION
+        if not os.path.lexists(path):
+            if require_record:
+                raise self.failure(
+                    "Writer generation record is missing; cannot authorize upgrade from the shutdown archive. Preserve the instance and inspect locally."
+                )
+            return None
+        try:
+            self._private(path, directory=False)
+            record = native_service.read(path)
+            if not isinstance(record, dict) or record.keys() != {"writer_generation"}:
+                raise ValueError
+            generation = record["writer_generation"]
+            if generation is not None and (
+                not isinstance(generation, str)
+                or uuid.UUID(generation, version=4).hex != generation
+            ):
+                raise ValueError
+        except (OSError, ValueError):
+            raise self.failure(
+                "Invalid writer generation record; preserve it and inspect selected instance state locally."
+            ) from None
+        return generation
+
+    def mark_writer_start(self) -> None:
+        """Durably invalidate earlier captures before a new writer may touch data."""
+        data = self._selected_data()
+        self._read_generation(data)
+        native_service.save(
+            data.parent / _WRITER_GENERATION, {"writer_generation": uuid.uuid4().hex}
+        )
+
+    def writer_generation(self, *, require_record: bool = False) -> str | None:
+        """Return the selected generation, optionally distinguishing absence from null."""
+        return self._read_generation(
+            self._selected_data(), require_record=require_record
+        )
+
+    def shutdown_generation(
+        self,
+        instance: str,
+        owner: dict[str, Any],
+        installed: dict[str, Any],
+        *,
+        require_record: bool = False,
+    ) -> str | None:
+        """Read owned instance evidence independently of layout and selection."""
+        data = self._data(instance, owner, installed)
+        if data is None:
+            raise self.failure("Shutdown instance data are absent.")
+        return self._read_generation(data, require_record=require_record)
+
+    def _publish(
+        self,
+        instance: str,
+        owner: dict[str, Any],
+        identity: dict[str, Any],
+        *,
+        payload: Path | None = None,
+        legacy_image: dict[str, Any] | None = None,
+    ) -> None:
+        """Durably stage private data and provenance before exclusive publication."""
+        # Record the provisioning attempt before creating data. An interruption
+        # may require recovery, but must never authorize silent reinitialization.
+        self._remember_default(instance)
+        directory = self._instances(create=True)
+        target = directory / instance
+        record = {
+            "version": 1,
+            "instance": instance,
+            "owner": owner["token"],
+            "identity": identity,
         }
-        runtime._save(RECOVERY_RECORD, records)
+        if legacy_image is not None:
+            record["legacy_image"] = legacy_image
+        with tempfile.TemporaryDirectory(
+            prefix=".restore-", dir=directory
+        ) as temporary:
+            stage = Path(temporary) / "instance"
+            stage.mkdir(mode=0o700)
+            if payload is None:
+                (stage / "data").mkdir(mode=0o700)
+                sync_directory(stage / "data")
+            else:
+                unpack_data(payload, stage / "data")
+            descriptor = os.open(
+                stage / INSTANCE_RECORD, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w") as output:
+                json.dump(record, output, allow_nan=False)
+                output.flush()
+                os.fsync(output.fileno())
+            # An explicit null is evidence that this instance has never begun a
+            # writer generation; a lost record cannot supply that evidence.
+            native_service.save(stage / _WRITER_GENERATION, {"writer_generation": None})
+            sync_directory(stage)
+            try:
+                _rename_exclusive(stage, target)
+            except OSError as error:
+                if error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise self.failure(
+                        "Instance target already exists; choose a fresh name. Nothing overwritten."
+                    ) from None
+                raise self.failure(
+                    "Could not publish the native instance atomically."
+                ) from None
+            sync_directory(directory)
 
-    def snapshot(
-        self, owner: dict[str, Any], directory: Path | None = None
+    def _snapshot(
+        self,
+        data: Path,
+        directory: Path,
+        instance: str,
+        identity: dict[str, Any],
+        *,
+        via: Literal["stop", "backup"],
     ) -> dict[str, Any]:
-        """Export a fully quiesced owned volume and publish only a verified archive."""
+        """Publish verified data and record success independently of resumption."""
         runtime = self.runtime
-        directory = directory if directory is not None else self._directory()
-        runtime._check_label("volume", runtime.volume, owner)
-        self._engines_idle(owner, stop=False)
-        image = self._source_image(owner)
-        self.record_image()
+        if not runtime._idle():
+            raise self.failure("FreshRSS writers are still running; snapshot refused.")
+        generation = self._read_generation(data)
         with tempfile.TemporaryDirectory(
             prefix=".rss-export-", dir=directory
         ) as temporary:
-            payload = Path(temporary) / "data.tar"
-            payload.touch(mode=0o600)
-            result = runtime._podman(
-                "volume",
-                "export",
-                "--output",
-                str(payload),
-                runtime.volume,
-                check=False,
-            )
-            if result.returncode:
-                raise self.failure(
-                    "Volume export failed; no archive published. Inspect the local engine without sharing sensitive output."
-                )
-            result = create_archive(payload, directory, image)
+            payload = write_data_tar(data, Path(temporary))
+            result = create_archive(payload, directory, runtime=identity)
         runtime._save(
             BACKUP_RECORD,
             {"archive": result["archive"], "sha256": result["sha256"]},
         )
-        runtime._save(
-            SUCCESS,
-            {
-                **result,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "volume": runtime.volume,
-            },
-        )
+        evidence = {
+            **result,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "instance": instance,
+            "writer_generation": generation,
+            "via": via,
+        }
+        runtime._save(SUCCESS, evidence)
+        if via == "stop":
+            runtime._save(SHUTDOWN_SUCCESS, evidence)
         return result
 
     def backup(self) -> dict[str, Any]:
-        """Back up while preserving the prior VM/application running state."""
+        """Back up complete data and resume only previously running, allowed web."""
+        self._require_lock()
         runtime = self.runtime
         directory = self._directory()
-        owner, _machine = runtime._owned()
+        owner, _installed = runtime._owned()
+        instance, identity = runtime.instance, runtime._identity()
+        data = self._data(instance, owner, identity)
+        if data is None:
+            raise self.failure("Selected instance has no data to back up.")
+        self._remember_default(instance)
+        status = runtime._status()
+        if status["application"] not in ("running", "stopped"):
+            raise self.failure(
+                "FreshRSS writer state is unconfirmed; stop and inspect before backup."
+            )
+        was_running = status["application"] == "running"
+        port = status.get("port") if was_running else None
+        was_private = check_private_backend = False
+        if was_running:
+            runtime._require_live_selection(status["live_instance"], instance)
+            live = runtime._live()
+            if (
+                live is None
+                or type(port) is not int
+                or not 1024 <= port <= 65535
+                or live[0].get("instance") != instance
+                or live[0].get("port") != port
+                or type(live[0].get("private")) is not bool
+                or type(live[0].get("check_private_backend", False)) is not bool
+            ):
+                raise self.failure(
+                    "Cannot confirm the active FreshRSS backend or its access mode; backup refused."
+                )
+            was_private = live[0]["private"]
+            check_private_backend = was_private or live[0].get(
+                "check_private_backend", False
+            )
         maintenance = BackupSchedule(runtime)
         maintenance.begin(owner, "backup")
-        was_stopped = False
-        was_running = False
-        quiesced = False
-        quiescing = False
-        vm_ready = False
-        snapshot_finished = False
-        restored = False
+        settled = False
         try:
-            owner, was_stopped = self._ensure_vm()
-            vm_ready = True
-            was_private = PrivateAccess(runtime).status(owner)["status"] == "running"
-            runtime._check_label("volume", runtime.volume, owner)
-            self._source_image(owner)
-            if runtime._exists("container", self.app):
-                was_running = runtime._check_label("container", self.app, owner)[
-                    "State"
-                ]["Running"]
             maintenance.phase("quiescing")
-            quiescing = True
-            self._engines_idle(owner, stop=True)
-            quiesced = True
+            withdrawn = runtime._quiesce(owner)
             maintenance.phase("snapshot")
             try:
-                result = self.snapshot(owner, directory)
+                result = self._snapshot(
+                    data, directory, instance, identity, via="backup"
+                )
             except Exception:
-                snapshot_finished = True
+                settled = True
                 raise
-            snapshot_finished = True
+            settled = True
             return result
         finally:
-            safe_to_restore = vm_ready and (
-                not quiescing or (quiesced and snapshot_finished)
-            )
             try:
-                if safe_to_restore:
-                    if was_running and quiesced and maintenance.may_resume():
+                if settled:
+                    if not runtime._idle():
+                        raise self.failure(
+                            "Cannot confirm writers are stopped; reconcile maintenance."
+                        )
+                    if was_running and maintenance.may_resume():
+                        runtime._require_live_selection(instance, runtime.instance)
                         maintenance.phase("resuming")
-                        runtime._start(private_https=was_private)
-                    elif was_stopped:
-                        self._engines_idle(owner, stop=False)
-                        runtime._run("podman", "machine", "stop", self.machine)
-                    restored = True
-            finally:
-                if restored:
+                        runtime._start(
+                            private_https=was_private and withdrawn,
+                            port_override=port,
+                            check_private_backend=check_private_backend,
+                        )
                     maintenance.finish()
-                else:
-                    runtime._diagnostic(
-                        "Backup maintenance remains unresolved; run rss backup-status and rss backup-reconcile. Archive success and resumption are separate."
-                    )
+            finally:
+                if maintenance.pending():
+                    maintenance.notice()
 
-    def shutdown(self) -> dict[str, Any]:
-        """Back up stopped writers before stopping the VM; fail closed on export errors."""
+    def capture_shutdown(
+        self, *, already_stopped: bool, instance: str | None
+    ) -> dict[str, Any]:
+        """Capture the identified instance, or only make an unattributed idle copy."""
+        self._require_lock()
         runtime = self.runtime
-        owner, machine = runtime._owned()
-        if machine["State"] == "stopped":
-            PrivateAccess(runtime).stop(owner)
-            return {
-                "machine": "stopped",
-                "already_stopped": True,
-                "backup": {"status": "already_stopped"},
-            }
-        if machine["State"] != "running":
-            raise self.failure(
-                "Project VM is "
-                + machine["State"]
-                + "; wait and inspect before retrying."
-            )
-        maintenance = BackupSchedule(runtime)
-        maintenance.begin(owner, "stop")
-        maintenance.phase("quiescing")
-        try:
-            self._engines_idle(owner, stop=True)
-        except Exception:
-            # A completed native refusal cannot leave an export running: capture
-            # has not begun. Preserve normal stop/forwarding retry semantics.
-            # Abrupt process death/BaseException still leaves the durable hold.
-            maintenance.finish()
-            raise
-        maintenance.phase("snapshot")
-        try:
-            backup = (
-                self.snapshot(owner)
-                if runtime._exists("volume", runtime.volume)
-                else {"status": "no_data"}
-            )
-        except (self.failure, OSError, ValueError, KeyError, TypeError) as error:
-            self._engines_idle(owner, stop=False)
-            maintenance.finish()
-            raise self.failure(
-                "Shutdown backup failed; application writers remain stopped and VM remains running. Fix RSS_BACKUP_DIR/export and retry rss stop. "
-                + str(error)
-            ) from error
-        self._engines_idle(owner, stop=False)
-        maintenance.phase("stopping_vm")
-        runtime._run("podman", "machine", "stop", self.machine)
-        maintenance.finish()
-        return {"machine": "stopped", "already_stopped": False, "backup": backup}
-
-    def restore(self, archive: Path, volume: str) -> dict[str, Any]:
-        """Validate first, then import into an absent labelled volume without activation."""
-        runtime = self.runtime
-        volume = volume_name(volume)
-        # Validation is wholly local and precedes VM startup or volume creation.
-        with tempfile.TemporaryDirectory(prefix="rss-restore-") as temporary:
-            manifest, payload = validate_archive(
-                archive, Path(temporary), runtime._image()
-            )
-            if volume == runtime.volume:
+        if not runtime._idle():
+            raise self.failure("FreshRSS writers are still running; snapshot refused.")
+        owner, installed = runtime._ownership_receipt()
+        instance = instance if instance is not None else runtime.instance
+        data = self._data(instance, owner, installed)
+        if data is None:
+            if not self._initial_absent(instance):
+                raise self.failure("Selected instance data are absent.")
+            backup = {"status": "no_data"}
+        else:
+            self._remember_default(instance)
+            if runtime._owned(require_current=False) != (owner, installed):
                 raise self.failure(
-                    "Restore target is currently selected; choose a different fresh name. Restore never activates itself."
+                    "Installed runtime identity changed during shutdown."
                 )
-            owner, _was_stopped = self._ensure_vm()
-            if runtime._exists("volume", volume):
-                raise self.failure(
-                    "Restore target already exists; choose a fresh volume. Nothing overwritten."
-                )
-            record_path = runtime.state_dir / RECOVERY_RECORD
-            records = (
-                json.loads(record_path.read_text()) if record_path.exists() else {}
+            backup = self._snapshot(
+                data, self._directory(), instance, installed, via="stop"
             )
-            records[volume] = {
-                "status": "incomplete",
-                "image": manifest["image"],
-                "activated": False,
-            }
-            runtime._save(RECOVERY_RECORD, records)
-            runtime._podman(
-                "volume", "create", "--label", self.label + "=" + owner["token"], volume
-            )
-            runtime._check_label("volume", volume, owner)
-            result = runtime._podman(
-                "volume", "import", volume, str(payload), check=False
-            )
-            if result.returncode:
-                raise self.failure(
-                    "Restore import failed; incomplete owned target retained, not selected. Choose a new name when retrying; source data is unchanged."
-                )
-            records[volume]["status"] = "ready"
-            runtime._save(RECOVERY_RECORD, records)
-            return {
-                "restored": True,
-                "volume": volume,
-                "selected": False,
-                "manifest": manifest,
-                "next_step": "Stop the application, then run rss select-volume NAME and rss replace to activate explicitly.",
-            }
-
-    def select_volume(self, volume: str) -> dict[str, Any]:
-        """Select an owned recovery volume only while the application is stopped."""
-        runtime = self.runtime
-        volume = volume_name(volume)
-        owner, machine = runtime._owned()
-        if machine["State"] != "running":
+        if not runtime._idle():
             raise self.failure(
-                "Start the owned VM before selecting a volume; do not start the application."
+                "Cannot confirm writers are stopped; reconcile maintenance."
             )
-        runtime._check_label("volume", volume, owner)
-        record_path = runtime.state_dir / RECOVERY_RECORD
-        records = json.loads(record_path.read_text()) if record_path.exists() else {}
-        if volume in records and records[volume]["status"] != "ready":
-            raise self.failure("Restore target is incomplete and cannot be selected.")
-        if volume in records and records[volume]["image"] != runtime._image():
-            raise self.failure(
-                "Restore image differs from the configured image; reconcile the pin before selection."
-            )
-        if runtime._exists("container", self.app):
-            app = runtime._check_label("container", self.app, owner)
-            if app["State"]["Running"]:
-                raise self.failure(
-                    "Stop the application before selecting a different data volume."
-                )
-        runtime._save(runtime.selected_volume_path.name, {"volume": volume})
         return {
-            "volume": volume,
+            "application": "stopped",
+            "already_stopped": already_stopped,
+            "backup": backup,
+        }
+
+    def _restore(self, archive: Path, instance: str, *, legacy: bool) -> dict[str, Any]:
+        """Validate one format and publish a fresh owned instance without selection."""
+        self._require_lock()
+        runtime = self.runtime
+        instance = instance_name(instance)
+        if instance.casefold() == runtime.instance.casefold():
+            raise self.failure(
+                "Restore target is currently selected; choose a different fresh name. Nothing overwritten."
+            )
+        with tempfile.TemporaryDirectory(prefix="rss-restore-") as temporary:
+            path = Path(temporary)
+            if legacy:
+                image = json.loads((runtime.root / "config/image.json").read_text())
+                manifest, payload = validate_archive(
+                    archive, path, image, native_paths=True
+                )
+                identity = runtime._identity()
+                if manifest["image"]["version"] != identity["freshrss_version"]:
+                    raise self.failure(
+                        "Legacy import requires the same FreshRSS version as the native pin."
+                    )
+            else:
+                identity = runtime._identity()
+                manifest, payload = validate_archive(archive, path, runtime=identity)
+            owner, _installed = runtime._owned()
+            target = self._instances() / instance
+            if os.path.lexists(target):
+                raise self.failure(
+                    "Instance target already exists; choose a fresh name. Nothing overwritten."
+                )
+            self._publish(
+                instance,
+                owner,
+                identity,
+                payload=payload,
+                legacy_image=manifest.get("image"),
+            )
+        result = {
+            "restored": True,
+            "instance": instance,
+            "selected": False,
+            "manifest": manifest,
+            "next_step": "Stop the application, then run rss select-instance NAME and rss start to activate explicitly.",
+        }
+        if legacy:
+            result["imported"] = True
+        return result
+
+    def restore(self, archive: Path, instance: str) -> dict[str, Any]:
+        """Restore only an exactly compatible v2 native archive."""
+        return self._restore(archive, instance, legacy=False)
+
+    def import_legacy(self, archive: Path, instance: str) -> dict[str, Any]:
+        """Import a matching v1 archive; never access old Podman resources."""
+        return self._restore(archive, instance, legacy=True)
+
+    def select_instance(self, instance: str) -> dict[str, Any]:
+        """Select a complete owned instance only while all writers are idle."""
+        self._require_lock()
+        runtime = self.runtime
+        instance = instance_name(instance)
+        owner, _installed = runtime._owned()
+        if BackupSchedule(runtime).pending() or not runtime._idle():
+            raise self.failure(
+                "Stop FreshRSS and reconcile any maintenance before selecting an instance."
+            )
+        if self._data(instance, owner, runtime._identity()) is None:
+            raise self.failure("Instance is absent; select a complete owned instance.")
+        self._remember_default(instance)
+        # Write the independent guard first: an interrupted first selection
+        # requires explicit repair, never implicit activation of the default.
+        marker = runtime.state_dir / _SELECTION_REQUIRED
+        if not os.path.lexists(marker):
+            runtime._save(_SELECTION_REQUIRED, {"version": 1})
+        runtime._save(SELECTION, {"instance": instance})
+        return {
+            "instance": instance,
             "selected": True,
-            "next_step": "Run rss replace if an old application container exists, otherwise rss start. The original data volume is preserved.",
+            "next_step": "Run rss start to activate the selection. Existing instance data are preserved.",
         }

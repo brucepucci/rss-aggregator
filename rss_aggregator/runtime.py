@@ -1,25 +1,31 @@
-"""Guarded local FreshRSS lifecycle, independent of the command-line adapter."""
+"""Guarded Apple Silicon FreshRSS lifecycle, independent of Click."""
 
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.error import URLError
-from urllib.request import urlopen
 
-from rss_aggregator.backup_schedule import BackupSchedule
+from rss_aggregator import native_service as service
+from rss_aggregator.backup_schedule import SCHEDULE, BackupSchedule
 from rss_aggregator.private_access import PrivateAccess
-from rss_aggregator.recovery import Recovery, volume_name
-from rss_aggregator.supervision import Supervision
+from rss_aggregator.recovery import Recovery, same_data_identity, selected_instance
+from rss_aggregator.supervision import JOB_INSPECTION_TIMEOUT, REGISTRATION, Supervision
+
+BACKEND_CHECKS = "private-backends.json"
 
 Operation = Literal[
     "setup",
@@ -27,11 +33,11 @@ Operation = Literal[
     "status",
     "fetch",
     "verify",
-    "replace",
     "stop",
     "backup",
     "restore",
-    "select-volume",
+    "select-instance",
+    "import-legacy",
     "api-check",
     "supervision-status",
     "supervision-install",
@@ -42,21 +48,17 @@ Operation = Literal[
     "backup-enable",
     "backup-disable",
     "backup-due",
-    "remove-vm",
-    "remove-package",
-    "delete-volume",
+    "uninstall",
+    "upgrade",
 ]
-
-MACHINE = "rss-aggregator"
-APP = "rss-aggregator-freshrss"
-VOLUME = "rss-aggregator-data"
-CHECK = "rss-aggregator-check"
-LABEL = "io.rss-aggregator.owner"
-SELECTION = "selected-volume.json"
 
 
 class RuntimeFailure(Exception):
     """Report a lifecycle guard or external command failure without CLI coupling."""
+
+
+class PublicBackendExposed(RuntimeFailure):
+    """Report confirmed public forwarding to the specific requested backend."""
 
 
 class ServeConfigRejected(RuntimeFailure):
@@ -64,57 +66,35 @@ class ServeConfigRejected(RuntimeFailure):
 
 
 class Runtime:
-    """Manage one checkout's resources using its independently resolved state.
-
-    Parameters
-    ----------
-    root : Path, optional
-        Checkout containing the pinned image and FreshRSS configuration. Defaults
-        to the checkout containing this editable source file, not the caller's cwd.
-    state_dir : Path, optional
-        Ownership and audit state. Overrides RSS_STATE_DIR and then root/.local.
-        Relative explicit paths and environment values resolve against the cwd.
-    """
+    """Manage one private native installation under an independent command lock."""
 
     def __init__(self, root: Path | None = None, state_dir: Path | None = None) -> None:
-        """Resolve instance paths without inspecting or changing native resources."""
-        self.root = (
-            (root if root is not None else Path(__file__).resolve().parents[1])
-            .expanduser()
-            .resolve()
-        )
+        """Resolve configured paths without touching the instance or starting jobs."""
+        self.root = (root or Path(__file__).resolve().parents[1]).expanduser().resolve()
+        path = Path(
+            state_dir or os.environ.get("RSS_STATE_DIR", self.root / ".local/native")
+        ).expanduser()
+        if path.is_symlink():
+            raise RuntimeFailure("RSS_STATE_DIR must not be a symlink.")
+        self.state_dir = path.resolve()
         self._command_lock_fd: int | None = None
-        self.state_dir = (
-            Path(
-                state_dir
-                if state_dir is not None
-                else os.environ.get("RSS_STATE_DIR", self.root / ".local")
-            )
-            .expanduser()
-            .resolve()
-        )
 
     @property
-    def selected_volume_path(self) -> Path:
-        """Locate the managed selection record in the existing ownership directory."""
-        return self.state_dir / SELECTION
+    def instance(self) -> str:
+        """Read the explicit data selection or the initial default name."""
+        return selected_instance(self.state_dir)
 
     @property
-    def volume(self) -> str:
-        """Resolve the explicitly selected owned data volume or the initial default."""
-        path = self.selected_volume_path
-        return (
-            volume_name(json.loads(path.read_text())["volume"])
-            if path.exists()
-            else VOLUME
-        )
+    def data_dir(self) -> Path:
+        """Locate the full local data directory of the selected FreshRSS instance."""
+        return self.state_dir / "instances" / self.instance / "data"
 
     def run(
         self,
         operation: Operation,
         *,
         archive: Path | None = None,
-        volume: str | None = None,
+        instance: str | None = None,
         username: str | None = None,
         api_password: str | None = None,
         loopback: bool = False,
@@ -122,110 +102,182 @@ class Runtime:
         hour: int = 3,
         minute: int = 0,
         confirm: str | None = None,
-        package: str | None = None,
-        unused_elsewhere: bool = False,
     ) -> dict[str, Any]:
-        """Execute one public operation under the nonblocking project lock.
+        """Execute one public operation with nonblocking serialization and durable intent."""
+        from rss_aggregator.native_install import NativeInstall
 
-        Returns
-        -------
-        dict[str, Any]
-            JSON-compatible operation-specific results, with diagnostics on stderr.
-
-        Raises
-        ------
-        RuntimeFailure
-            If the operation is unknown, another command holds the lock, or a
-            resource safety guard fails. OS and configuration errors propagate.
-        """
-        from rss_aggregator.cleanup import Cleanup
-
+        install = NativeInstall(self)
         recovery = Recovery(self)
         backups = BackupSchedule(self, now)
+        supervision = Supervision(self)
+        if operation in ("restore", "import-legacy") and (
+            archive is None or instance is None
+        ):
+            raise RuntimeFailure("An archive and a fresh named target are required.")
+        if operation == "select-instance" and instance is None:
+            raise RuntimeFailure("Select-instance requires an explicit target.")
         handlers = {
-            "remove-vm": lambda: Cleanup(self).remove_vm(confirm),
-            "remove-package": lambda: self._remove_package(
-                package, confirm, unused_elsewhere
-            ),
-            "delete-volume": lambda: Cleanup(self).delete_volume(volume, confirm),
+            "setup": install.install,
+            "uninstall": lambda: self._runtime_change("uninstall", confirm),
+            "upgrade": lambda: self._runtime_change("upgrade", confirm),
             "backup": backups.backup,
             "backup-status": backups.status,
             "backup-reconcile": backups.reconcile,
             "backup-enable": lambda: backups.enable(hour, minute),
             "backup-disable": backups.disable,
             "backup-due": backups.due,
-            "restore": lambda: recovery.restore(archive, volume),
-            "select-volume": lambda: recovery.select_volume(volume),
+            "restore": lambda: recovery.restore(archive, instance),
+            "select-instance": lambda: recovery.select_instance(instance),
+            "import-legacy": lambda: recovery.import_legacy(archive, instance),
             "api-check": lambda: self._api_check(
                 username, api_password, loopback=loopback
             ),
-            "setup": self._setup,
-            "start": self._start,
+            "start": lambda: self._start(explicit=True),
             "status": self._status,
             "fetch": self._fetch,
             "verify": self._verify,
-            "replace": self._replace,
             "stop": backups.shutdown,
-            "supervision-status": Supervision(self).status,
-            "supervision-install": Supervision(self).install,
-            "supervision-remove": Supervision(self).remove,
-            "supervision-tick": Supervision(self).tick,
+            "supervision-status": supervision.status,
+            "supervision-install": supervision.install,
+            "supervision-remove": supervision.remove,
+            "supervision-tick": supervision.tick,
         }
         if operation not in handlers:
             raise RuntimeFailure(f"Unknown operation: {operation}")
-        if operation == "restore" and (archive is None or volume is None):
-            raise ValueError(
-                "Restore requires an archive path and a fresh target volume."
-            )
-        if operation == "select-volume" and volume is None:
-            raise ValueError("Select-volume requires an explicit volume name.")
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with (self.state_dir / "command.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
+        self._state_guard()
+        with self._command_lease() as lock:
+            if lock is None:
                 if operation == "backup-status":
                     return backups.status(busy=True)
                 if operation == "backup-due":
-                    backups.deferred()
+                    self._record_backup_contention(backups)
                 raise RuntimeFailure(
                     "Another project command is running; wait for it to finish."
-                ) from error
-            self._command_lock_fd = lock.fileno()
+                )
+            self._command_lock_fd = lock
             try:
-                if operation == "stop":
-                    Supervision(self).set_intent("stopped")
                 if backups.pending() and operation not in (
                     "status",
+                    "stop",
                     "backup-status",
                     "backup-reconcile",
                     "backup-disable",
                     "supervision-status",
                     "supervision-tick",
                     "supervision-remove",
-                    "remove-vm",
                 ):
                     raise RuntimeFailure(
                         "Maintenance is unresolved; inspect rss backup-status, then rss backup-reconcile before operating writers."
                     )
-                if operation == "start":
-                    Supervision(self).set_intent("running")
                 return handlers[operation]()
             finally:
                 self._command_lock_fd = None
 
-    def _remove_package(
-        self, package: str | None, confirm: str | None, unused_elsewhere: bool
-    ) -> dict[str, Any]:
-        """Dispatch optional host-package removal independently of VM deletion."""
-        from rss_aggregator.package_cleanup import PackageCleanup
+    @contextmanager
+    def _command_lease(self) -> Iterator[int | None]:
+        """Serialize the entire command on the stable private state directory inode."""
+        fd = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                locked = False
+            info = os.fstat(fd)
+            if (
+                info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+                or not os.path.samestat(info, self.state_dir.lstat())
+            ):
+                raise RuntimeFailure(
+                    "Private state directory changed; inspect locally."
+                )
+            if not locked:
+                yield None
+                return
 
-        if package is None:
-            raise ValueError("Remove-package requires an explicit formula name.")
-        return PackageCleanup(self).remove(package, confirm, unused_elsewhere)
+            # Honor file contention when present, but don't rely on this
+            # replaceable pathname. Mixing checkouts that use different lock
+            # protocols for one state directory is unsupported.
+            path = self.state_dir / "command.lock"
+            try:
+                legacy = path.lstat()
+            except FileNotFoundError:
+                if any(self.state_dir.iterdir()):
+                    yield fd  # Never recreate a missing lock file in established state.
+                    return
+                expected = None
+            else:
+                expected = (legacy.st_dev, legacy.st_ino)
+            with service.lease(path, expected=expected) as compatibility:
+                yield fd if compatibility is not None else None
+        finally:
+            os.close(fd)  # Descendants may still own the inherited flock.
+
+    def _record_backup_contention(self, backups: BackupSchedule) -> None:
+        """Record contention only for an independently enabled and owned job."""
+        try:
+            config = backups._config()
+            if (
+                config
+                and config.get("registration_id")
+                and backups._job_matches(config)
+                and backups._job.loaded(config)
+                and backups._config() == config
+            ):
+                backups.deferred()
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # Contention remains the failure; uncertain registration is not authority
+            # to write or repair evidence outside the command lock.
+            pass
+
+    def _state_guard(self) -> None:
+        """Refuse legacy, public, foreign, synced-default or network state."""
+        if os.getuid() == 0:
+            raise RuntimeFailure("Use a normal non-root user account for FreshRSS.")
+        if any(
+            os.path.lexists(parent / "native-owner.json")
+            for parent in self.state_dir.parents
+        ):
+            raise RuntimeFailure(
+                "RSS_STATE_DIR must not be inside an existing native state directory; select the state root or a separate directory."
+            )
+        home = Path.home().resolve()
+        synced = (home / "Library/CloudStorage", home / "Library/Mobile Documents")
+        if any(self.state_dir.is_relative_to(directory) for directory in synced):
+            raise RuntimeFailure("Use local, non-synced SQLite storage.")
+        ancestor = next(
+            p for p in (self.state_dir, *self.state_dir.parents) if p.exists()
+        )
+        if sys.platform == "darwin":
+            disk = self._run("/bin/df", "-P", str(ancestor), check=False)
+            lines = disk.stdout.splitlines()
+            if (
+                disk.returncode
+                or len(lines) < 2
+                or not re.match(r"/dev/disk\d", lines[1])
+            ):
+                raise RuntimeFailure("Use a local macOS filesystem for RSS_STATE_DIR.")
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = self.state_dir.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise RuntimeFailure(
+                "RSS_STATE_DIR must be a private directory (0700) owned by this user."
+            )
+        owner = service.read(self.state_dir / "owner.json")
+        if owner is not None and (
+            not isinstance(owner, dict) or "machine" in owner or "connection" in owner
+        ):
+            raise RuntimeFailure(
+                "Legacy Podman ownership found; use a separate private native RSS_STATE_DIR."
+            )
 
     def _diagnostic(self, message: str) -> None:
-        """Send human-readable progress or captured command chatter to stderr."""
+        """Keep diagnostics separate from JSON results."""
         print(message, file=sys.stderr)
 
     def _run(
@@ -234,948 +286,1063 @@ class Runtime:
         check: bool = True,
         input: str | None = None,
         inherit_lock: bool = True,
-        dependency_checks: bool = False,
+        timeout: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Capture an external command with Homebrew mutation safeguards.
-
-        Captured stdout remains available for parsing; callers explicitly send
-        informational output to diagnostics rather than the JSON result stream.
-        Short-lived native work inherits the lease by default. VM launchers must
-        disable inheritance so their long-lived helpers cannot retain it; the
-        Python caller still holds the lock throughout VM startup. Implicit
-        Homebrew autoremove stays disabled even when native dependent checks
-        are restored for explicit package removal.
-        """
-        env = dict(
-            os.environ,
-            HOMEBREW_NO_AUTO_UPDATE="1",
-            HOMEBREW_NO_INSTALL_UPGRADE="1",
-            HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK="1",
-            HOMEBREW_NO_INSTALL_CLEANUP="1",
-            HOMEBREW_NO_AUTOREMOVE="1",
-        )
-        if dependency_checks:
-            env.pop("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", None)
+        """Run host tooling with optional deadlines and command-lease inheritance."""
         try:
             result = subprocess.run(
                 args,
                 text=True,
                 capture_output=True,
-                env=env,
                 input=input,
                 check=False,
-                # Native work retains serialization if its Python parent dies.
+                timeout=timeout,
                 pass_fds=(self._command_lock_fd,)
                 if inherit_lock and self._command_lock_fd is not None
                 else (),
             )
+        except subprocess.TimeoutExpired:
+            # subprocess.run kills and reaps its direct child on timeout.
+            raise RuntimeFailure(
+                f"{Path(args[0]).name} timed out; inspect locally."
+            ) from None
         except OSError as error:
-            raise RuntimeFailure(f"{args[0]} unavailable: {error}") from error
+            raise RuntimeFailure(
+                f"Unable to run {Path(args[0]).name}; check the selected executable."
+            ) from error
         if check and result.returncode:
             raise RuntimeFailure(
-                f"{args[0]} failed ({result.returncode}): {result.stderr.strip()}"
+                f"{Path(args[0]).name} failed ({result.returncode}); inspect locally."
             )
         return result
 
     def _save(self, name: str, value: Any) -> None:
-        """Atomically persist private JSON audit or ownership state."""
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target = self.state_dir / name
-        temporary = target.with_suffix(".tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(json.dumps(value, indent=2) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        temporary.replace(target)
-        descriptor = os.open(self.state_dir, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        """Atomically persist a private ownership or orchestration record."""
+        service.save(self.state_dir / name, value)
 
-    def _image(self) -> dict[str, Any]:
-        """Read this checkout's pinned image configuration only when needed."""
-        return json.loads((self.root / "config/image.json").read_text())
+    def _manifest(self) -> dict[str, Any]:
+        """Read the checkout's reviewed runtime manifest without touching installation."""
+        from rss_aggregator.native_install import read_manifest
 
-    def _packages(self) -> dict[str, str]:
-        """Inventory installed Homebrew formula versions for mutation checks."""
-        return dict(
-            line.split(" ", 1)
-            for line in self._run(
-                "brew", "list", "--formula", "--versions"
-            ).stdout.splitlines()
-        )
+        return read_manifest(self.root)
 
-    def _cask_inventory(self) -> dict[str, str]:
-        """Record cask versions, retaining incomplete names on read-only fallback."""
-        result = self._run("brew", "list", "--cask", "--versions", check=False)
-        if result.returncode == 0:
-            return {"casks": result.stdout}
-        warning = (
-            f"brew list --cask --versions failed ({result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-        self._diagnostic(warning + "; using read-only cask inventory fallback.")
-        problem = (
-            "Unusable Homebrew cask inventory; setup stopped before installation. "
-            "Inspect the read-only cask queries and resolve the inventory before retrying."
-        )
-        try:
-            records = self._json_run(
-                "brew", "info", "--json=v2", "--installed", "--cask"
-            )
-        except json.JSONDecodeError as error:
-            raise RuntimeFailure(problem) from error
-        names = self._run("brew", "list", "--cask").stdout
-        tokens = names.splitlines()
-        if (
-            not isinstance(records, dict)
-            or not isinstance(records.get("casks"), list)
-            or any(not re.fullmatch(r"[a-z0-9][a-z0-9+_.@-]*", name) for name in tokens)
-            or len(tokens) != len(set(tokens))
-        ):
-            raise RuntimeFailure(problem)
-        known: dict[str, str] = {}
-        for cask in records["casks"]:
-            if not isinstance(cask, dict):
-                raise RuntimeFailure(problem)
-            token, installed = cask.get("token"), cask.get("installed")
-            if (
-                not isinstance(token, str)
-                or token not in tokens
-                or token in known
-                or not isinstance(installed, str)
-                or not installed
-                or any(char.isspace() or not char.isprintable() for char in installed)
-            ):
-                raise RuntimeFailure(problem)
-            known[token] = installed
-        return {
-            "casks": "".join(
-                f"{token} {version}\n" for token, version in known.items()
-            ),
-            "cask_names": names,
-            "cask_inventory_warning": warning,
-        }
+    def _identity(self) -> dict[str, str]:
+        """Return the paths-independent native archive compatibility pin."""
+        from rss_aggregator.native_install import manifest_identity
 
-    def _bootstrap(self) -> None:
-        """Install only missing Podman after recording and checking host changes."""
-        if not shutil.which("brew"):
-            raise RuntimeFailure(
-                "Homebrew is required; install it from https://brew.sh first."
-            )
-        before = self._packages()
-        self._save(
-            "host-latest.json"
-            if (self.state_dir / "host-before.json").exists()
-            else "host-before.json",
-            {
-                "packages": before,
-                **self._cask_inventory(),
-                "dependencies": self._run("brew", "deps", "--installed").stdout,
-                "podman_formula": self._run(
-                    "brew", "info", "--json=v2", "podman"
-                ).stdout,
-            },
-        )
-        if "podman" in before:
-            return
-        result = self._run("brew", "install", "--dry-run", "podman")
-        preview = result.stdout + result.stderr
-        self._diagnostic(preview)
-        self._save("install-preview.json", {"output": preview})
-        planned = set(re.findall(r"(?m)^([a-zA-Z0-9@+_.-]+)\s+\d", preview))
-        if (
-            planned.intersection(before)
-            or "upgrade" in preview.lower()
-            or "reinstall" in preview.lower()
-        ):
-            raise RuntimeFailure(
-                "Installation preview changes existing packages; user approval required."
-            )
-        try:
-            if "podman" not in before:
-                self._diagnostic(self._run("brew", "install", "podman").stdout)
-        finally:
-            after = self._packages()
-            previous = self.state_dir / "host-additions.json"
-            additions = json.loads(previous.read_text()) if previous.exists() else {}
-            additions.update(
-                {name: version for name, version in after.items() if name not in before}
-            )
-            self._save("host-additions.json", additions)
-        changed = [name for name in before if before[name] != after.get(name)]
-        if changed:
-            raise RuntimeFailure(
-                "Unexpected host package changes: " + ", ".join(changed)
-            )
+        return manifest_identity(self._manifest())
 
-    def _json_run(self, *args: str) -> Any:
-        """Decode JSON returned by a checked external command."""
-        return json.loads(self._run(*args).stdout)
+    def _owned(
+        self, *, require_current: bool = True, verify: bool = True
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Bind operations to the native installation's ownership and pin."""
+        from rss_aggregator.native_install import NativeInstall
 
-    def _inventory(self, resources: bool = False) -> dict[str, Any]:
-        """Inventory Podman without starting machines or changing defaults."""
-        if not shutil.which("podman"):
-            return {"machines": [], "connections": [], "podman": "not installed"}
-        snapshot = {
-            "machines": self._json_run("podman", "machine", "list", "--format", "json"),
-            "connections": self._json_run(
-                "podman", "system", "connection", "list", "--format", "json"
-            ),
-        }
-        if resources:
-            snapshot["resources"] = {}
-            running = {m["Name"] for m in snapshot["machines"] if m.get("Running")}
-            for connection in snapshot["connections"]:
-                name = connection["Name"]
-                if not connection.get("IsMachine", False) or (
-                    name not in running and name.removesuffix("-root") not in running
-                ):
-                    snapshot["resources"][name] = (
-                        "Not queried: machine stopped or non-machine connection."
-                    )
-                    continue
-                results = {}
-                for kind, args in [
-                    ("containers", ("ps", "--all", "--format", "json")),
-                    ("volumes", ("volume", "ls", "--format", "json")),
-                    ("images", ("images", "--format", "json")),
-                ]:
-                    result = self._run(
-                        "podman", "--connection", name, *args, check=False
-                    )
-                    results[kind] = (
-                        json.loads(result.stdout)
-                        if result.returncode == 0
-                        else "Unavailable"
-                    )
-                snapshot["resources"][name] = results
-        return snapshot
+        return NativeInstall(self).owned(require_current=require_current, verify=verify)
 
-    def _setup(self) -> dict[str, Any]:
-        """Create a rootless project VM without starting or adopting resources."""
-        from rss_aggregator.cleanup import Cleanup
+    def _ownership_receipt(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Identify the owner for shutdown independently of runtime layout drift."""
+        from rss_aggregator.native_install import NativeInstall
 
-        snapshot = self._inventory(resources=True)
-        Cleanup(self).prepare_setup(snapshot)
-        if not (self.state_dir / "owner.json").exists():
-            if any(m["Name"] == MACHINE for m in snapshot["machines"]):
-                raise RuntimeFailure(
-                    "Refusing unowned machine rss-aggregator; do not delete or adopt it automatically."
-                )
-            if any(
-                c["Name"] in (MACHINE, MACHINE + "-root")
-                for c in snapshot["connections"]
-            ):
-                raise RuntimeFailure(
-                    "Refusing unowned project connection; resolve the name collision manually."
-                )
-        else:
-            self._owned()
-        self._save(
-            "podman-latest.json"
-            if (self.state_dir / "podman-before.json").exists()
-            else "podman-before.json",
-            snapshot,
-        )
-        self._bootstrap()
-        snapshot = self._inventory(resources=True)
-        self._save("podman-pre-machine.json", snapshot)
-        created = False
-        if not (self.state_dir / "owner.json").exists():
-            # A newly installed CLI can reveal resources absent from the first inventory.
-            if any(m["Name"] == MACHINE for m in snapshot["machines"]) or any(
-                c["Name"] in (MACHINE, MACHINE + "-root")
-                for c in snapshot["connections"]
-            ):
-                raise RuntimeFailure(
-                    "Refusing unowned project machine/connection discovered after CLI installation."
-                )
-            self._run(
-                "podman",
-                "machine",
-                "init",
-                "--cpus",
-                "2",
-                "--memory",
-                "2048",
-                "--disk-size",
-                "20",
-                "--rootful=false",
-                "--update-connection=false",
-                MACHINE,
-            )
-            machine = self._json_run("podman", "machine", "inspect", MACHINE)[0]
-            connections = self._inventory()["connections"]
-            for existing in snapshot["connections"]:
-                current = next(
-                    (c for c in connections if c["Name"] == existing["Name"]), {}
-                )
-                if any(
-                    existing.get(key) != current.get(key)
-                    for key in ("URI", "Identity", "Default")
-                ):
-                    raise RuntimeFailure(
-                        "Podman changed a pre-existing connection/default; inspect locally before continuing."
-                    )
-            connection = next(c for c in connections if c["Name"] == MACHINE)
-            self._save(
-                "owner.json",
-                {
-                    "token": str(uuid.uuid4()),
-                    "machine": machine,
-                    "connection": connection,
-                },
-            )
-            created = True
-        self._diagnostic("Project machine is set up. Setup does not start or stop it.")
-        return {"machine": MACHINE, "created": created}
+        return NativeInstall(self).receipt()
 
-    def _owned(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Verify recorded VM and connection identity before using resources."""
-        path = self.state_dir / "owner.json"
-        if not path.exists():
-            raise RuntimeFailure("Project is not set up. Run scripts/rss setup.")
-        owner = json.loads(path.read_text())
-        current = self._json_run("podman", "machine", "inspect", MACHINE)[0]
-        for key in ("Name", "Created", "ConfigDir", "SSHConfig", "Rootful"):
-            if current.get(key) != owner["machine"].get(key):
-                raise RuntimeFailure(
-                    "Project machine identity changed; refusing to modify it."
-                )
-        connections = self._inventory()["connections"]
-        connection = next((c for c in connections if c["Name"] == MACHINE), {})
-        for key in ("URI", "Identity"):
-            if connection.get(key) != owner["connection"].get(key):
-                raise RuntimeFailure(
-                    "Project connection identity changed; refusing to modify it."
-                )
-        return owner, current
-
-    def _start(self, *, private_https: bool | None = None) -> dict[str, Any]:
-        """Start serving only after ownership, image, and effective PHP gates."""
-        owner, machine = self._owned()
-        cold_start = machine["State"] == "stopped"
-        if machine["State"] not in ("stopped", "running"):
-            raise RuntimeFailure(
-                "Project VM is "
-                + machine["State"]
-                + "; wait and inspect before retrying."
-            )
+    def _port(self) -> int:
+        """Parse the non-privileged local listener port before starting writers."""
         try:
             port = int(os.environ.get("RSS_PORT", "8080"))
-        except ValueError as error:
-            raise RuntimeFailure(
-                "RSS_PORT must be an integer between 1024 and 65535."
-            ) from error
+        except ValueError:
+            port = 0
         if not 1024 <= port <= 65535:
-            raise RuntimeFailure("RSS_PORT must be between 1024 and 65535.")
-        private = PrivateAccess(self)
-        enabled = private.enabled() if private_https is None else private_https
-        origin = private.prepare(owner, port) if enabled else None
-        Recovery(self).check_activation()
-        private.stop(owner)
-        if machine["State"] != "running":
-            conflicts = [
-                m["Name"]
-                for m in self._inventory()["machines"]
-                if m["Name"] != MACHINE and m.get("Running")
-            ]
-            if conflicts:
-                raise RuntimeFailure(
-                    "Another machine is running: "
-                    + ", ".join(conflicts)
-                    + ". Stop it yourself if appropriate; it has not been changed."
-                )
-            self._diagnostic(
-                self._run(
-                    "podman",
-                    "machine",
-                    "start",
-                    "--update-connection=false",
-                    MACHINE,
-                    inherit_lock=False,
-                ).stdout
-            )
-            self._owned()
-        # Collisions must be checked before touching the image or application.
-        app = (
-            self._check_label("container", APP, owner)
-            if self._exists("container", APP)
-            else None
-        )
-        if self._exists("volume", self.volume):
-            self._check_label("volume", self.volume, owner)
-        if not app or not app["State"]["Running"]:
-            with socket.socket() as listener:
-                # Permit our previous TCP TIME_WAIT, not an active listener.
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    listener.bind(("127.0.0.1", port))
-                except OSError as error:
+            raise RuntimeFailure("RSS_PORT must be an integer between 1024 and 65535.")
+        return port
+
+    def _writer_lease_state(self) -> Literal["web", "php", "idle"]:
+        """Prove exclusion of a web generation and standalone PHP independently."""
+        try:
+            leases = service.WriterLeases(self.state_dir)
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is None:
+                    return "web"
+                if controller is None:
                     raise RuntimeFailure(
-                        f"Loopback port {port} is occupied; choose RSS_PORT or stop its owner yourself."
-                    ) from error
-        self._security(owner, target=CHECK)
-        if not self._exists("volume", self.volume):
-            self._podman(
-                "volume", "create", "--label", LABEL + "=" + owner["token"], self.volume
+                        "Native writer state is unconfirmed; controller and writer leases disagree. Inspect the state directory locally."
+                    )
+                with leases.hold("fetch.lock") as fetch:
+                    return "php" if fetch is None else "idle"
+        except (OSError, ValueError):
+            raise RuntimeFailure(
+                "Native writer state is unconfirmed; writer lease evidence is missing or damaged. Inspect the state directory locally."
+            ) from None
+
+    def _idle(self) -> bool:
+        """Prove only a healthy, wholly unlocked writer lease set is idle."""
+        try:
+            return self._writer_lease_state() == "idle"
+        except RuntimeFailure:
+            return False
+
+    def _live(self) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read the current generation only with held writer and controller leases."""
+        try:
+            leases = service.WriterLeases(self.state_dir)
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is not None or controller is not None:
+                    return None
+        except (OSError, ValueError):
+            return None
+        plan = service.read(self.state_dir / "service.json")
+        receipt = service.read(self.state_dir / "service-status.json")
+        if (
+            plan
+            and receipt
+            and receipt.get("nonce") == plan.get("nonce")
+            and receipt.get("web") == "started"
+        ):
+            return plan, receipt
+        return None
+
+    def _web_writer_plan(self) -> dict[str, Any] | None:
+        """Read matching web-controller records after observing its writer lease."""
+        plan = service.read(self.state_dir / "service.json")
+        receipt = service.read(self.state_dir / "service-status.json")
+        if (
+            isinstance(plan, dict)
+            and isinstance(plan.get("nonce"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", plan["nonce"])
+            and isinstance(receipt, dict)
+            and receipt.get("nonce") == plan["nonce"]
+            and receipt.get("web") == "started"
+        ):
+            return plan
+        return None
+
+    def _draining_writer_plan(self) -> dict[str, Any] | None:
+        """Observe a held web or startup PHP attribution without proving readiness."""
+        try:
+            leases = service.WriterLeases(self.state_dir, names=("writers.lock",))
+            with leases.hold("writers.lock") as writer:
+                if writer is None:
+                    return self._web_writer_plan()
+                leases = service.WriterLeases(self.state_dir)
+                with (
+                    leases.hold("controller.lock") as controller,
+                    leases.hold("fetch.lock") as fetch,
+                ):
+                    if controller is not None and fetch is None:
+                        return service.draining_startup_writer(self.state_dir)
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _stop_independent_web(self) -> None:
+        """Close an identified controller without trusting the standalone PHP lease."""
+        try:
+            leases = service.WriterLeases(
+                self.state_dir, names=("writers.lock", "controller.lock")
             )
-        if app:
-            verified = json.loads((self.state_dir / "security.json").read_text())
-            expected = verified["image_id"]
-            binding = app["HostConfig"]["PortBindings"].get("80/tcp", [])
+            with (
+                leases.hold("writers.lock") as writer,
+                leases.hold("controller.lock") as controller,
+            ):
+                if writer is not None or controller is not None:
+                    return
+            plan = self._web_writer_plan()
+            owner, installed = self._ownership_receipt()
+            if plan is None or plan.get("owner") != owner["token"]:
+                return
+            generation = Recovery(self).shutdown_generation(
+                plan["instance"], owner, installed, require_record=True
+            )
+            if generation is None or generation != plan.get("writer_generation"):
+                return
+            self._save("stop-service.json", {"nonce": plan["nonce"]})
+            deadline = time.monotonic() + 165
+            while time.monotonic() < deadline:
+                with (
+                    leases.hold("writers.lock") as writer,
+                    leases.hold("controller.lock") as controller,
+                ):
+                    if writer is not None and controller is not None:
+                        return
+                time.sleep(0.2)
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # Independent shutdown is best-effort; the failed writer-state
+            # check still prevents snapshot, restart or other writer mutation.
+            pass
+
+    def _stop_writers(self) -> None:
+        """Request web generation stop and prove that all writer leases release."""
+        try:
+            lease_state = self._writer_lease_state()
+        except RuntimeFailure:
+            self._stop_independent_web()
+            raise
+        if lease_state == "idle":
+            return
+        if lease_state == "web":
+            plan = service.read(self.state_dir / "service.json")
             if (
-                app["Image"].removeprefix("sha256:") != expected.removeprefix("sha256:")
-                or binding != [{"HostIp": "127.0.0.1", "HostPort": str(port)}]
-                or app["Config"]["Entrypoint"] != ["./Docker/entrypoint.sh"]
-                or app["Config"]["Cmd"] != verified["official_command"]
-                or "LISTEN=127.0.0.1:8088" not in app["Config"]["Env"]
-                or not any(
-                    m.get("Name") == self.volume
-                    and m["Destination"] == "/var/www/FreshRSS/data"
-                    for m in app["Mounts"]
-                )
+                not isinstance(plan, dict)
+                or not isinstance(plan.get("nonce"), str)
+                or not re.fullmatch(r"[a-f0-9]{32}", plan["nonce"])
             ):
                 raise RuntimeFailure(
-                    "Existing application image/port/entrypoint differs; use replace after checking configuration."
+                    "Unidentified native writer lease; inspect the instance locally."
                 )
-            if cold_start and not app["State"]["Running"]:
-                # A stopped VM can leave stale Apache PID/runtime files in the
-                # container layer. Recreate only after all configuration gates;
-                # the named data volume is never removed or implicitly migrated.
-                current = self._check_label("container", APP, owner)
-                if current != app or current["State"]["Running"]:
-                    raise RuntimeFailure(
-                        "Application changed during cold-start inspection; preserve it and inspect locally."
-                    )
-                self._podman("rm", APP)
-                app = None
-            elif app["State"]["Running"]:
-                self._podman("stop", "--time", "60", APP)
-        if app is None:
-            image = self._image()
-            self._podman(
-                "create",
-                "--name",
-                APP,
-                "--pull=never",
-                "--platform",
-                image["platform"],
-                "--label",
-                LABEL + "=" + owner["token"],
-                "--restart=no",
-                "--publish",
-                f"127.0.0.1:{port}:80",
-                "--mount",
-                f"type=volume,source={self.volume},destination=/var/www/FreshRSS/data",
-                "--env",
-                "CRON_MIN=*/20",
-                "--env",
-                "TZ=UTC",
-                "--env",
-                "ENABLE_ACCESS_LOG=0",
-                "--env",
-                "LISTEN=127.0.0.1:8088",
-                "--env",
-                "TRUSTED_PROXY=0",
-                "--env",
-                "COPY_LOG_TO_SYSLOG=Off",
-                "--env",
-                "COPY_SYSLOG_TO_STDERR=Off",
-                image["image"],
-            )
-        # Repeat both copies while stopped, including after a partial first start.
-        # These are new-user templates, never existing users' settings or feeds.
-        self._podman(
-            "cp",
-            str(self.root / "config/config-user.custom.php"),
-            APP + ":/var/www/FreshRSS/data/config-user.custom.php",
+            self._save("stop-service.json", {"nonce": plan["nonce"]})
+        # Startup PHP may have acquired only fetch.lock, before a web generation
+        # exists. Its caretaker retains that lease through its own deadline.
+        deadline = time.monotonic() + 165
+        while time.monotonic() < deadline:
+            if self._writer_lease_state() == "idle":
+                return
+            time.sleep(0.2)
+        raise RuntimeFailure(
+            "Native writers did not confirm shutdown; no archive or further mutation is safe. Inspect the own user processes locally."
         )
-        self._podman(
-            "cp",
-            str(self.root / "config/public-feed.opml"),
-            APP + ":/var/www/FreshRSS/data/opml.xml",
-        )
-        guard_access = bool(origin or private.path.exists())
-        try:
-            self._podman("start", APP)
-            security = self._security(owner, target=APP)
-            self._ready(port)
-            scheduler = self._scheduler(owner)
-            fetch = self._fetch()
-            url = origin or f"http://127.0.0.1:{port}"
-            forwarding = None
-            if guard_access:
-                if fetch["status"] == "installer_pending":
-                    if origin:
-                        raise RuntimeFailure(
-                            "Complete the FreshRSS installer on loopback first (RSS_TAILSCALE=0), then retry private start. No Serve route was published."
-                        )
-                else:
-                    self._configure_access(url, api=bool(origin))
-            if origin:
-                forwarding = private.start(owner, port, origin)
-        except Exception:
-            if not guard_access:
-                raise
-            # Preserved routes can reach an unverified backend even if an earlier
-            # post-start check fails before the authentication gate is evaluated.
-            # Close only the owned application, never roll back foreign Serve.
-            try:
-                app = self._check_label("container", APP, owner)
-                if app["State"]["Running"]:
-                    self._podman("stop", "--time", "60", APP)
-            except Exception:
-                raise RuntimeFailure(
-                    "FreshRSS access/forwarding startup failed; stopping the project "
-                    "application could not be confirmed. It may still be "
-                    "exposed through foreign forwarding. Inspect and close "
-                    "the backend locally; no forwarding rollback was attempted."
-                ) from None
-            self._diagnostic(
-                "FreshRSS access/forwarding startup failed; the owned FreshRSS "
-                "application was stopped. Resolve access settings/forwarding locally "
-                "before retrying; no forwarding rollback was attempted."
-            )
-            raise
-        Recovery(self).record_image(activated=True)
-        self._diagnostic(
-            f"FreshRSS: {url} (form login; complete installer locally on first run)."
-        )
-        return {
-            "machine": "running",
-            "url": url,
-            "security": security,
-            "scheduler": scheduler,
-            "fetch": fetch,
-            **({"forwarding": forwarding} if forwarding else {}),
-        }
 
-    def _configure_access(self, origin: str, *, api: bool) -> None:
-        """Set the external origin and retain form authentication without credentials."""
-        options = [
+    def _quiesce(self, owner: dict[str, Any] | None = None) -> bool:
+        """Close writers even on withdrawal failure; report actual owned withdrawal."""
+        if owner is None:
+            owner, _ = self._ownership_receipt()
+        forwarding_error = None
+        try:
+            try:
+                withdrawn = PrivateAccess(self).stop(owner)
+            except Exception as error:
+                forwarding_error = error
+        finally:
+            try:
+                self._stop_writers()
+            except Exception as writer_error:
+                if forwarding_error is not None:
+                    raise RuntimeFailure(
+                        f"Private forwarding shutdown is unconfirmed: {forwarding_error} "
+                        f"Writer shutdown also failed: {writer_error}"
+                    ) from None
+                raise
+        if forwarding_error is not None:
+            raise RuntimeFailure(
+                f"Private forwarding shutdown is unconfirmed: {forwarding_error} "
+                "Owned writer shutdown confirmed; inspect forwarding locally."
+            ) from None
+        return withdrawn
+
+    def _service_home(self, *, create: bool = False) -> Path:
+        """Locate owned private configuration without following a directory link."""
+        home = self.state_dir / "service"
+        if create:
+            home.mkdir(mode=0o700, exist_ok=True)
+        info = home.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise RuntimeFailure(
+                "Native service configuration is not private and owned."
+            )
+        return home
+
+    @staticmethod
+    def _write_service_file(path: Path, payload: bytes) -> None:
+        """Replace one generated file without following links."""
+        path.unlink(missing_ok=True)
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+
+    def _prepare(self) -> None:
+        """Configure explicit PHP settings and prepare only an uninitialized data target."""
+        home = self._service_home(create=True)
+        self._write_service_file(home / "php.ini", service.INI.encode())
+        if not service.initialized(self.data_dir):
+            self._php("cli/prepare.php")
+            for filename, template in (
+                ("config-user.custom.php", "config-user.custom.php"),
+                ("opml.xml", "public-feed.opml"),
+            ):
+                self._seed(self.data_dir / filename, self.root / "config" / template)
+
+    @staticmethod
+    def _seed(path: Path, template: Path) -> None:
+        """Publish a complete private template without replacing any existing data."""
+        from rss_aggregator.archives import sync_directory
+        from rss_aggregator.recovery import _rename_exclusive
+
+        if os.path.lexists(path):
+            return
+        payload = template.read_bytes()
+        # Stage beside the data directory, so even an interrupted staging write
+        # cannot leave a partial file in the archive payload.
+        with tempfile.TemporaryDirectory(
+            dir=path.parent.parent, prefix=".seed-"
+        ) as staging:
+            source = Path(staging) / path.name
+            fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                _rename_exclusive(source, path)
+            except FileExistsError:
+                return
+            sync_directory(path.parent)
+
+    def _startup_writer(self) -> tuple[dict[str, str], Path]:
+        """Bind startup mutation to owned data and its already recorded generation."""
+        owner, installed = self._ownership_receipt()
+        instance = self.instance
+        generation = Recovery(self).shutdown_generation(
+            instance, owner, installed, require_record=True
+        )
+        if generation is None:
+            raise RuntimeFailure(
+                "Cannot run startup PHP without a recorded writer generation."
+            )
+        return (
+            {
+                "owner": owner["token"],
+                "instance": instance,
+                "writer_generation": generation,
+            },
+            self.state_dir / "instances" / instance / "data",
+        )
+
+    def _php(
+        self, *args: str, timeout_seconds: int = 120, capture_output: bool = False
+    ) -> bytes:
+        """Run bounded PHP without exporting its output or inheriting the command lease."""
+        with service.WriterLeases(self.state_dir).hold("fetch.lock") as operation_lock:
+            if operation_lock is None:
+                raise RuntimeFailure(
+                    "A feed fetch is already in progress; retry after it completes."
+                )
+            identity, data = self._startup_writer()
+            try:
+                # An unnamed file avoids blocking the caretaker on caller exit.
+                with (
+                    service.startup_writer_claim(self.state_dir, identity) as claim,
+                    (
+                        tempfile.TemporaryFile() if capture_output else nullcontext()
+                    ) as output,
+                ):
+                    code = service.foreground_php(
+                        self.state_dir,
+                        data,
+                        operation_lock,
+                        timeout_seconds,
+                        args,
+                        claim_fd=claim,
+                        output=output if output is not None else subprocess.DEVNULL,
+                    )
+                    payload = b""
+                    if output is not None:
+                        output.seek(0)
+                        payload = output.read(128 * 1024)
+            except OSError:
+                code = 1
+        if code == service.FETCH_TIMED_OUT:
+            raise RuntimeFailure(
+                f"FreshRSS PHP operation timed out after {timeout_seconds} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
+            )
+        if code:
+            raise RuntimeFailure(
+                "FreshRSS PHP operation failed; inspect the instance locally (logs may contain secrets)."
+            )
+        return payload
+
+    def _configure(self, origin: str) -> None:
+        """Enforce form authentication, the API and SQLite before opening the listener."""
+        self._php(
+            "cli/reconfigure.php",
             "--base-url",
             origin,
             "--auth-type",
             "form",
             "--allow-anonymous=false",
             "--allow-anonymous-refresh=false",
-        ]
-        if api:
-            options.append("--api-enabled=true")
-        result = self._podman(
-            "exec",
-            "--user",
-            "www-data",
-            APP,
-            "php",
-            "cli/reconfigure.php",
-            *options,
-            check=False,
+            "--api-enabled=true",
+            "--disable-update=true",
         )
-        if result.returncode:
-            raise RuntimeFailure(
-                "FreshRSS HTTPS/API configuration failed; inspect the installed instance locally. No credentials were printed."
-            )
         code = (
-            'require "cli/_cli.php";$c=FreshRSS_Context::systemConf();'
-            'echo json_encode(["api_enabled"=>$c->api_enabled,"auth_type"=>$c->auth_type,'
-            '"allow_anonymous"=>$c->allow_anonymous,"allow_anonymous_refresh"=>$c->allow_anonymous_refresh,'
-            '"base_url"=>$c->base_url]);'
+            'require "cli/_cli.php"; $c=FreshRSS_Context::systemConf();'
+            "echo json_encode([$c->auth_type,$c->allow_anonymous,$c->allow_anonymous_refresh,"
+            '$c->api_enabled,$c->base_url,$c->disable_update,$c->db["type"]??null]);'
         )
-        effective = self._podman(
-            "exec", "--user", "www-data", APP, "php", "-r", code, check=False
-        )
-        try:
-            settings = json.loads(effective.stdout)
-        except ValueError:
-            settings = {}
-        if (
-            effective.returncode
-            or not isinstance(settings, dict)
-            or settings.get("auth_type") != "form"
-            or settings.get("allow_anonymous") is not False
-            or settings.get("allow_anonymous_refresh") is not False
-            or settings.get("base_url") != origin
-            or (api and settings.get("api_enabled") is not True)
-        ):
+        if json.loads(self._php("-r", code, capture_output=True)) != [
+            "form",
+            False,
+            False,
+            True,
+            origin,
+            True,
+            "sqlite",
+        ]:
             raise RuntimeFailure(
-                "FreshRSS effective HTTPS/API configuration differs from the required authenticated settings; no Serve route published. Inspect configuration overrides locally."
+                "Effective FreshRSS authentication, API, update or SQLite settings differ; no Serve forwarding changed."
             )
 
-    def _api_check(
-        self, username: str | None, api_password: str | None, *, loopback: bool = False
+    @staticmethod
+    def _check_port(port: int) -> None:
+        """Test whether IPv4 loopback can bind without stopping other listeners."""
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                listener.bind(("127.0.0.1", port))
+            except OSError:
+                raise RuntimeFailure(
+                    f"Loopback port {port} is occupied; no foreign listener was stopped."
+                ) from None
+
+    def _launch(
+        self, port: int, origin: str, private: bool, *, check_private_backend: bool
     ) -> dict[str, Any]:
-        """Require a running security-checked owned app before sending API credentials."""
-        if not username or not api_password:
-            raise RuntimeFailure(
-                "API check requires a FreshRSS user and separate API password, entered locally."
+        """Spawn a detached lease-holding worker and record its forwarding guard."""
+        self._check_port(port)
+        owner, installed = self._ownership_receipt()
+        instance = self.instance
+        generation = Recovery(self).shutdown_generation(
+            instance, owner, installed, require_record=True
+        )
+        if generation is None:
+            raise RuntimeFailure("Cannot launch without a recorded writer generation.")
+        nonce = uuid.uuid4().hex
+        plan = {
+            "nonce": nonce,
+            "startup_gate": True,
+            "instance": instance,
+            "owner": owner["token"],
+            "writer_generation": generation,
+            "port": port,
+            "url": origin,
+            "private": private,
+            "check_private_backend": private or check_private_backend,
+            "runtime": self._identity(),
+        }
+        leases = service.WriterLeases(self.state_dir)
+        with (
+            leases.hold("writers.lock") as writer,
+            leases.hold("controller.lock") as controller,
+        ):
+            if writer is None or controller is None:
+                raise RuntimeFailure(
+                    "A native writer or controller lease is still held; no new writers were started."
+                )
+            self._save("service.json", plan)
+            self._worker = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "rss_aggregator.native_service",
+                    str(self.state_dir),
+                    str(writer),
+                    str(controller),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(writer, controller),
+                start_new_session=True,
             )
-        owner, machine = self._owned()
-        if machine["State"] != "running":
-            raise RuntimeFailure(
-                "Start the project with RSS_TAILSCALE=1 before checking its API."
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if self._idle():
+                raise RuntimeFailure(
+                    "Native web service exited before loopback readiness; inspect the port and runtime pin."
+                )
+            live = self._live()
+            if live and self._ready(plan) and not self._idle():
+                return plan
+            time.sleep(0.2)
+        raise RuntimeFailure(
+            "Owned PHP web service or scheduler did not become ready on loopback."
+        )
+
+    def _check_web(
+        self, plan: dict[str, Any], initialized: bool, *, starting: bool = False
+    ) -> dict[str, Any]:
+        """Check effective web settings and auth behind the startup gate when needed."""
+        port, nonce = plan["port"], plan["nonce"]
+        diagnostic_host = "rss-" + nonce + ".invalid"
+        probe = self._service_home() / "__rss_probe.php"
+        source = (self.root / "config/security-probe.php").read_bytes()
+        try:
+            self._write_service_file(probe, source)
+            code, body = service.web_check(
+                port, "/__rss_probe.php", host=diagnostic_host
             )
-        app = self._check_label("container", APP, owner)
-        audit = self.state_dir / "security.json"
-        security = json.loads(audit.read_text()) if audit.exists() else {}
+            result = json.loads(body) if code == 200 else None
+        finally:
+            probe.unlink(missing_ok=True)
         if (
-            not app["State"]["Running"]
-            or security.get("checked_container") != APP
-            or security.get("image_id") != app["Image"]
+            not isinstance(result, dict)
+            or result.get("sapi") != "frankenphp"
+            or result.get("php") != plan["runtime"]["php"]
+            or result.get("upload_progress") not in ("", "0")
+            or result.get("expose_php") not in ("", "0")
+            or result.get("display_errors") not in ("", "0")
+            or result.get("sqlite") is not True
+            or result.get("loaded_ini") != str(self.state_dir / "service/php.ini")
+            or result.get("scanned_ini") not in ("", False, None)
+            or result.get("initialized") is not initialized
+            or (initialized and result.get("authenticated_settings") is not True)
         ):
             raise RuntimeFailure(
-                "Complete a security-checked private start before API authentication."
+                "Effective web PHP settings or SQLite support failed verification."
+            )
+        host = diagnostic_host if starting else None
+        if service.web_check(port, "/i/", host=host)[0] not in (200, 302, 303):
+            raise RuntimeFailure(
+                "The FreshRSS application did not pass loopback readiness."
+            )
+        if initialized and service.web_check(
+            port, "/api/greader.php/reader/api/0/subscription/list", host=host
+        )[0] not in (401, 403):
+            raise RuntimeFailure(
+                "The unauthenticated Google Reader-compatible API was not refused."
+            )
+        return {**result, "verified": True}
+
+    def _ready(self, plan: dict[str, Any]) -> bool:
+        """Confirm the selected listener responds for this exact service generation."""
+        code, reply = service.web_check(
+            plan["port"], "/__rss_ready", host="rss-" + plan["nonce"] + ".invalid"
+        )
+        return code == 200 and reply == plan["nonce"].encode()
+
+    def _generation_receipt(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Find the same live generation and its running scheduler, not a stale receipt."""
+        current, receipt = self._live() or ({}, {})
+        if (
+            current.get("nonce") == plan["nonce"]
+            and receipt.get("scheduler") == "running"
+        ):
+            return receipt
+        return None
+
+    def _acknowledged(self, plan: dict[str, Any]) -> bool:
+        """Check the controller's generation-specific ordinary HTTP gate marker."""
+        nonce = plan["nonce"]
+        return service.read(
+            service.acknowledgement_path(self.state_dir / "service", nonce)
+        ) == {"nonce": nonce}
+
+    def _ordinary_ready(self, plan: dict[str, Any]) -> bool:
+        """Check ordinary HTTP and bind the observation to the expected listener."""
+        return (
+            self._ready(plan)
+            and service.web_check(plan["port"], "/i/")[0] in (200, 302, 303)
+            and self._ready(plan)
+        )
+
+    def _approve(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """Require controller acknowledgement and ordinary HTTP from this generation."""
+        nonce = plan["nonce"]
+        request = service.approval_path(self.state_dir / "service", nonce)
+        if self._generation_receipt(plan) is not None:
+            try:
+                service.save(request, {"nonce": nonce})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if self._generation_receipt(plan) is None:
+                        break
+                    if self._acknowledged(plan) and self._ordinary_ready(plan):
+                        receipt = self._generation_receipt(plan)
+                        if receipt is not None and self._acknowledged(plan):
+                            return receipt
+                        break
+                    time.sleep(0.1)
+            finally:
+                request.unlink(missing_ok=True)
+        raise RuntimeFailure(
+            "The native generation did not confirm startup approval and ordinary loopback HTTP readiness."
+        )
+
+    def _retained_security(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Attest fresh settings for retention or request a guarded restart instead."""
+        try:
+            initialized = service.initialized(self.data_dir)
+            record = service.read(self.state_dir / "security.json")
+            previous = record.get("effective") if isinstance(record, dict) else None
+            if (
+                not isinstance(previous, dict)
+                or previous.get("initialized") is not initialized
+                or (plan["private"] and not initialized)
+            ):
+                return None
+            security = self._check_web(plan, initialized)
+            self._save("security.json", {"nonce": plan["nonce"], "effective": security})
+            return security
+        except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+            # The guarded restart withdraws owned forwarding before opening writers.
+            return None
+
+    def _recorded_backend_checks(self, owner: dict[str, Any]) -> set[int]:
+        """Read owned per-port inspection obligations, never publication authority."""
+        path = self.state_dir / BACKEND_CHECKS
+        record = service.read(path)
+        if record is None and not os.path.lexists(path):
+            return set()
+        if (
+            not isinstance(record, dict)
+            or type(record.get("version")) is not int
+            or record["version"] != 1
+            or record.get("owner") != owner["token"]
+            or not isinstance(record.get("ports"), list)
+            or any(
+                type(port) is not int or not 1024 <= port <= 65535
+                for port in record["ports"]
+            )
+        ):
+            raise RuntimeFailure(
+                "Private backend inspection record has invalid ownership or format; preserve it and inspect locally."
+            )
+        return set(record["ports"])
+
+    def _planned_private_backend(self, owner: dict[str, Any]) -> set[int]:
+        """Recognize the last owned guarded plan, including one without a live worker."""
+        plan = service.read(self.state_dir / "service.json")
+        if (
+            isinstance(plan, dict)
+            and plan.get("owner") == owner["token"]
+            and (
+                plan.get("private") is True or plan.get("check_private_backend") is True
+            )
+            and type(plan.get("port")) is int
+            and 1024 <= plan["port"] <= 65535
+        ):
+            return {plan["port"]}
+        return set()
+
+    def _requires_backend_check(self, owner: dict[str, Any], port: int) -> bool:
+        """Tell job capture whether a local backend needs its read-only dependency."""
+        return port in (
+            self._recorded_backend_checks(owner) | self._planned_private_backend(owner)
+        )
+
+    def _start(
+        self,
+        *,
+        private_https: bool | None = None,
+        port_override: int | None = None,
+        recheck: bool = False,
+        check_private_backend: bool = False,
+        explicit: bool = False,
+    ) -> dict[str, Any]:
+        """Start owned serving, changing intent only for a validated explicit start."""
+        owner, _ = self._owned()
+        if explicit:
+            Supervision(self).set_intent("running")
+        port = self._port() if port_override is None else port_override
+        access = PrivateAccess(self)
+        private = access.enabled() if private_https is None else private_https
+        live = self._live()
+        if live and not explicit:
+            self._require_live_selection(live[0].get("instance"), self.instance)
+        # The obligation belongs to the owned loopback endpoint, whether or not
+        # its previous controller is still running. It does not opt into Serve.
+        recorded_checks = self._recorded_backend_checks(owner)
+        backend_checks = recorded_checks | self._planned_private_backend(owner)
+        check_private_backend = check_private_backend or port in backend_checks
+        try:
+            if private:
+                origin = access.prepare(owner, port)
+            else:
+                if check_private_backend:
+                    access.check_backend(port)
+                origin = f"http://127.0.0.1:{port}"
+        except PublicBackendExposed as error:
+            if live is None or live[0].get("port") != port:
+                raise
+            # Leave the foreign route alone; close only the owned backend it reaches.
+            try:
+                self._stop_writers()
+            except (RuntimeFailure, OSError, ValueError, KeyError, TypeError):
+                raise RuntimeFailure(
+                    f"{error} Shutdown of the owned backend could not be confirmed."
+                ) from None
+            raise RuntimeFailure(f"{error} Owned backend shutdown confirmed.") from None
+        recovery = Recovery(self)
+        recovery.check_activation()
+        if live is not None and live[0]["port"] != port:
+            # A known occupied replacement must not disrupt the current service.
+            self._check_port(port)
+        if private or check_private_backend:
+            backend_checks.add(port)
+        if backend_checks != recorded_checks:
+            self._save(
+                BACKEND_CHECKS,
+                {
+                    "version": 1,
+                    "owner": owner["token"],
+                    "ports": sorted(backend_checks),
+                },
+            )
+        if live and not recheck:
+            plan, receipt = live
+            status = self._status()
+            if (
+                status["http_ready"]
+                and plan["port"] == port
+                and plan["url"] == origin
+                and plan["private"] == private
+                and (
+                    not check_private_backend
+                    or plan.get("check_private_backend") is True
+                )
+                and plan["instance"] == self.instance
+                and plan.get("startup_gate") is True
+                and receipt.get("scheduler") == "running"
+                and (
+                    status["forwarding"]["status"] == "running"
+                    if private
+                    else status["forwarding"]["status"] in ("stopped", "unconfigured")
+                )
+            ):
+                security = self._retained_security(plan)
+                if (
+                    security is not None
+                    and self._acknowledged(plan)
+                    and self._ordinary_ready(plan)
+                    and (receipt := self._generation_receipt(plan)) is not None
+                ):
+                    return {
+                        **status,
+                        "scheduler": self._scheduler(receipt),
+                        "security": security,
+                        "fetch": {"status": "already_running"},
+                    }
+        try:
+            self._quiesce()
+            recovery.ensure_data()
+            recovery.mark_writer_start()
+            self._prepare()
+            installed = service.initialized(self.data_dir)
+            if private and not installed:
+                raise RuntimeFailure(
+                    "Complete the FreshRSS installer on loopback first (RSS_TAILSCALE=0); no Serve route was published."
+                )
+            fetch = {"status": "installer_pending"}
+            if installed:
+                self._configure(origin)
+                fetch = self._actualize(startup=True)
+            # Preparation and the upstream fetch can take minutes. Refresh the
+            # forwarding check before binding, with ordinary requests still gated.
+            if private:
+                if access.prepare(owner, port) != origin:
+                    raise RuntimeFailure(
+                        "The Tailscale HTTPS origin changed during startup; retry after checking the tailnet locally."
+                    )
+            elif check_private_backend:
+                access.check_backend(port)
+            plan = self._launch(
+                port, origin, private, check_private_backend=check_private_backend
+            )
+            security = self._check_web(plan, installed, starting=True)
+            if self._generation_receipt(plan) is None:
+                raise RuntimeFailure(
+                    "Native feed scheduling did not pass the startup gate."
+                )
+            self._save("security.json", {"nonce": plan["nonce"], "effective": security})
+            forwarding = access.start(owner, port, origin) if private else None
+            if private or check_private_backend:
+                access.check_backend(port, owner=owner if private else None)
+            receipt = self._approve(plan)
+        except Exception as error:
+            problems = []
+            try:
+                self._stop_writers()
+            except Exception:
+                problems.append("stopping native writers could not be confirmed")
+            try:
+                access.rollback_start()
+            except Exception:
+                problems.append(
+                    "withdrawal of startup forwarding could not be confirmed"
+                )
+            if problems:
+                raise RuntimeFailure(
+                    f"{error} Startup cleanup: {'; '.join(problems)}. Inspect potential remaining access locally."
+                ) from None
+            raise
+        return {
+            "runtime": "installed",
+            "application": "running",
+            "url": origin,
+            "instance": self.instance,
+            "security": security,
+            "scheduler": self._scheduler(receipt),
+            "fetch": fetch,
+            **({"forwarding": forwarding} if forwarding else {}),
+        }
+
+    def _scheduler(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Report whether the owned native scheduler is running and its last attempt."""
+        return {
+            "running": receipt.get("scheduler") == "running",
+            "cron": "*/20 * * * *",
+            "timezone": "UTC",
+            "last_fetch": receipt.get("last_fetch"),
+        }
+
+    def _status(self) -> dict[str, Any]:
+        """Report installed pin, selected data, writer readiness and private forwarding."""
+        if not os.path.lexists(self.state_dir / "runtime"):
+            # Inspection of an unused root must not manufacture writer evidence.
+            writer_evidence = any(
+                os.path.lexists(self.state_dir / name)
+                for name in (
+                    "native-owner.json",
+                    "service.json",
+                    service.WRITER_LEASE_RECORD,
+                    *service.WRITER_LEASES,
+                )
+            )
+            idle = not writer_evidence or self._idle()
+            return {
+                "runtime": "absent",
+                "application": "stopped" if idle else "unconfirmed",
+                "http_ready": False,
+            }
+        owner, _ = self._owned(require_current=False, verify=False)
+        live = self._live()
+        plan, receipt = live or ({}, {})
+        selected = self.instance
+        security = service.read(self.state_dir / "security.json")
+        ready = bool(
+            live
+            and plan.get("instance") == selected
+            and isinstance(security, dict)
+            and security.get("nonce") == plan["nonce"]
+            and plan.get("runtime") == self._identity()
+            and (plan.get("startup_gate") is not True or self._acknowledged(plan))
+            and self._ordinary_ready(plan)
+        )
+        return {
+            "runtime": "installed",
+            "application": "running"
+            if live
+            else "stopped"
+            if self._idle()
+            else "unconfirmed",
+            "instance": selected,
+            "http_ready": ready,
+            "scheduler": self._scheduler(receipt),
+            "forwarding": PrivateAccess(self).status(owner),
+            **(
+                {
+                    "url": plan["url"],
+                    "port": plan["port"],
+                    "live_instance": plan.get("instance"),
+                }
+                if live
+                else {}
+            ),
+        }
+
+    @staticmethod
+    def _require_live_selection(live_instance: Any, selected: str) -> None:
+        """Do not treat an observed writer as the selected instance on disagreement."""
+        if live_instance != selected:
+            raise RuntimeFailure(
+                "The live FreshRSS instance differs from the selected instance; run rss stop or explicitly start the intended instance."
+            )
+
+    def _actualize(self, *, startup: bool = False) -> dict[str, Any]:
+        """Run the upstream fetcher, attributing a fetch before web launch."""
+        timeout = service.FETCH_TIMEOUT
+        with service.WriterLeases(self.state_dir).hold("fetch.lock") as fetch:
+            if fetch is None:
+                raise RuntimeFailure(
+                    "A feed fetch is already in progress; retry after it completes."
+                )
+            if startup:
+                identity, data = self._startup_writer()
+                claim_context = service.startup_writer_claim(self.state_dir, identity)
+            else:
+                data = self.data_dir
+                claim_context = nullcontext()
+            try:
+                with claim_context as claim:
+                    code = service.foreground_fetch(
+                        self.state_dir, data, fetch, timeout, claim_fd=claim
+                    )
+            except OSError:
+                code = 1
+        if code == service.FETCH_TIMED_OUT:
+            raise RuntimeFailure(
+                f"FreshRSS PHP operation timed out after {timeout} seconds; inspect feeds and instance logs locally (logs may contain secrets)."
+            )
+        if code:
+            raise RuntimeFailure(
+                "FreshRSS PHP operation failed; inspect the instance locally (logs may contain secrets)."
+            )
+        return {"status": "completed"}
+
+    def _fetch(self) -> dict[str, Any]:
+        """Fetch immediately for the selected and verified running instance."""
+        self._owned()
+        status = self._status()
+        if status["application"] == "running":
+            self._require_live_selection(status["live_instance"], status["instance"])
+        if not status["http_ready"]:
+            raise RuntimeFailure("Start a verified native service before fetching.")
+        if not service.initialized(self.data_dir):
+            return {"status": "installer_pending"}
+        return self._actualize()
+
+    def _verify(self) -> dict[str, Any]:
+        """Recheck security and readiness by reopening the currently owned listener."""
+        self._ownership_receipt()
+        live = self._live()
+        if live is None:
+            raise RuntimeFailure("Start the owned service before verifying it.")
+        self._require_live_selection(live[0].get("instance"), self.instance)
+        return {
+            **self._start(
+                private_https=live[0]["private"],
+                port_override=live[0]["port"],
+                recheck=True,
+                check_private_backend=live[0].get("check_private_backend", False),
+            ),
+            "verified": True,
+        }
+
+    def _api_check(
+        self, username: str | None, password: str | None, *, loopback: bool = False
+    ) -> dict[str, Any]:
+        """Send prompted API credentials only to a verified owned origin."""
+        owner, _ = self._owned()
+        status = self._status()
+        if not username or not password or not status["http_ready"]:
+            raise RuntimeFailure(
+                "A verified running instance and a separate API credential are required."
             )
         private = PrivateAccess(self)
-        forwarding = private.status(owner)
-        if forwarding["status"] != "running":
-            raise RuntimeFailure(
-                "Project Serve forwarding is stopped; start with RSS_TAILSCALE=1 first."
-            )
-        origin = forwarding["url"]
         if loopback:
-            bindings = (
-                app.get("HostConfig", {}).get("PortBindings", {}).get("80/tcp", [])
-            )
-            if len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1":
+            origin = f"http://127.0.0.1:{status['port']}"
+        else:
+            forwarding = private.status(owner)
+            if forwarding["status"] != "running":
                 raise RuntimeFailure(
-                    "Loopback API check requires exactly one owned 127.0.0.1 publication."
+                    "Start with RSS_TAILSCALE=1 before testing trusted HTTPS."
                 )
-            try:
-                port = int(bindings[0]["HostPort"])
-            except (ValueError, TypeError, KeyError):
-                raise RuntimeFailure(
-                    "Invalid owned loopback API port; inspect project status."
-                ) from None
-            if not 1024 <= port <= 65535:
-                raise RuntimeFailure(
-                    "Invalid owned loopback API port; inspect project status."
-                )
-            origin = f"http://127.0.0.1:{port}"
+            origin = forwarding["url"]
         return {
-            **private.check_api(origin, username, api_password),
+            **private.check_api(origin, username, password),
             "transport": "loopback" if loopback else "https",
             "https_verified": not loopback,
         }
 
-    def _podman(
-        self, *args: str, check: bool = True, input: str | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        """Target the project connection explicitly for every resource command."""
-        return self._run(
-            "podman", "--connection", MACHINE, *args, check=check, input=input
-        )
+    def _runtime_change(self, operation: str, confirm: str | None) -> dict[str, Any]:
+        """Require a stopped owned generation, no registered jobs and exact preview approval."""
+        from rss_aggregator.native_install import NativeInstall
 
-    def _exists(self, kind: str, name: str) -> bool:
-        """Distinguish an absent resource from a failed Podman query."""
-        result = self._podman(kind, "exists", name, check=False)
-        if result.returncode not in (0, 1):
+        owner, installed = self._owned(require_current=False)
+        if not self._idle() or Supervision(self).intent() == "running":
             raise RuntimeFailure(
-                f"Cannot determine {kind} state: {result.stderr.strip()}"
+                "Run rss stop first; runtime changes require stopped intent and idle writers."
             )
-        return result.returncode == 0
-
-    def _check_label(
-        self, kind: str, name: str, owner: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Refuse resources whose ownership token differs from the project."""
-        item = json.loads(self._podman(kind, "inspect", name).stdout)[0]
-        labels = (
-            item.get("Labels")
-            if kind == "volume"
-            else item.get("Config", {}).get("Labels")
-        )
-        if (labels or {}).get(LABEL) != owner["token"]:
-            raise RuntimeFailure(f"Refusing unowned {kind} {name}.")
-        return item
-
-    def _security(self, owner: dict[str, Any], target: str = CHECK) -> dict[str, Any]:
-        """Verify pinned image and effective Apache PHP before publishing.
-
-        The disposable preflight never publishes ports or mounts project data.
-        The application stays on internal port 8088 until its probe is removed.
-        """
-        image_config = self._image()
-        image = image_config["image"]
-        result = self._podman("image", "inspect", image, check=False)
-        if result.returncode:
-            self._diagnostic("Pulling pinned official FreshRSS image...")
-            self._podman("pull", "--platform", image_config["platform"], image)
-            result = self._podman("image", "inspect", image)
-        info = json.loads(result.stdout)[0]
-        labels = info.get("Labels", {})
-        if (
-            info["Os"] + "/" + info["Architecture"] != image_config["platform"]
-            or image not in info["RepoDigests"]
-            or image.split("@")[0] + "@" + image_config["platform_manifest"]
-            not in info["RepoDigests"]
-            or labels.get("org.opencontainers.image.version") != image_config["version"]
-            or labels.get("org.opencontainers.image.revision")
-            != image_config["revision"]
-            or info["Config"]["Entrypoint"] != ["./Docker/entrypoint.sh"]
+        self._require_no_jobs()
+        if PrivateAccess(self).status(owner)["status"] not in (
+            "stopped",
+            "unconfigured",
         ):
             raise RuntimeFailure(
-                "Pinned official image identity/platform/entrypoint mismatch."
+                "Private forwarding is not confirmed stopped; runtime retained."
             )
-        if target == CHECK and self._exists("container", CHECK):
-            self._check_label("container", CHECK, owner)
-            self._podman("rm", "--force", "--volumes", CHECK)
-        name = ".project-security-" + uuid.uuid4().hex + ".php"
-        try:
-            if target == CHECK:
-                self._podman(
-                    "run",
-                    "--detach",
-                    "--name",
-                    CHECK,
-                    "--pull=never",
-                    "--platform",
-                    image_config["platform"],
-                    "--label",
-                    LABEL + "=" + owner["token"],
-                    "--env",
-                    "CRON_MIN=",
-                    "--env",
-                    "ENABLE_ACCESS_LOG=0",
-                    image,
-                )
-            else:
-                self._check_label("container", APP, owner)
-            self._podman(
-                "cp",
-                str(self.root / "config/security-probe.php"),
-                target + ":/var/www/FreshRSS/p/" + name,
-            )
-            internal_port = 80 if target == CHECK else 8088
-            code = f'echo file_get_contents("http://127.0.0.1:{internal_port}/{name}");'
-            data = None
-            for _ in range(30):
-                result = self._podman("exec", target, "php", "-r", code, check=False)
-                try:
-                    data = json.loads(result.stdout)
-                    break
-                except ValueError:
-                    time.sleep(1)
-            if data is None:
-                raise RuntimeFailure(
-                    "Apache PHP security probe did not become ready; application not published."
-                )
-            version = tuple(int(n) for n in data["php"].split("-")[0].split(".")[:3])
-            minimum = tuple(int(n) for n in image_config["php_minimum"].split("."))
-            if version[:2] != minimum[:2] or version < minimum:
-                raise RuntimeFailure("Unsupported/unfixed PHP runtime: " + data["php"])
-            if data["sapi"] != "apache2handler" or data["upload_progress"] not in (
-                "",
-                "0",
-            ):
-                raise RuntimeFailure(
-                    "Effective Apache PHP session upload progress is not disabled."
-                )
-            record = {
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "image": image,
-                "image_id": info["Id"],
-                "platform": image_config["platform"],
-                "platform_manifest": image_config["platform_manifest"],
-                "freshrss": image_config["version"],
-                "advisory_review_date": image_config["security_checked"],
-                "web": data,
-                "checked_container": target,
-                "official_command": info["Config"]["Cmd"],
-                "cli_php": self._podman(
-                    "exec", target, "php", "-r", "echo PHP_VERSION;"
-                ).stdout,
-            }
-            self._save("security.json", record)
-        finally:
-            # Only the disposable check container's anonymous volumes are removed.
-            if target == CHECK:
-                if self._exists("container", CHECK):
-                    self._check_label("container", CHECK, owner)
-                    self._podman("rm", "--force", "--volumes", CHECK)
-            else:
-                self._clear_probes()
-        if target == APP:
-            # Gracefully open port 80 only after the effective PHP probe is removed.
-            code = (
-                '$p="/etc/apache2/sites-available/FreshRSS.Apache.conf";'
-                "$s=file_get_contents($p);"
-                'if(substr_count($s,"Listen 127.0.0.1:8088")!==1){exit(1);}'
-                'file_put_contents($p,str_replace("Listen 127.0.0.1:8088","Listen 80",$s));'
-            )
-            self._podman("exec", APP, "php", "-r", code)
-            self._podman(
-                "exec", APP, "sh", "-c", ". /etc/apache2/envvars; apache2 -k graceful"
-            )
-        self._diagnostic(
-            "Verified official FreshRSS "
-            + image_config["version"]
-            + ", Apache PHP "
-            + data["php"]
-            + ", upload progress disabled ("
-            + target
-            + ", probe removed before serving)."
-        )
-        return record
-
-    def _clear_probes(self) -> None:
-        """Remove current and stale project probes, verifying cleanup before serving."""
-        code = (
-            '$dir="/var/www/FreshRSS/p/";'
-            '$pattern="/^\\\\.project-security-[a-f0-9]{32}\\\\.php$/D";'
-            "$files=scandir($dir);if($files===false){exit(1);}"
-            "foreach($files as $file){if(preg_match($pattern,$file)"
-            "&&!unlink($dir.$file)){exit(1);}}"
-            "clearstatcache();$files=scandir($dir);if($files===false){exit(1);}"
-            "foreach($files as $file){if(preg_match($pattern,$file)){exit(1);}}"
-        )
-        self._podman("exec", APP, "php", "-r", code)
-
-    def _stop(self) -> dict[str, Any]:
-        """Back up quiesced project data before stopping only the owned VM."""
-        return Recovery(self).shutdown()
-
-    def _status(self) -> dict[str, Any]:
-        """Report owned VM/application state and check running service readiness."""
-        if not (self.state_dir / "owner.json").exists():
-            self._diagnostic("FreshRSS is not set up. Run scripts/rss setup.")
-            return {"machine": "absent", "application": "absent"}
-        owner, machine = self._owned()
-        result = {
-            "machine": machine["State"],
-            "application": "unknown",
-            "volume": self.volume,
-            "forwarding": PrivateAccess(self).status(owner),
+        plan = {
+            "operation": operation,
+            "runtime_path": str(self.state_dir / "runtime"),
+            "installed": installed,
+            "preserves_data_and_archives": True,
         }
-        self._diagnostic("Project VM: " + machine["State"])
-        if machine["State"] == "running":
-            if self._exists("container", APP):
-                app = self._check_label("container", APP, owner)
-                result["application"] = app["State"]["Status"]
-                self._diagnostic("FreshRSS: " + app["State"]["Status"])
-                if app["State"]["Running"]:
-                    result["scheduler"] = self._scheduler(owner)
-                    bindings = app["HostConfig"]["PortBindings"].get("80/tcp", [])
-                    if len(bindings) != 1 or bindings[0]["HostIp"] != "127.0.0.1":
-                        raise RuntimeFailure(
-                            "Application loopback publication differs from the project configuration."
-                        )
-                    self._ready(int(bindings[0]["HostPort"]))
-                    result["http_ready"] = True
-                    self._diagnostic("Loopback HTTP: ready.")
-            else:
-                result["application"] = "absent"
-                self._diagnostic("FreshRSS container absent.")
-        path = self.state_dir / "security.json"
-        if path.exists():
-            record = json.loads(path.read_text())
-            result["security"] = record
-            self._diagnostic(
-                "Last security check: "
-                + record["checked_at"]
-                + ", PHP "
-                + record["web"]["php"]
-                + " ("
-                + record["checked_container"]
-                + ")"
-            )
-        return result
-
-    def _ready(self, port: int) -> None:
-        """Retry transient HTTP failures up to 30 times, retaining failed VMs."""
-        for _ in range(30):
-            try:
-                with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
-                    if response.status == 200:
-                        return
-            except (URLError, TimeoutError, ConnectionError):
-                time.sleep(1)
-        raise RuntimeFailure(
-            "FreshRSS HTTP did not become ready; VM retained for diagnosis."
-        )
-
-    def _scheduler(self, owner: dict[str, Any]) -> dict[str, Any]:
-        """Verify the effective 20-minute fetching job and live cron process."""
-        self._check_label("container", APP, owner)
-        crontab = self._podman("exec", APP, "crontab", "-l").stdout
-        if not any(
-            line.startswith("*/20 * * * * ") and "actualize_script.php" in line
-            for line in crontab.splitlines()
-        ):
-            raise RuntimeFailure("Effective 20-minute cron job missing.")
-        self._podman(
-            "exec",
-            APP,
-            "sh",
-            "-c",
-            'test -r /run/crond.pid && kill -0 "$(cat /run/crond.pid)"',
-        )
-        self._diagnostic("Scheduler: cron running, */20 (UTC minutes 00, 20, 40).")
-        return {"running": True, "cron": "*/20 * * * *", "timezone": "UTC"}
-
-    def _fetch(self) -> dict[str, Any]:
-        """Fetch installed users' feeds without bypassing upstream cache or TTL."""
-        owner, machine = self._owned()
-        if machine["State"] != "running":
-            raise RuntimeFailure("Start the project VM before fetching.")
-        self._check_label("container", APP, owner)
-        installed = self._podman(
-            "exec",
-            APP,
-            "test",
-            "-f",
-            "/var/www/FreshRSS/data/applied_migrations.txt",
-            check=False,
-        )
-        if installed.returncode == 1:
-            self._diagnostic(
-                "FreshRSS installer pending; after local installation, run scripts/rss fetch for the preconfigured public feed."
-            )
-            return {"status": "installer_pending"}
-        if installed.returncode:
-            raise RuntimeFailure("Could not determine FreshRSS installation state.")
-        result = self._podman(
-            "exec",
-            "--user",
-            "www-data",
-            APP,
-            "php",
-            "app/actualize_script.php",
-            check=False,
-        )
-        if result.returncode:
+        if operation == "upgrade":
+            plan["reviewed_manifest"] = self._manifest()
+        nonce = hashlib.sha256(
+            json.dumps([owner["token"], plan], sort_keys=True).encode()
+        ).hexdigest()
+        if confirm is None:
+            return {**plan, "confirmation": nonce, "status": "preview"}
+        if confirm != nonce:
             raise RuntimeFailure(
-                "Immediate feed fetching failed; inspect local FreshRSS logs (may contain sensitive URLs)."
+                "Confirmation does not match the current preview; nothing was changed."
             )
-        self._diagnostic(
-            "Immediate feed actualization completed (upstream cache/TTL/backoff still apply)."
+        install = NativeInstall(self)
+        if operation == "uninstall":
+            install.uninstall()
+            return {"status": "uninstalled", "preserves_data_and_archives": True}
+        self._require_upgrade_backup(owner, installed)
+        result = install.upgrade(expected_manifest=plan["reviewed_manifest"])
+        return {"status": "installed", "manifest": result["manifest"]}
+
+    def _require_no_jobs(self) -> None:
+        """Prove both role-specific definitions and registrations are absent."""
+        jobs = (Supervision(self).job, BackupSchedule(self)._job)
+        if any(
+            os.path.lexists(self.state_dir / name) for name in (REGISTRATION, SCHEDULE)
+        ) or any(os.path.lexists(job.path) for job in jobs):
+            raise RuntimeFailure(
+                "Native job evidence remains; remove owned supervision and disable daily backup before changing the runtime. Inspect ambiguous jobs locally."
+            )
+        launchctl = shutil.which("launchctl")
+        if not launchctl or not Path(launchctl).is_absolute():
+            raise RuntimeFailure(
+                "Cannot prove native jobs are absent; launchctl is unavailable."
+            )
+        for probe in (jobs[0].domain, *(f"{job.domain}/{job.label}" for job in jobs)):
+            result = self._run(
+                launchctl,
+                "print",
+                probe,
+                check=False,
+                inherit_lock=False,
+                timeout=JOB_INSPECTION_TIMEOUT,
+            )
+            expected = (0,) if probe == jobs[0].domain else (3, 113)
+            if result.returncode not in expected:
+                raise RuntimeFailure(
+                    "Cannot prove native jobs are absent; inspect both job labels in the normal user session before changing the runtime."
+                )
+
+    def _require_upgrade_backup(
+        self, owner: dict[str, Any], installed: dict[str, Any]
+    ) -> None:
+        """Limit upgrades to runtime-only and independently revalidate the last backup."""
+        import tempfile
+
+        from rss_aggregator.archives import validate_archive
+
+        current = self._identity()
+        if not same_data_identity(installed, current):
+            raise RuntimeFailure(
+                "Only PHP/web runtime upgrades of the same FreshRSS release are supported. Preserve data and plan FreshRSS upgrades separately."
+            )
+        recovery = Recovery(self)
+        if recovery.pristine():
+            return
+        success = BackupSchedule(self).require_upgrade_shutdown(
+            owner, self.instance, recovery.writer_generation(require_record=True)
         )
-        return {"status": "completed"}
-
-    def _replace(self) -> dict[str, Any]:
-        """Replace only the owned application container, preserving named data."""
-        owner, machine = self._owned()
-        if machine["State"] != "running":
-            raise RuntimeFailure("Start the project before replacing its container.")
-        self._check_label("volume", self.volume, owner)
-        Recovery(self).check_activation()
-        private = PrivateAccess(self)
-        private.enabled()  # Validate opt-in before stopping forwarding or removing the app.
-        private.stop(owner)
-        if self._exists("container", APP):
-            self._check_label("container", APP, owner)
-            self._podman("stop", "--time", "60", APP)
-            self._podman("rm", APP)  # Never --volumes: the named data volume survives.
-        return {**self._start(), "replaced": True}
-
-    def _verify(self) -> dict[str, Any]:
-        """Reopen serving only after rechecking effective application Apache PHP."""
-        _owner, machine = self._owned()
-        if machine["State"] != "running":
-            raise RuntimeFailure("Start the project before verification.")
-        return {**self._start(), "verified": True}
+        archive = Path(success["archive"])
+        digest = hashlib.sha256()
+        with archive.open("rb") as candidate:
+            for block in iter(lambda: candidate.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != success["sha256"]:
+            raise RuntimeFailure(
+                "The recorded upgrade backup changed; preserve it and create a fresh verified archive."
+            )
+        with tempfile.TemporaryDirectory(prefix="rss-upgrade-check-") as scratch:
+            validate_archive(archive, Path(scratch), runtime=installed)

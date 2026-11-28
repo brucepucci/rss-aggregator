@@ -34,4 +34,4 @@ convention = "numpy"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = '-m "not live"'
-markers = ["live: opt-in real Podman/HTTP integration checks"]
+markers = ["live: opt-in native Apple Silicon macOS integration with synthetic data"]
